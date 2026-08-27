@@ -1,0 +1,407 @@
+"""The AST pass: find what is worth tracing, without importing anything.
+
+This runs in the editor's process on every keystroke-ish event, so it stays
+cheap and never executes user code. It answers three questions:
+
+  * which functions carry jaxtyping annotations, and where exactly are they
+  * how would you construct the class that owns a method
+  * which lines carry `# torchtyc: ignore` comments
+"""
+
+from __future__ import annotations
+
+import ast
+import io
+import re
+import tokenize
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .annotations import AnnotationError, ArraySpec, Spec, TupleSpec, parse_annotation
+
+_IGNORE = re.compile(r"#\s*torchtyc:\s*ignore(?:\[([^\]]*)\])?")
+
+
+@dataclass
+class Position:
+    line: int  # 0-based, LSP convention
+    column: int
+    end_line: int
+    end_column: int
+
+    @classmethod
+    def of(cls, node: ast.AST) -> Position:
+        return cls(
+            line=node.lineno - 1,
+            column=node.col_offset,
+            end_line=(node.end_lineno or node.lineno) - 1,
+            end_column=node.end_col_offset or node.col_offset,
+        )
+
+
+@dataclass
+class Param:
+    name: str
+    spec: Spec | None
+    position: Position
+    has_default: bool
+    annotation_error: str | None = None
+    # The declared type when it is a plain builtin, used to synthesise a value
+    # for a non-tensor parameter.
+    plain_type: str | None = None
+
+
+@dataclass
+class Attribute:
+    """An annotated assignment to `self`, as in `self.W: Float[...] = ...`.
+
+    Python never checks these at runtime and neither does jaxtyping, which only
+    looks at function signatures. Since torchtyc has a constructed instance in
+    hand anyway, checking them is nearly free and covers the place where a
+    weight matrix gets its axes transposed.
+    """
+
+    name: str
+    spec: Spec
+    position: Position
+
+
+@dataclass
+class ClassInfo:
+    name: str
+    position: Position
+    init_params: list[Param] = field(default_factory=list)
+    bases: list[str] = field(default_factory=list)
+    attributes: list[Attribute] = field(default_factory=list)
+
+    @property
+    def dim_names(self) -> set[str]:
+        names: set[str] = set()
+        for attribute in self.attributes:
+            for array in _iter_arrays(attribute.spec):
+                names.update(array.named_dims)
+        return names
+
+    @property
+    def is_module(self) -> bool:
+        return any(base.split(".")[-1] == "Module" for base in self.bases)
+
+
+@dataclass
+class Target:
+    """One function or method torchtyc will try to trace."""
+
+    qualname: str
+    name: str
+    position: Position
+    params: list[Param]
+    returns: Spec | None
+    returns_position: Position | None
+    decorators: list[str]
+    owner: ClassInfo | None = None
+    annotation_error: str | None = None
+    einops_calls: list[EinopsCall] = field(default_factory=list)
+
+    @property
+    def is_method(self) -> bool:
+        return self.owner is not None
+
+    @property
+    def array_params(self) -> list[Param]:
+        return [p for p in self.params if isinstance(p.spec, ArraySpec)]
+
+    @property
+    def has_array_annotation(self) -> bool:
+        return bool(self.array_params) or isinstance(self.returns, (ArraySpec, TupleSpec))
+
+    @property
+    def dim_names(self) -> set[str]:
+        names: set[str] = set()
+        specs = [p.spec for p in self.params] + [self.returns]
+        for spec in specs:
+            for array in _iter_arrays(spec):
+                names.update(array.named_dims)
+        return names
+
+
+@dataclass
+class EinopsCall:
+    func: str  # rearrange | reduce | repeat | einsum | pack | unpack
+    pattern: str | None
+    position: Position
+    # Positional arguments that are not the pattern string. For einsum that is
+    # the number of operand tensors, which the pattern must agree with.
+    tensor_args: int = 0
+    keywords: frozenset[str] = frozenset()
+
+
+@dataclass
+class Suppression:
+    line: int  # 0-based
+    rules: frozenset[str] | None  # None means "every rule on this line"
+    used: bool = False
+
+
+@dataclass
+class FileScan:
+    path: str
+    targets: list[Target]
+    suppressions: list[Suppression]
+    classes: list[ClassInfo] = field(default_factory=list)
+    syntax_error: tuple[str, Position] | None = None
+
+
+def _iter_arrays(spec: Spec | None):
+    if isinstance(spec, ArraySpec):
+        yield spec
+    elif isinstance(spec, TupleSpec):
+        for item in spec.items:
+            yield from _iter_arrays(item)
+
+
+def _decorator_name(node: ast.expr) -> str:
+    target = node.func if isinstance(node, ast.Call) else node
+    parts: list[str] = []
+    while isinstance(target, ast.Attribute):
+        parts.append(target.attr)
+        target = target.value
+    if isinstance(target, ast.Name):
+        parts.append(target.id)
+    return ".".join(reversed(parts))
+
+
+def _base_name(node: ast.expr) -> str:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+_EINOPS_FUNCS = {"rearrange", "reduce", "repeat", "einsum", "pack", "unpack"}
+
+
+def _find_einops(node: ast.AST) -> list[EinopsCall]:
+    calls: list[EinopsCall] = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        name = _decorator_name(child).split(".")[-1]
+        if name not in _EINOPS_FUNCS:
+            continue
+        pattern = next(
+            (
+                arg.value
+                for arg in child.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            ),
+            None,
+        )
+        tensor_args = sum(
+            1
+            for arg in child.args
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str))
+        )
+        calls.append(
+            EinopsCall(
+                func=name,
+                pattern=pattern,
+                position=Position.of(child),
+                tensor_args=tensor_args,
+                keywords=frozenset(k.arg for k in child.keywords if k.arg),
+            )
+        )
+    return calls
+
+
+def _parse_param(arg: ast.arg, has_default: bool) -> Param:
+    position = Position.of(arg)
+    spec: Spec | None = None
+    error: str | None = None
+    plain: str | None = None
+    if arg.annotation is not None:
+        position = Position.of(arg.annotation)
+        try:
+            spec = parse_annotation(arg.annotation)
+        except AnnotationError as exc:
+            error = str(exc)
+        plain = _plain_type(arg.annotation)
+    return Param(
+        name=arg.arg,
+        spec=spec,
+        position=position,
+        has_default=has_default,
+        annotation_error=error,
+        plain_type=plain,
+    )
+
+
+def _plain_type(node: ast.expr) -> str | None:
+    """Reduce `int`, `int | None`, `Optional[int]` to `int` for value synthesis."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        for side in (node.left, node.right):
+            name = _plain_type(side)
+            if name and name != "None":
+                return name
+        return None
+    if isinstance(node, ast.Constant) and node.value is None:
+        return "None"
+    if isinstance(node, ast.Subscript):
+        head = _base_name(node.value).split(".")[-1]
+        if head in ("Optional",):
+            return _plain_type(node.slice)
+        return head
+    if isinstance(node, ast.Attribute):
+        return _base_name(node)
+    return None
+
+
+def _attributes_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Attribute]:
+    found: list[Attribute] = []
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.AnnAssign):
+            continue
+        target = node.target
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+        ):
+            continue
+        try:
+            spec = parse_annotation(node.annotation)
+        except AnnotationError:
+            continue
+        if spec is None:
+            continue
+        found.append(Attribute(name=target.attr, spec=spec, position=Position.of(node.annotation)))
+    return found
+
+
+def _params_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Param]:
+    args = fn.args
+    positional = args.posonlyargs + args.args
+    defaults_start = len(positional) - len(args.defaults)
+    params = [
+        _parse_param(arg, has_default=index >= defaults_start)
+        for index, arg in enumerate(positional)
+    ]
+    params += [
+        _parse_param(arg, has_default=default is not None)
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults or [])
+    ]
+    return params
+
+
+def scan_source(source: str, path: str) -> FileScan:
+    """Parse one file and collect targets and suppressions."""
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as exc:
+        line = max((exc.lineno or 1) - 1, 0)
+        column = max((exc.offset or 1) - 1, 0)
+        return FileScan(
+            path=path,
+            targets=[],
+            suppressions=[],
+            syntax_error=(exc.msg, Position(line, column, line, column + 1)),
+        )
+
+    targets: list[Target] = []
+    classes: list[ClassInfo] = []
+
+    def visit_function(fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None) -> None:
+        returns: Spec | None = None
+        error: str | None = None
+        try:
+            returns = parse_annotation(fn.returns)
+        except AnnotationError as exc:
+            error = str(exc)
+        targets.append(
+            Target(
+                qualname=f"{owner.name}.{fn.name}" if owner else fn.name,
+                name=fn.name,
+                position=Position(
+                    fn.lineno - 1,
+                    fn.col_offset,
+                    fn.lineno - 1,
+                    fn.col_offset + len("def ") + len(fn.name),
+                ),
+                params=_params_of(fn),
+                returns=returns,
+                returns_position=Position.of(fn.returns) if fn.returns else None,
+                decorators=[_decorator_name(d) for d in fn.decorator_list],
+                owner=owner,
+                annotation_error=error,
+                einops_calls=_find_einops(fn),
+            )
+        )
+
+    def visit_class(node: ast.ClassDef) -> None:
+        info = ClassInfo(
+            name=node.name,
+            position=Position.of(node),
+            bases=[_base_name(base) for base in node.bases],
+        )
+        classes.append(info)
+        # __init__ first, so every method sees the constructor parameters and
+        # the annotated attributes they may refer to.
+        for child in node.body:
+            if (
+                isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name == "__init__"
+            ):
+                info.init_params = _params_of(child)[1:]  # drop self
+                info.attributes = _attributes_of(child)
+        for child in node.body:
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ) and not child.name.startswith("__"):
+                visit_function(child, info)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit_function(node, None)
+        elif isinstance(node, ast.ClassDef):
+            visit_class(node)
+
+    return FileScan(
+        path=path,
+        targets=targets,
+        suppressions=scan_suppressions(source),
+        classes=classes,
+    )
+
+
+def scan_suppressions(source: str) -> list[Suppression]:
+    found: list[Suppression] = []
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        comments = [(t.start[0], t.string) for t in tokens if t.type == tokenize.COMMENT]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        comments = [
+            (index + 1, line) for index, line in enumerate(source.splitlines()) if "#" in line
+        ]
+    for lineno, text in comments:
+        match = _IGNORE.search(text)
+        if match is None:
+            continue
+        rules = match.group(1)
+        found.append(
+            Suppression(
+                line=lineno - 1,
+                rules=(
+                    frozenset(r.strip() for r in rules.split(",") if r.strip()) if rules else None
+                ),
+            )
+        )
+    return found
+
+
+def scan_file(path: str | Path) -> FileScan:
+    text = Path(path).read_text(encoding="utf-8")
+    return scan_source(text, str(path))

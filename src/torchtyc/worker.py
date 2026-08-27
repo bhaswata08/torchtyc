@@ -1,0 +1,286 @@
+"""The subprocess that actually imports user code.
+
+Run as `python -m torchtyc.worker`, reading one JSON job on stdin and writing
+one JSON result on stdout. It lives in a separate process for three reasons:
+
+  * it must run under the *project's* interpreter, with the project's torch,
+    which is rarely the interpreter hosting the language server
+  * importing user code runs module-level side effects, and a fresh process is
+    the only honest way to pick up an edit without stale-module games
+  * user code that segfaults or hangs takes the worker down, not the editor
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+from .binding import DimBinder
+from .diagnostics import RULES, Diagnostic, Severity
+from .discovery import ClassInfo, Position, Target, scan_source
+from .tracing import TraceSkipped, check_return, describe, instantiate, trace
+
+
+def import_from_path(path: Path) -> Any:
+    """Import a file as part of its package, so relative imports resolve."""
+    path = path.resolve()
+    parts = [path.stem]
+    root = path.parent
+    while (root / "__init__.py").exists():
+        parts.append(root.name)
+        root = root.parent
+
+    dotted = ".".join(reversed(parts))
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    # Drop any cached copy so an edit on disk is what gets checked.
+    for name in [n for n in sys.modules if n == dotted or n.startswith(dotted + ".")]:
+        del sys.modules[name]
+
+    return importlib.import_module(dotted)
+
+
+def _anchor(exc: BaseException, path: str, fallback: Position) -> tuple[Position, str]:
+    """Point at the deepest frame inside the file being checked.
+
+    A shape error usually surfaces several frames down, inside einsum or matmul.
+    The line the user needs to see is the last one they wrote, not torch's.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    mine = [f for f in frames if f.filename and Path(f.filename).resolve() == Path(path).resolve()]
+    chosen = mine[-1] if mine else None
+    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    if chosen is None:
+        return fallback, text
+    line = chosen.lineno - 1 if chosen.lineno else fallback.line
+    return Position(line, 0, line, len(chosen.line or "") if chosen.line else 1), text
+
+
+def _severity(rule: str) -> Severity:
+    entry = RULES.get(rule)
+    return entry.severity if entry else Severity.ERROR
+
+
+def check_target(module: Any, target: Target, path: str, variadic_rank: int) -> list[Diagnostic]:
+    out: list[Diagnostic] = []
+    anchor = target.returns_position or target.position
+
+    try:
+        result = trace(module, target, variadic_rank)
+    except TraceSkipped as exc:
+        return [
+            Diagnostic(
+                path=path,
+                line=target.position.line,
+                column=target.position.column,
+                end_line=target.position.end_line,
+                end_column=target.position.end_column,
+                rule=exc.rule,
+                severity=_severity(exc.rule),
+                message=exc.message,
+                function=target.qualname,
+                hint=exc.hint or None,
+            )
+        ]
+    except Exception as exc:  # noqa: BLE001 - any user error is a finding
+        position, text = _anchor(exc, path, target.position)
+        return [
+            Diagnostic(
+                path=path,
+                line=position.line,
+                column=position.column,
+                end_line=position.end_line,
+                end_column=position.end_column,
+                rule="trace-error",
+                severity=Severity.ERROR,
+                message=f"{type(exc).__name__}: {exc}",
+                function=target.qualname,
+                traceback=text,
+            )
+        ]
+
+    for problem in check_return(target.returns, result.returned, result.binder):
+        out.append(
+            Diagnostic(
+                path=path,
+                line=anchor.line,
+                column=anchor.column,
+                end_line=anchor.end_line,
+                end_column=anchor.end_column,
+                rule=problem["rule"],
+                severity=_severity(problem["rule"]),
+                message=f"in the return of `{target.qualname}`: {problem['message']}",
+                function=target.qualname,
+                expected=problem.get("expected"),
+                got=problem.get("got"),
+                hint=problem.get("hint") or None,
+            )
+        )
+
+    return out
+
+
+def check_attributes(
+    module: Any, info: ClassInfo, path: str, variadic_rank: int
+) -> list[Diagnostic]:
+    """Construct the class once and compare `self.X` against its annotation."""
+    binder = DimBinder(variadic_rank=variadic_rank)
+    cls = getattr(module, info.name, None)
+    if cls is None:
+        return []
+
+    dim_names = info.dim_names | {p.name for p in info.init_params}
+    try:
+        instance = instantiate(info, cls, binder, dim_names)
+    except TraceSkipped as exc:
+        return [
+            Diagnostic(
+                path=path,
+                line=info.position.line,
+                column=info.position.column,
+                end_line=info.position.line,
+                end_column=info.position.end_column,
+                rule=exc.rule,
+                severity=_severity(exc.rule),
+                message=exc.message,
+                function=info.name,
+                hint=exc.hint or None,
+            )
+        ]
+    except Exception as exc:  # noqa: BLE001
+        position, text = _anchor(exc, path, info.position)
+        return [
+            Diagnostic(
+                path=path,
+                line=position.line,
+                column=position.column,
+                end_line=position.end_line,
+                end_column=position.end_column,
+                rule="trace-error",
+                severity=Severity.ERROR,
+                message=f"constructing `{info.name}`: {type(exc).__name__}: {exc}",
+                function=info.name,
+                traceback=text,
+            )
+        ]
+
+    out: list[Diagnostic] = []
+    for attribute in info.attributes:
+        if not hasattr(instance, attribute.name):
+            continue
+        value = getattr(instance, attribute.name)
+        for problem in check_return(attribute.spec, value, binder):
+            out.append(
+                Diagnostic(
+                    path=path,
+                    line=attribute.position.line,
+                    column=attribute.position.column,
+                    end_line=attribute.position.end_line,
+                    end_column=attribute.position.end_column,
+                    rule=(
+                        "attribute-mismatch"
+                        if problem["rule"] in ("shape-mismatch", "rank-mismatch")
+                        else problem["rule"]
+                    ),
+                    severity=_severity(problem["rule"]),
+                    message=f"`self.{attribute.name}`: {problem['message']}",
+                    function=info.name,
+                    expected=problem.get("expected"),
+                    got=problem.get("got"),
+                    hint=problem.get("hint") or None,
+                )
+            )
+    return out
+
+
+def shapes_for_hover(module: Any, target: Target, variadic_rank: int) -> dict[str, str]:
+    """Best-effort argument and return shapes, used by hover and inlay hints."""
+    try:
+        result = trace(module, target, variadic_rank)
+    except Exception:  # noqa: BLE001
+        return {}
+    hints = {
+        name: result.binder.render_shape(shape) for name, shape in result.argument_shapes.items()
+    }
+    hints["return"] = describe(result.returned, result.binder)
+    return hints
+
+
+def run_job(job: dict[str, Any]) -> dict[str, Any]:
+    variadic_rank = job.get("variadic_rank", 2)
+    want_hover = job.get("hover", False)
+    diagnostics: list[dict[str, Any]] = []
+    hovers: dict[str, dict[str, str]] = {}
+
+    for path in job["paths"]:
+        source = job.get("sources", {}).get(path)
+        if source is None:
+            source = Path(path).read_text(encoding="utf-8")
+        scan = scan_source(source, path)
+        if scan.syntax_error is not None:
+            continue  # the in-process pass already reported it
+
+        targets = [t for t in scan.targets if t.has_array_annotation]
+        classes = [c for c in scan.classes if c.attributes]
+        if not targets and not classes:
+            continue
+
+        try:
+            module = import_from_path(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            position, text = _anchor(exc, path, Position(0, 0, 0, 1))
+            diagnostics.append(
+                Diagnostic(
+                    path=path,
+                    line=position.line,
+                    column=position.column,
+                    end_line=position.end_line,
+                    end_column=position.end_column,
+                    rule="import-error",
+                    severity=Severity.ERROR,
+                    message=f"{type(exc).__name__}: {exc}",
+                    traceback=text,
+                ).to_json()
+            )
+            continue
+
+        for info in classes:
+            for diagnostic in check_attributes(module, info, path, variadic_rank):
+                diagnostics.append(diagnostic.to_json())
+
+        for target in targets:
+            for diagnostic in check_target(module, target, path, variadic_rank):
+                diagnostics.append(diagnostic.to_json())
+            if want_hover:
+                hovers[target.qualname] = shapes_for_hover(module, target, variadic_rank)
+
+    return {"diagnostics": diagnostics, "hovers": hovers}
+
+
+def main() -> int:
+    try:
+        job = json.loads(sys.stdin.read())
+    except json.JSONDecodeError as exc:
+        json.dump({"error": f"bad job: {exc}"}, sys.stdout)
+        return 2
+
+    try:
+        result = run_job(job)
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+            "diagnostics": [],
+            "hovers": {},
+        }
+    json.dump(result, sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
