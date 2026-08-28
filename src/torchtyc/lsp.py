@@ -360,7 +360,9 @@ def code_action(ls: TorchtycServer, params: lsp.CodeActionParams) -> list[lsp.Co
         )
 
         suggestion = _extract(diagnostic.message, "try:")
-        edit = _rewrite_annotation(uri, line, text, suggestion) if suggestion else None
+        edit = (
+            _rewrite_annotation(uri, document, diagnostic.range, suggestion) if suggestion else None
+        )
         if edit is not None:
             actions.append(
                 lsp.CodeAction(
@@ -406,21 +408,36 @@ _ANNOTATION = re.compile(r'[A-Za-z_]\w*\s*\[[^][]*"[^"]*"\s*\]')
 
 
 def _rewrite_annotation(
-    uri: str, line: int, text: str, suggestion: str
+    uri: str, document: Any, span: lsp.Range, suggestion: str
 ) -> lsp.WorkspaceEdit | None:
-    """Replace the last annotation on the line with the whole suggestion.
+    """Replace exactly the annotation the diagnostic points at.
 
-    The whole annotation goes, not only its dim string: a dtype mismatch
-    suggests the same dims under a different dtype class, so rewriting the dims
-    alone would produce an edit that changes nothing.
+    The range comes from the diagnostic rather than from searching the line,
+    because searching cannot tell which annotation is meant. A tuple return
+    holds several, and the suggestion describes one element while the
+    diagnostic anchors the whole tuple: picking the last match there would
+    rewrite the wrong element.
+
+    The whole annotation is replaced, not only its dim string, since a dtype
+    mismatch suggests the same dims under a different dtype class and
+    rewriting the dims alone would change nothing.
+
+    Nothing is offered unless the range holds exactly one array annotation, so
+    a suggestion that does not describe the anchored text is declined rather
+    than applied to the wrong place.
     """
-    match = None
-    for match in _ANNOTATION.finditer(text):
-        pass
-    if match is None or match.group(0) == suggestion:
+    if span.start.line != span.end.line:
         return None
-    new_text = text[: match.start()] + suggestion + text[match.end() :]
-    return _replace_line(uri, line, new_text)
+    try:
+        text = document.lines[span.start.line].rstrip("\n")
+    except IndexError:
+        return None
+
+    target = text[span.start.character : span.end.character]
+    if _ANNOTATION.fullmatch(target) is None or target == suggestion:
+        return None
+
+    return lsp.WorkspaceEdit(changes={uri: [lsp.TextEdit(range=span, new_text=suggestion)]})
 
 
 @server.feature(lsp.WORKSPACE_DID_CHANGE_CONFIGURATION)

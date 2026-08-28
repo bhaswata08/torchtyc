@@ -1,9 +1,13 @@
 """Static checks on einops pattern strings.
 
 These need no torch and no import, so they run in the editor's process and
-survive a file that does not even import. The rules are deliberately narrow:
-every one of them flags something einops itself would reject at runtime, so a
-report here is never a matter of taste.
+survive a file that does not even import.
+
+The error-level rules are deliberately narrow: each one flags something einops
+itself rejects at runtime, so an error here is never a matter of taste. The
+near-miss rule is the exception and is warning-level for that reason: einops
+accepts an axis name one edit away from an annotated dimension quite happily,
+and torchtyc only points out that the two probably meant to be the same.
 """
 
 from __future__ import annotations

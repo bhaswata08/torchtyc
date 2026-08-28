@@ -84,18 +84,27 @@ def bench_trace(paths: list[str], python: str, repeats: int) -> dict:
     from torchtyc.engine import check_paths
 
     config = Config(root=Path("."), python=python)
-    return timed(lambda: check_paths(paths, config), repeats)
+
+    def run():
+        report = check_paths(paths, config)
+        # A worker that never started is not a fast check, it is a broken one.
+        if report.worker_error is not None:
+            raise RuntimeError(f"the worker failed: {report.worker_error}")
+
+    return timed(run, repeats)
 
 
 def bench_spawn(python: str, body: str, repeats: int) -> dict:
     """Spawn a fresh interpreter that runs `body` and exits."""
 
     def run():
+        # An interpreter that cannot import torch exits fast, and that speed
+        # would be published as a measurement. Fail instead.
         subprocess.run(
             [python, "-c", body],
             capture_output=True,
             text=True,
-            check=False,
+            check=True,
         )
 
     return timed(run, repeats)
@@ -126,7 +135,7 @@ def bench_worker_startup(python: str, repeats: int) -> dict:
             input=job,
             capture_output=True,
             text=True,
-            check=False,
+            check=True,
         )
 
     return {

@@ -190,8 +190,20 @@ def test_suggestion_reaches_the_lsp_message():
     assert 'try: Float[Tensor, "... out_features"]' in to_lsp(diagnostic).message
 
 
-def quick_fix_edits(line_text: str, diagnostic: Diagnostic) -> list[str]:
-    """Run the real code action handler over one line and one diagnostic."""
+def quick_fix_edits(
+    line_text: str, diagnostic: Diagnostic, anchor: str | None = None
+) -> list[tuple[str, str]]:
+    """Run the real code action handler over one line and one diagnostic.
+
+    `anchor` is the substring the diagnostic points at, which is what the
+    worker anchors real diagnostics to: the return annotation node, or the
+    annotation of a `self.X` assignment. Passing it here rather than letting
+    the handler search the line is the whole point, since a line can hold
+    several annotations.
+
+    Returns (replaced text, replacement) pairs so a test can assert the edit
+    lands on the right span and not merely that the line ends up right.
+    """
     from types import SimpleNamespace
 
     from torchtyc.lsp import code_action
@@ -199,6 +211,13 @@ def quick_fix_edits(line_text: str, diagnostic: Diagnostic) -> list[str]:
     uri = "file:///a.py"
     document = SimpleNamespace(lines=[line_text + "\n"])
     ls = SimpleNamespace(workspace=SimpleNamespace(get_text_document=lambda _: document))
+
+    if anchor is not None:
+        start = line_text.index(anchor)
+        diagnostic.column = start
+        diagnostic.end_column = start + len(anchor)
+        diagnostic.end_line = diagnostic.line
+
     params = lsp.CodeActionParams(
         text_document=lsp.TextDocumentIdentifier(uri=uri),
         range=lsp.Range(
@@ -206,14 +225,18 @@ def quick_fix_edits(line_text: str, diagnostic: Diagnostic) -> list[str]:
         ),
         context=lsp.CodeActionContext(diagnostics=[to_lsp(diagnostic)]),
     )
-    return [
-        action.edit.changes[uri][0].new_text
-        for action in code_action(ls, params)
-        if action.title.startswith("Change the annotation")
-    ]
+
+    pairs = []
+    for action in code_action(ls, params):
+        if not action.title.startswith("Change the annotation"):
+            continue
+        edit = action.edit.changes[uri][0]
+        replaced = line_text[edit.range.start.character : edit.range.end.character]
+        pairs.append((replaced, edit.new_text))
+    return pairs
 
 
-def test_quick_fix_rewrites_the_dim_string_of_a_shape_mismatch():
+def test_quick_fix_replaces_the_anchored_annotation():
     diagnostic = Diagnostic(
         path="a.py",
         line=0,
@@ -223,8 +246,8 @@ def test_quick_fix_rewrites_the_dim_string_of_a_shape_mismatch():
         suggestion='Float[Tensor, "b out_features"]',
     )
     line = 'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
-    assert quick_fix_edits(line, diagnostic) == [
-        'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b out_features"]:'
+    assert quick_fix_edits(line, diagnostic, anchor='Float[Tensor, "b d"]') == [
+        ('Float[Tensor, "b d"]', 'Float[Tensor, "b out_features"]')
     ]
 
 
@@ -238,8 +261,11 @@ def test_quick_fix_for_a_dtype_mismatch_changes_the_dtype_class():
         suggestion='Int[Tensor, "b d"]',
     )
     line = 'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
-    edits = quick_fix_edits(line, diagnostic)
-    assert edits == ['def f(x: Float[Tensor, "b d"]) -> Int[Tensor, "b d"]:']
+    # The dims are unchanged, so rewriting only the dim string would be a
+    # no-op. The whole annotation is replaced instead.
+    assert quick_fix_edits(line, diagnostic, anchor='Float[Tensor, "b d"]') == [
+        ('Float[Tensor, "b d"]', 'Int[Tensor, "b d"]')
+    ]
 
 
 def test_quick_fix_is_not_offered_when_it_would_change_nothing():
@@ -252,7 +278,7 @@ def test_quick_fix_is_not_offered_when_it_would_change_nothing():
         suggestion='Float[Tensor, "b d"]',
     )
     line = 'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
-    assert quick_fix_edits(line, diagnostic) == []
+    assert quick_fix_edits(line, diagnostic, anchor='Float[Tensor, "b d"]') == []
 
 
 def test_quick_fix_rewrites_an_annotated_attribute():
@@ -265,6 +291,44 @@ def test_quick_fix_rewrites_an_annotated_attribute():
         suggestion='Float[nn.Parameter, "d_in d_out"]',
     )
     line = '        self.W: Float[nn.Parameter, "d_out d_in"] = nn.Parameter(torch.empty((2, 3)))'
-    assert quick_fix_edits(line, diagnostic) == [
-        '        self.W: Float[nn.Parameter, "d_in d_out"] = nn.Parameter(torch.empty((2, 3)))'
+    assert quick_fix_edits(line, diagnostic, anchor='Float[nn.Parameter, "d_out d_in"]') == [
+        ('Float[nn.Parameter, "d_out d_in"]', 'Float[nn.Parameter, "d_in d_out"]')
     ]
+
+
+def test_quick_fix_declines_a_tuple_return():
+    """The suggestion describes one element, the diagnostic anchors the tuple.
+
+    Searching the line for an annotation would pick the last element and
+    rewrite it with element zero's suggestion, silently corrupting the code.
+    Offering nothing is the only safe answer until the diagnostic can anchor
+    the element itself.
+    """
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        suggestion='Float[Tensor, "a out"]',
+    )
+    line = 'def f(x) -> tuple[Float[Tensor, "a b"], Int[Tensor, "c"]]:'
+    assert (
+        quick_fix_edits(line, diagnostic, anchor='tuple[Float[Tensor, "a b"], Int[Tensor, "c"]]')
+        == []
+    )
+
+
+def test_quick_fix_declines_a_multiline_annotation():
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        end_line=1,
+        end_column=4,
+        suggestion='Float[Tensor, "a"]',
+    )
+    line = "def f(x) -> Float["
+    assert quick_fix_edits(line, diagnostic) == []
