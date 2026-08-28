@@ -41,7 +41,9 @@ def test_init_params_and_attributes():
     assert [p.name for p in info.init_params] == ["d_in", "d_out", "bias"]
     assert info.init_params[2].has_default is True
     assert [a.name for a in info.attributes] == ["W"]
-    assert info.dim_names == {"d_out", "d_in"}
+    # Class-wide: the attribute names two axes and `forward` adds `b`, and a
+    # constructor parameter is matched against all of them.
+    assert info.dim_names == {"d_out", "d_in", "b"}
     assert info.is_module is True
 
 

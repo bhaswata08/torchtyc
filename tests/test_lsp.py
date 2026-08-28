@@ -190,8 +190,81 @@ def test_suggestion_reaches_the_lsp_message():
     assert 'try: Float[Tensor, "... out_features"]' in to_lsp(diagnostic).message
 
 
-def test_quick_fix_applies_the_suggested_dim_string():
-    from torchtyc.lsp import _dims_of
+def quick_fix_edits(line_text: str, diagnostic: Diagnostic) -> list[str]:
+    """Run the real code action handler over one line and one diagnostic."""
+    from types import SimpleNamespace
 
-    assert _dims_of('Float[Tensor, "... out_features"]') == "... out_features"
-    assert _dims_of("no quotes here") is None
+    from torchtyc.lsp import code_action
+
+    uri = "file:///a.py"
+    document = SimpleNamespace(lines=[line_text + "\n"])
+    ls = SimpleNamespace(workspace=SimpleNamespace(get_text_document=lambda _: document))
+    params = lsp.CodeActionParams(
+        text_document=lsp.TextDocumentIdentifier(uri=uri),
+        range=lsp.Range(
+            start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=0)
+        ),
+        context=lsp.CodeActionContext(diagnostics=[to_lsp(diagnostic)]),
+    )
+    return [
+        action.edit.changes[uri][0].new_text
+        for action in code_action(ls, params)
+        if action.title.startswith("Change the annotation")
+    ]
+
+
+def test_quick_fix_rewrites_the_dim_string_of_a_shape_mismatch():
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        suggestion='Float[Tensor, "b out_features"]',
+    )
+    line = 'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
+    assert quick_fix_edits(line, diagnostic) == [
+        'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b out_features"]:'
+    ]
+
+
+def test_quick_fix_for_a_dtype_mismatch_changes_the_dtype_class():
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="dtype-mismatch",
+        message="bad",
+        suggestion='Int[Tensor, "b d"]',
+    )
+    line = 'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
+    edits = quick_fix_edits(line, diagnostic)
+    assert edits == ['def f(x: Float[Tensor, "b d"]) -> Int[Tensor, "b d"]:']
+
+
+def test_quick_fix_is_not_offered_when_it_would_change_nothing():
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        suggestion='Float[Tensor, "b d"]',
+    )
+    line = 'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
+    assert quick_fix_edits(line, diagnostic) == []
+
+
+def test_quick_fix_rewrites_an_annotated_attribute():
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="attribute-mismatch",
+        message="bad",
+        suggestion='Float[nn.Parameter, "d_in d_out"]',
+    )
+    line = '        self.W: Float[nn.Parameter, "d_out d_in"] = nn.Parameter(torch.empty((2, 3)))'
+    assert quick_fix_edits(line, diagnostic) == [
+        '        self.W: Float[nn.Parameter, "d_in d_out"] = nn.Parameter(torch.empty((2, 3)))'
+    ]

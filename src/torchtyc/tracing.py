@@ -255,7 +255,7 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
     if "property" in target.decorators:
         raise TraceSkipped("uninstantiable", "properties are not traced")
 
-    instance = instantiate(target.owner, cls, binder, target.dim_names)
+    instance = instantiate(target.owner, cls, binder, target.owner.dim_names)
     return getattr(instance, target.name), params[1:]  # drop self
 
 

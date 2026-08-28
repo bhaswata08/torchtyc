@@ -70,12 +70,10 @@ def _full(report: Report, root: Path, color: bool) -> str:
             f"{_paint(f'{d.severity.label}[{d.rule}]', _COLORS[d.severity], color)}"
         )
         body = [head, f"  {d.message}"]
-        if d.expected is not None or d.got is not None:
-            width = max(len(str(d.expected or "")), len(str(d.got or "")))
-            if d.expected is not None:
-                body.append(f"    Expected: {d.expected:<{width}}")
-            if d.got is not None:
-                body.append(f"    Got:      {d.got:<{width}}")
+        if d.expected is not None:
+            body.append(f"    Expected: {d.expected}")
+        if d.got is not None:
+            body.append(f"    Got:      {d.got}")
         source = _source_line(d)
         if source:
             body.append(_paint(f"    {d.line + 1} | {source}", _DIM, color))

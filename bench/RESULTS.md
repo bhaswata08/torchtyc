@@ -1,59 +1,71 @@
 # Benchmark results
 
-Measured on NixOS, torch 2.12 (CPU), Python 3.13, via `python bench/bench.py`.
-Numbers are medians. Re-run the harness rather than trusting these; they exist
-to record the shape of the costs, not to be precise.
+Every number below comes from one run of `python bench/bench.py`, on NixOS with
+torch 2.12 (CPU, 16 threads), Python 3.13, on a 24-core machine. Numbers are
+medians over the harness's repeats. Re-run the harness rather than trusting
+these; they exist to record the shape of the costs, not to be precise. The
+absolute figures move with the machine, but the ratios do not.
 
 ## The three paths, separately
 
 | Path | Cost | Runs when |
 | --- | --- | --- |
-| Lint (AST only) | 0.34 ms per module | every keystroke |
+| Lint (AST only) | 0.35 ms per module | every keystroke |
 | Trace (subprocess) | ~1.2 s | on open, on save, after 0.7 s idle |
 | Marginal trace per function | ~1 ms | within a trace |
 
 ## Lint scales with the file, and stays cheap
 
+From `scaling_by_module_count[*].lint`:
+
 | Annotated modules in one file | Lint |
 | --- | --- |
-| 1 | 0.34 ms |
-| 8 | 2.28 ms |
-| 32 | 9.00 ms |
+| 1 | 0.35 ms |
+| 8 | 2.29 ms |
+| 32 | 9.14 ms |
 
-The whole `cs336_basics` package (6 files) lints in **5.9 ms**. This is the path
-that runs while you type, and it never imports torch, so it cannot be slowed
-down by the project's dependencies.
+This is the path that runs while you type, and it never imports torch, so the
+project's dependencies cannot slow it down.
 
 ## Tracing is dominated by importing torch, not by tracing
 
+From `worker_startup` and `scaling_by_module_count[*].check`:
+
 | Step | Cost |
 | --- | --- |
-| Spawn a bare Python | 18 ms |
-| `import torch` | 880 ms |
-| `import torch, einops, jaxtyping` | 889 ms |
-| Full `check` of a 1-module file | 1187 ms |
-| Full `check` of a 32-module file | 1217 ms |
+| Spawn a bare Python | 15 ms |
+| `import torch` | 862 ms |
+| `import torch, einops, jaxtyping` | 879 ms |
+| Worker process with an empty job | 883 ms |
+| Full `check` of a 1-module file | 1180 ms |
+| Full `check` of a 32-module file | 1207 ms |
 
-Going from 1 annotated module to 32 costs **30 ms**, about 1 ms per function.
+Going from 1 annotated module to 32 costs **27 ms**, about 1 ms per function.
 Roughly 75% of a check is `import torch`, which happens once per check
-regardless of how much there is to check.
-
-`torchtyc check cs336_basics` (6 files, 3 annotated functions): **1666 ms**.
+regardless of how much there is to check. einops and jaxtyping together add
+17 ms on top of torch, and the process itself costs 15 ms.
 
 ## Meta tensors versus real ones
 
-One `einsum` of a `(256, width)` against a `(width, width)`:
+One `einsum` of a `(256, width)` against a `(width, width)`, from
+`forward_pass_by_width`:
 
 | width | real CPU | meta | speedup |
 | --- | --- | --- | --- |
-| 512 | 0.39 ms | 0.027 ms | 15x |
-| 2048 | 3.67 ms | 0.026 ms | 142x |
-| 8192 | 57.32 ms | 0.026 ms | 2206x |
+| 512 | 0.33 ms | 0.026 ms | 13x |
+| 2048 | 3.66 ms | 0.026 ms | 140x |
+| 8192 | 177.07 ms | 0.026 ms | 6686x |
 
 Meta is flat, because no arithmetic happens and no memory is allocated. Real
 CPU grows with the work. The gap therefore widens with model size, which is the
 whole reason the checker traces on meta: checking a large model costs the same
 as checking a small one.
+
+## Measuring a real project
+
+`bench.py --target <path>` lints and checks every `.py` file under a directory
+and reports both under `targets`. That is how the numbers for a real codebase
+are produced; they are not included here because they depend on the project.
 
 ## Where the remaining time goes
 

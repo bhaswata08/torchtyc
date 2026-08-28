@@ -87,12 +87,31 @@ def bench_trace(paths: list[str], python: str, repeats: int) -> dict:
     return timed(lambda: check_paths(paths, config), repeats)
 
 
+def bench_spawn(python: str, body: str, repeats: int) -> dict:
+    """Spawn a fresh interpreter that runs `body` and exits."""
+
+    def run():
+        subprocess.run(
+            [python, "-c", body],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    return timed(run, repeats)
+
+
 def bench_worker_startup(python: str, repeats: int) -> dict:
-    """How long the subprocess takes to exist and import torch, with no work."""
+    """The fixed cost of a check, broken into the steps that make it up.
+
+    A check pays for a process, then for `import torch`, then for the rest of
+    the imports. Measuring them separately is what says where the ~1.2 s of a
+    check actually goes, and therefore what is worth attacking.
+    """
     job = json.dumps({"paths": [], "variadic_rank": 2, "sources": {}, "hover": False})
     package_root = str(Path(__file__).resolve().parent.parent / "src")
 
-    def run():
+    def run_worker():
         subprocess.run(
             [
                 python,
@@ -110,7 +129,14 @@ def bench_worker_startup(python: str, repeats: int) -> dict:
             check=False,
         )
 
-    return timed(run, repeats)
+    return {
+        "bare_python": bench_spawn(python, "pass", repeats),
+        "import_torch": bench_spawn(python, "import torch", repeats),
+        "import_torch_einops_jaxtyping": bench_spawn(
+            python, "import torch, einops, jaxtyping", repeats
+        ),
+        "empty_worker": timed(run_worker, repeats),
+    }
 
 
 def bench_real_vs_meta(width: int, batch: int, repeats: int) -> dict:
@@ -131,6 +157,15 @@ def bench_real_vs_meta(width: int, batch: int, repeats: int) -> dict:
         "real_cpu": timed(lambda: run("cpu"), repeats),
         "meta": timed(lambda: run("meta"), repeats),
     }
+
+
+def bench_width_sweep(widths: tuple[int, ...], batch: int, repeats: int) -> dict:
+    """Real versus meta across model widths.
+
+    Meta is flat in the tensor size and real CPU is not, so the ratio only means
+    something as a curve. One width would hide that.
+    """
+    return {width: bench_real_vs_meta(width, batch, repeats) for width in widths}
 
 
 def main() -> int:
@@ -157,7 +192,7 @@ def main() -> int:
     results["scaling_by_module_count"] = scaling
 
     results["worker_startup"] = bench_worker_startup(args.python, args.repeats)
-    results["forward_pass"] = bench_real_vs_meta(4096, 256, args.repeats * 4)
+    results["forward_pass_by_width"] = bench_width_sweep((512, 2048, 8192), 256, args.repeats * 4)
 
     for target in args.target:
         files = [str(p) for p in Path(target).rglob("*.py") if ".venv" not in str(p)]

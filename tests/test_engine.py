@@ -198,7 +198,51 @@ def test_hover_shapes_are_produced(project):
     """
     )
     report = check_paths(paths, config, hover=True)
-    assert "b" in report.hovers["double"]["x"]
+    assert "b" in report.shapes_in(paths[0])["double"]["x"]
+
+
+def test_two_files_sharing_a_qualname_keep_separate_shapes(tmp_path: Path):
+    paths = []
+    for index, dims in enumerate(('"b d"', '"b d e"')):
+        path = tmp_path / f"pkg{index}.py"
+        path.write_text(
+            textwrap.dedent(HEADER)
+            + textwrap.dedent(f"""
+            def double(x: Float[Tensor, {dims}]) -> Float[Tensor, {dims}]:
+                return x * 2
+            """)
+        )
+        paths.append(str(path))
+
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths(paths, config, hover=True)
+    first = report.shapes_in(paths[0])["double"]["return"]
+    second = report.shapes_in(paths[1])["double"]["return"]
+    assert first != second
+    assert first.count(",") == 1
+    assert second.count(",") == 2
+
+
+def test_an_unresolvable_init_parameter_skips_the_class_both_ways(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model, dropout):
+            super().__init__()
+            self.W: Float[nn.Parameter, "d_model d_model"] = nn.Parameter(
+                torch.empty((d_model, d_model))
+            )
+            self.drop = nn.Dropout(dropout)
+
+        def forward(self, x: Float[Tensor, "b d_model"]) -> Float[Tensor, "b d_model"]:
+            return self.drop(x @ self.W)
+    """
+    )
+    report = check_paths(paths, config)
+    found = rules(report)
+    assert "trace-error" not in found
+    assert found.count("uninstantiable") == 2
 
 
 def test_variadic_rank_is_configurable(project):

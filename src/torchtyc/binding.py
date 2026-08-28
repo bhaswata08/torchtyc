@@ -159,6 +159,10 @@ class DimBinder:
             if "*" in rendered or "[" in rendered or rendered == str(size):
                 return None
             parts.append(rendered)
+        # jaxtyping allows at most one variadic, and so does the binder. Two
+        # separate anonymous runs cannot be written as a valid dim string.
+        if parts.count("...") > 1:
+            return None
         return " ".join(parts) if parts else None
 
 

@@ -169,9 +169,8 @@ def check_attributes(
     if cls is None:
         return []
 
-    dim_names = info.dim_names | {p.name for p in info.init_params}
     try:
-        instance = instantiate(info, cls, binder, dim_names)
+        instance = instantiate(info, cls, binder, info.dim_names)
     except TraceSkipped as exc:
         return [
             Diagnostic(
@@ -248,7 +247,9 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     variadic_rank = job.get("variadic_rank", 2)
     want_hover = job.get("hover", False)
     diagnostics: list[dict[str, Any]] = []
-    hovers: dict[str, dict[str, str]] = {}
+    # path -> qualname -> shapes. Two files in one job can define the same
+    # qualname, so the path has to be part of the key.
+    hovers: dict[str, dict[str, dict[str, str]]] = {}
 
     for path in job["paths"]:
         buffer = job.get("sources", {}).get(path)
@@ -290,7 +291,9 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             for diagnostic in found:
                 diagnostics.append(diagnostic.to_json())
             if want_hover:
-                hovers[target.qualname] = shapes_for_hover(result) if result is not None else {}
+                hovers.setdefault(path, {})[target.qualname] = (
+                    shapes_for_hover(result) if result is not None else {}
+                )
 
     return {"diagnostics": diagnostics, "hovers": hovers}
 

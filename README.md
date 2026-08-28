@@ -8,6 +8,13 @@ is the PyTorch counterpart to [jaxtyc](https://github.com/BeeGass/jaxtyc), which
 does the same thing for JAX with `jax.eval_shape`.
 
 ```python
+# model.py
+import torch
+from einops import einsum
+from jaxtyping import Float
+from torch import Tensor, nn
+
+
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
@@ -19,10 +26,12 @@ class Linear(nn.Module):
 
 ```
 $ torchtyc check model.py
-model.py:8:63: error[shape-mismatch]
-  in the return of `Linear.forward`: `in_features` is 101 here, but the traced dimension is out_features
+model.py:12:63: error[shape-mismatch]
+  in the return of `Linear.forward`: annotated `in_features`, but the traced dimension is `out_features`
     Expected: (..., in_features)
-    Got:      (107, 109, out_features)
+    Got:      (..., out_features)
+    12 | def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... in_features"]:
+  try:  Float[Tensor, "... out_features"]
   hint: this dimension is `out_features`, so the annotation likely names the wrong axis
 
 Found 1 error(s) in 1 function(s) across 1 file(s)
@@ -46,17 +55,28 @@ buys two things:
 transposed weight matrix would sail through. Distinct primes make the two
 impossible to confuse.
 
-**Products stay readable.** When a traced dimension comes out as 10403, and
-`seq` is 101 and `d_model` is 103, torchtyc factors it and reports
-`seq*d_model`, which tells you the function flattened two axes together:
+**Products stay readable.** A traced dimension that is the product of two
+bound primes factors back into the names that produced it, which tells you the
+function flattened two axes together. The primes themselves never reach the
+message:
+
+```python
+# flat.py
+def flatten(x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
+    return x.reshape(x.shape[0], -1)
+```
 
 ```
-model.py:12:61: error[rank-mismatch]
+flat.py:6:55: error[rank-mismatch]
   in the return of `flatten`: expected 3 dimensions, traced 2
     Expected: (batch, seq, d_model)
-    Got:      (batch, seq*d_model)
-  hint: seq*d_model looks like two annotated axes flattened into one
+    Got:      (batch, d_model*seq)
+    6 | def flatten(x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
+  hint: d_model*seq looks like two annotated axes flattened into one
 ```
+
+An axis you did not name renders as `...`, and a raw number appears only when
+an axis has no name at all.
 
 Because it runs your function rather than reasoning about it symbolically,
 torchtyc also catches anything that raises on the way: a bad `einsum`, a
@@ -93,8 +113,10 @@ torchtyc rules                   List the diagnostic rules
 ```
 $ torchtyc trace model.py::Linear.forward
 Linear.forward
-  x       : (107, 109, in_features)
-  return -> float32[(107, 109, out_features)]
+  x       : (..., in_features)
+  return -> float32[(..., out_features)]
+
+dimension names are bound to distinct primes starting at 101
 ```
 
 ## Constructing modules
@@ -124,12 +146,21 @@ jaxtyping, which only reads function signatures. Since torchtyc has a
 constructed instance in hand anyway, it checks them too:
 
 ```python
-self.W: Float[nn.Parameter, "d_out d_in"] = nn.Parameter(torch.empty((d_in, d_out)))
+# attr.py
+class Linear(nn.Module):
+    def __init__(self, d_in: int, d_out: int) -> None:
+        super().__init__()
+        self.W: Float[nn.Parameter, "d_out d_in"] = nn.Parameter(torch.empty((d_in, d_out)))
 ```
 
 ```
-model.py:5:17: error[attribute-mismatch]
-  `self.W`: `d_out` is 103 here, but the traced dimension is d_in
+attr.py:9:17: error[attribute-mismatch]
+  `self.W`: annotated `d_out`, but the traced dimension is `d_in`
+    Expected: (d_out, d_in)
+    Got:      (d_in, d_out)
+    9 | self.W: Float[nn.Parameter, "d_out d_in"] = nn.Parameter(torch.empty((d_in, d_out)))
+  try:  Float[nn.Parameter, "d_in d_out"]
+  hint: this dimension is `d_in`, so the annotation likely names the wrong axis
 ```
 
 ## Suppressing

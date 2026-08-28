@@ -139,7 +139,9 @@ class Mux:
                     *argv,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    # The client only reads stdout, so a downstream server's
+                    # own stderr can pass straight through and stay visible.
+                    stderr=None,
                 )
             except OSError as exc:
                 print(f"torchtyc mux: cannot start {argv[0]}: {exc}", file=sys.stderr)
@@ -205,6 +207,15 @@ class Mux:
             if message is None:
                 continue
             await self.from_server(index, message)
+
+        # A server that closed stdout has usually died; give it a moment to do
+        # so and say why, but never block the mux on one that stays alive.
+        try:
+            code = await asyncio.wait_for(server.process.wait(), timeout=1.0)
+        except TimeoutError:
+            return
+        if code:
+            print(f"torchtyc mux: {server.name} exited with {code}", file=sys.stderr)
 
     async def from_server(self, index: int, message: dict[str, Any]) -> None:
         if "method" in message and "id" in message:
@@ -342,10 +353,13 @@ async def _run(commands: list[str]) -> int:
     _, remaining = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in remaining:
         task.cancel()
+    failed = False
     for server in mux.servers:
         if server.process.returncode is None:
             server.process.terminate()
-    return 0
+        elif server.process.returncode:
+            failed = True
+    return 1 if failed else 0
 
 
 def torchtyc_command(overrides: Overrides) -> str:

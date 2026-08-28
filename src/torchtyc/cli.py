@@ -103,9 +103,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
     config = _config_from(args, path)
 
     report = check_paths([path], config, hover=True)
-    shapes = report.hovers.get(qualname)
+    traced = report.shapes_in(path)
+    shapes = traced.get(qualname)
     if shapes is None:
-        available = ", ".join(sorted(report.hovers)) or "none"
+        available = ", ".join(sorted(traced)) or "none"
         print(f"could not trace `{qualname}` (traceable here: {available})", file=sys.stderr)
         for diagnostic in report.diagnostics:
             if diagnostic.function == qualname:

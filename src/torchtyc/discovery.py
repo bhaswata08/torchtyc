@@ -75,10 +75,20 @@ class ClassInfo:
     init_params: list[Param] = field(default_factory=list)
     bases: list[str] = field(default_factory=list)
     attributes: list[Attribute] = field(default_factory=list)
+    # Dimension names annotated by the class's own methods, filled in as the
+    # scanner visits them.
+    method_dim_names: set[str] = field(default_factory=set)
 
     @property
     def dim_names(self) -> set[str]:
-        names: set[str] = set()
+        """Every dimension name the class writes, across attributes and methods.
+
+        Constructing an instance is a class-wide act: `__init__` takes the axes
+        that `forward` and `self.W` both talk about, so one method's annotation
+        is what names a constructor parameter for every other. Scoping this per
+        method would let the same class build under one method and not another.
+        """
+        names: set[str] = set(self.method_dim_names)
         for attribute in self.attributes:
             for array in _iter_arrays(attribute.spec):
                 names.update(array.named_dims)
@@ -378,26 +388,27 @@ def scan_source(source: str, path: str) -> FileScan:
             returns = parse_annotation(fn.returns)
         except AnnotationError as exc:
             error = str(exc)
-        targets.append(
-            Target(
-                qualname=f"{owner.name}.{fn.name}" if owner else fn.name,
-                name=fn.name,
-                position=Position(
-                    fn.lineno - 1,
-                    fn.col_offset,
-                    fn.lineno - 1,
-                    fn.col_offset + len("def ") + len(fn.name),
-                ),
-                params=_params_of(fn),
-                returns=returns,
-                returns_position=Position.of(fn.returns) if fn.returns else None,
-                decorators=[_decorator_name(d) for d in fn.decorator_list],
-                end_line=(fn.end_lineno or fn.lineno) - 1,
-                owner=owner,
-                annotation_error=error,
-                einops_calls=_find_einops(fn, einops_names),
-            )
+        target = Target(
+            qualname=f"{owner.name}.{fn.name}" if owner else fn.name,
+            name=fn.name,
+            position=Position(
+                fn.lineno - 1,
+                fn.col_offset,
+                fn.lineno - 1,
+                fn.col_offset + len("def ") + len(fn.name),
+            ),
+            params=_params_of(fn),
+            returns=returns,
+            returns_position=Position.of(fn.returns) if fn.returns else None,
+            decorators=[_decorator_name(d) for d in fn.decorator_list],
+            end_line=(fn.end_lineno or fn.lineno) - 1,
+            owner=owner,
+            annotation_error=error,
+            einops_calls=_find_einops(fn, einops_names),
         )
+        targets.append(target)
+        if owner is not None:
+            owner.method_dim_names.update(target.dim_names)
 
     def visit_class(node: ast.ClassDef) -> None:
         info = ClassInfo(

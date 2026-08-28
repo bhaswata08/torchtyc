@@ -129,10 +129,10 @@ def check_call(call: EinopsCall, target: Target, path: str) -> list[Diagnostic]:
     # that is one character away from an annotated one is usually a typo.
     dim_names = target.dim_names
     if dim_names:
-        for axis in known - set(call.keywords):
+        for axis in sorted(known - set(call.keywords)):
             if axis in dim_names:
                 continue
-            close = [name for name in dim_names if _one_edit_apart(axis, name)]
+            close = sorted(name for name in dim_names if _one_edit_apart(axis, name))
             if close:
                 out.append(
                     Diagnostic(

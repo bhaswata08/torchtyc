@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -238,7 +239,7 @@ def hover(ls: TorchtycServer, params: lsp.HoverParams) -> lsp.Hover | None:
     if report is None or target is None:
         return None
 
-    shapes = report.hovers.get(target.qualname)
+    shapes = report.shapes_in(uri_to_path(uri)).get(target.qualname)
     if not shapes:
         return None
 
@@ -264,9 +265,10 @@ def inlay_hints(ls: TorchtycServer, params: lsp.InlayHintParams) -> list[lsp.Inl
     if report is None or scan is None:
         return []
 
+    traced = report.shapes_in(uri_to_path(uri))
     hints: list[lsp.InlayHint] = []
     for target in scan.targets:
-        shapes = report.hovers.get(target.qualname)
+        shapes = traced.get(target.qualname)
         if not shapes:
             continue
         line = target.position.line
@@ -298,11 +300,12 @@ def code_lens(ls: TorchtycServer, params: lsp.CodeLensParams) -> list[lsp.CodeLe
     if scan is None:
         return []
 
+    traced = report.shapes_in(uri_to_path(uri)) if report else {}
     lenses: list[lsp.CodeLens] = []
     for target in scan.targets:
         if not target.has_array_annotation:
             continue
-        shapes = (report.hovers.get(target.qualname) if report else None) or {}
+        shapes = traced.get(target.qualname) or {}
         failing = [
             d
             for d in (report.diagnostics if report else [])
@@ -357,27 +360,19 @@ def code_action(ls: TorchtycServer, params: lsp.CodeActionParams) -> list[lsp.Co
         )
 
         suggestion = _extract(diagnostic.message, "try:")
-        dims = _dims_of(suggestion) if suggestion else None
-        if dims:
+        edit = _rewrite_annotation(uri, line, text, suggestion) if suggestion else None
+        if edit is not None:
             actions.append(
                 lsp.CodeAction(
-                    title=f'Change the annotation to "{dims}"',
+                    title=f"Change the annotation to {suggestion}",
                     kind=lsp.CodeActionKind.QuickFix,
                     diagnostics=[diagnostic],
-                    edit=_rewrite_dims(uri, line, text, dims),
+                    edit=edit,
                     is_preferred=True,
                 )
             )
 
     return actions
-
-
-def _dims_of(suggestion: str) -> str | None:
-    """Pull the dim string out of a suggested `Float[Tensor, "a b"]`."""
-    import re
-
-    match = re.search(r'"([^"]*)"', suggestion)
-    return match.group(1) if match else None
 
 
 def _extract(message: str, marker: str) -> str | None:
@@ -404,16 +399,27 @@ def _replace_line(uri: str, line: int, text: str) -> lsp.WorkspaceEdit:
     )
 
 
-def _rewrite_dims(uri: str, line: int, text: str, dims: str) -> lsp.WorkspaceEdit:
-    """Replace the last dim string on the line, which is the return annotation."""
-    import re
+# A jaxtyping annotation: a dtype class, then a bracketed array type and dim
+# string. The dim string is quoted, which is what tells it apart from an
+# ordinary subscript such as `weights[0]`.
+_ANNOTATION = re.compile(r'[A-Za-z_]\w*\s*\[[^][]*"[^"]*"\s*\]')
 
+
+def _rewrite_annotation(
+    uri: str, line: int, text: str, suggestion: str
+) -> lsp.WorkspaceEdit | None:
+    """Replace the last annotation on the line with the whole suggestion.
+
+    The whole annotation goes, not only its dim string: a dtype mismatch
+    suggests the same dims under a different dtype class, so rewriting the dims
+    alone would produce an edit that changes nothing.
+    """
     match = None
-    for match in re.finditer(r'"([^"]*)"', text):
+    for match in _ANNOTATION.finditer(text):
         pass
-    if match is None:
-        return lsp.WorkspaceEdit(changes={uri: []})
-    new_text = text[: match.start(1)] + dims + text[match.end(1) :]
+    if match is None or match.group(0) == suggestion:
+        return None
+    new_text = text[: match.start()] + suggestion + text[match.end() :]
     return _replace_line(uri, line, new_text)
 
 
@@ -432,7 +438,8 @@ async def command_trace(ls: TorchtycServer, args: list[Any]) -> dict[str, Any]:
     report = ls.reports.get(uri)
     if report is None:
         return {}
-    return report.hovers.get(qualname, {}) if qualname else report.hovers
+    traced = report.shapes_in(uri_to_path(uri))
+    return traced.get(qualname, {}) if qualname else traced
 
 
 @server.command("torchtyc.recheck")

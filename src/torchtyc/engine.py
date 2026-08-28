@@ -40,10 +40,15 @@ _BOOTSTRAP = (
 @dataclass
 class Report:
     diagnostics: list[Diagnostic] = field(default_factory=list)
-    hovers: dict[str, dict[str, str]] = field(default_factory=dict)
+    # path -> qualname -> traced shapes, as the worker returned them.
+    hovers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     checked_files: int = 0
     checked_functions: int = 0
     worker_error: str | None = None
+
+    def shapes_in(self, path: str) -> dict[str, dict[str, str]]:
+        """Every traced qualname in one file, under the path it was checked as."""
+        return self.hovers.get(path, {})
 
     @property
     def errors(self) -> int:
@@ -239,7 +244,7 @@ def run_worker(
     config: Config,
     sources: dict[str, str] | None = None,
     hover: bool = False,
-) -> tuple[list[Diagnostic], dict[str, dict[str, str]], str | None]:
+) -> tuple[list[Diagnostic], dict[str, dict[str, dict[str, str]]], str | None]:
     """Trace the files in a subprocess and bring back what it found."""
     job = {
         "paths": paths,
