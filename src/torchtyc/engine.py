@@ -293,7 +293,9 @@ def check_paths(
 
     for path in paths:
         try:
-            text = sources.get(path) or Path(path).read_text(encoding="utf-8")
+            # An empty buffer is still the buffer: `or` would fall back to the
+            # file on disk and report code the user has just deleted.
+            text = sources[path] if path in sources else Path(path).read_text(encoding="utf-8")
         except OSError as exc:
             report.diagnostics.append(
                 Diagnostic(

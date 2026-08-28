@@ -156,13 +156,19 @@ class _UseDefault(Exception):
 
 def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[str]) -> Any:
     """Construct a module on the meta device so its parameters cost nothing."""
+    args: list[Any] = []
     kwargs: dict[str, Any] = {}
+    positional_open = True
     for param in owner.init_params:
         if param.name in ("args", "kwargs"):
             continue
+        if param.positional_only and not positional_open:
+            continue
         try:
-            kwargs[param.name] = build_value(param, binder, dim_names)
+            value = build_value(param, binder, dim_names)
         except _UseDefault:
+            if param.positional_only:
+                positional_open = False
             continue
         except TraceSkipped as exc:
             raise TraceSkipped(
@@ -170,10 +176,14 @@ def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[s
                 f"cannot construct `{owner.name}`: {exc.message}",
                 hint=exc.hint,
             ) from exc
+        if param.positional_only:
+            args.append(value)
+        else:
+            kwargs[param.name] = value
 
     with torch.device("meta"), _quiet_init():
         try:
-            return cls(**kwargs)
+            return cls(*args, **kwargs)
         except TypeError as exc:
             raise TraceSkipped("uninstantiable", f"cannot construct `{owner.name}`: {exc}") from exc
 
@@ -256,19 +266,33 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
 
     arguments: dict[str, Any] = {}
     shapes: dict[str, tuple[int, ...]] = {}
+    # A parameter declared before `/` cannot be passed by name, so it goes in a
+    # separate list. Once one of them falls back to its default every later
+    # positional-only parameter must too, since defaults are trailing.
+    positional: list[Any] = []
+    keywords: dict[str, Any] = {}
+    positional_open = True
     for param in params:
+        if param.positional_only and not positional_open:
+            continue
         try:
             value = build_value(param, binder, target.dim_names)
         except _UseDefault:
+            if param.positional_only:
+                positional_open = False
             continue
         arguments[param.name] = value
+        if param.positional_only:
+            positional.append(value)
+        else:
+            keywords[param.name] = value
         if isinstance(value, torch.Tensor):
             shapes[param.name] = tuple(value.shape)
 
     # nn.Module.__call__ runs hooks that can allocate; calling forward directly
     # keeps the trace to the user's own code.
     with torch.device("meta"), torch.no_grad():
-        returned = fn(**arguments)
+        returned = fn(*positional, **keywords)
 
     return TraceResult(
         binder=binder, returned=returned, arguments=arguments, argument_shapes=shapes
@@ -360,10 +384,9 @@ def check_return(spec: Spec | None, value: Any, binder: DimBinder) -> list[dict[
     try:
         check_shape(spec, tuple(value.shape), binder)
     except BindingError as exc:
-        rule = "rank-mismatch" if "dimensions" in exc.message else "shape-mismatch"
         problems.append(
             {
-                "rule": rule,
+                "rule": exc.rule,
                 "message": exc.message,
                 "expected": exc.expected or spec.shape_str(),
                 "got": exc.got or binder.render_shape(tuple(value.shape)),

@@ -47,6 +47,24 @@ def find_root(start: Path) -> Path:
     return start if start.is_dir() else start.parent
 
 
+def _strings(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"expected a list, got {type(value).__name__}")
+    return [str(item) for item in value]
+
+
+def _at_least(value: int, minimum: int) -> int:
+    if value < minimum:
+        raise ValueError(f"{value} is below {minimum}")
+    return value
+
+
+def _positive(value: float) -> float:
+    if value <= 0:
+        raise ValueError(f"{value} is not positive")
+    return value
+
+
 def load(start: Path | str = ".") -> Config:
     root = find_root(Path(start))
     config = Config(root=root)
@@ -64,21 +82,25 @@ def load(start: Path | str = ".") -> Config:
     if not isinstance(table, dict):
         return config
 
-    if "severity" in table:
-        config.severity = Severity.parse(str(table["severity"]))
-    if "ignore" in table:
-        config.ignore = frozenset(str(r) for r in table["ignore"])
-    if "exclude" in table:
-        config.exclude = tuple(str(p) for p in table["exclude"])
-    if "variadic-rank" in table:
-        config.variadic_rank = int(table["variadic-rank"])
-    if "python" in table:
-        config.python = str(table["python"])
-    if "einops" in table:
-        config.einops = bool(table["einops"])
-    if "timeout" in table:
-        config.timeout = float(table["timeout"])
-    if "extra-paths" in table:
-        config.extra_paths = tuple(str(p) for p in table["extra-paths"])
+    # A bad value keeps its default rather than raising. The language server
+    # builds its config while starting, and a typo in pyproject.toml must not
+    # take the whole server down with a traceback the editor cannot show.
+    def read(key: str, attribute: str, convert) -> None:
+        if key not in table:
+            return
+        try:
+            value = convert(table[key])
+        except (TypeError, ValueError):
+            return
+        setattr(config, attribute, value)
+
+    read("severity", "severity", lambda v: Severity.parse(str(v)))
+    read("ignore", "ignore", lambda v: frozenset(_strings(v)))
+    read("exclude", "exclude", lambda v: tuple(_strings(v)))
+    read("variadic-rank", "variadic_rank", lambda v: _at_least(int(v), 1))
+    read("python", "python", str)
+    read("einops", "einops", bool)
+    read("timeout", "timeout", lambda v: _positive(float(v)))
+    read("extra-paths", "extra_paths", lambda v: tuple(_strings(v)))
 
     return config

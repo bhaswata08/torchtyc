@@ -225,3 +225,92 @@ def test_broken_interpreter_reports_worker_error(project):
     report = check_paths(paths, config)
     assert report.worker_error is not None
     assert not report.ok
+
+
+def test_positional_only_parameter_traces(project):
+    paths, config = project(
+        HEADER
+        + """
+    def half(x: Float[Tensor, "b d"], /) -> Float[Tensor, "b d"]:
+        return x * 0.5
+    """
+    )
+    assert check_paths(paths, config).diagnostics == []
+
+
+def test_positional_only_parameter_still_catches_a_bad_shape(project):
+    paths, config = project(
+        HEADER
+        + """
+    def swap(x: Float[Tensor, "b d"], /) -> Float[Tensor, "d b"]:
+        return x
+    """
+    )
+    assert "shape-mismatch" in rules(check_paths(paths, config))
+
+
+def test_variadic_conflict_is_reported_as_dim_inconsistent(project):
+    paths, config = project(
+        HEADER
+        + """
+    def drop(x: Float[Tensor, "*batch d"]) -> Float[Tensor, "*batch d"]:
+        return x[0]
+    """
+    )
+    assert "dim-inconsistent" in rules(check_paths(paths, config))
+
+
+def test_unsaved_buffer_is_what_gets_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    def saved(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    buffer = textwrap.dedent(
+        HEADER
+        + """
+    def renamed(x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config, sources={paths[0]: buffer})
+    found = rules(report)
+    assert "shape-mismatch" in found
+    assert "trace-error" not in found
+
+
+def test_an_emptied_buffer_reports_nothing(project):
+    paths, config = project(
+        HEADER
+        + """
+    def flat(x: Float[Tensor, "b s d"]):
+        return x.reshape(x.shape[0], -1)
+    """
+    )
+    assert "anonymous-return" in rules(check_paths(paths, config))
+    assert check_paths(paths, config, sources={paths[0]: ""}).diagnostics == []
+
+
+def test_a_buffer_inside_a_package_keeps_its_relative_imports(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "helpers.py").write_text("SCALE = 2\n")
+    model = package / "model.py"
+    model.write_text(textwrap.dedent(HEADER))
+
+    buffer = textwrap.dedent(
+        HEADER
+        + """
+    from .helpers import SCALE
+
+    def scale(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x * SCALE
+    """
+    )
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths([str(model)], config, sources={str(model): buffer})
+    assert report.diagnostics == []
+    assert report.worker_error is None

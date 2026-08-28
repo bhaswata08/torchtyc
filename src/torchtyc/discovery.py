@@ -49,6 +49,8 @@ class Param:
     # The declared type when it is a plain builtin, used to synthesise a value
     # for a non-tensor parameter.
     plain_type: str | None = None
+    # Declared before `/`, so it can only be passed positionally.
+    positional_only: bool = False
 
 
 @dataclass
@@ -98,6 +100,8 @@ class Target:
     returns: Spec | None
     returns_position: Position | None
     decorators: list[str]
+    # Last line of the function body, so a cursor below it belongs to no target.
+    end_line: int = 0
     owner: ClassInfo | None = None
     annotation_error: str | None = None
     einops_calls: list[EinopsCall] = field(default_factory=list)
@@ -183,13 +187,57 @@ def _base_name(node: ast.expr) -> str:
 _EINOPS_FUNCS = {"rearrange", "reduce", "repeat", "einsum", "pack", "unpack"}
 
 
-def _find_einops(node: ast.AST) -> list[EinopsCall]:
+@dataclass
+class EinopsNames:
+    """Which names in this file actually refer to einops.
+
+    The rules only hold for einops, so a call is claimed only when its callee
+    was imported from einops. `torch.einsum` shares a name with `einops.einsum`
+    but takes a different pattern syntax, and flagging it would be wrong.
+    """
+
+    # `import einops as E` -> {"einops", "E"}
+    modules: set[str] = field(default_factory=set)
+    # `from einops import rearrange as rr` -> {"rr": "rearrange"}
+    functions: dict[str, str] = field(default_factory=dict)
+
+    def func_of(self, call: ast.Call) -> str | None:
+        target = call.func
+        if isinstance(target, ast.Name):
+            return self.functions.get(target.id)
+        if (
+            isinstance(target, ast.Attribute)
+            and target.attr in _EINOPS_FUNCS
+            and _base_name(target.value) in self.modules
+        ):
+            return target.attr
+        return None
+
+
+def _einops_names(tree: ast.Module) -> EinopsNames:
+    names = EinopsNames()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "einops":
+                    names.modules.add(alias.asname or "einops")
+                elif alias.name.startswith("einops.") and alias.asname is None:
+                    # `import einops.layers.torch` binds the top-level `einops`.
+                    names.modules.add("einops")
+        elif isinstance(node, ast.ImportFrom) and node.module == "einops":
+            for alias in node.names:
+                if alias.name in _EINOPS_FUNCS:
+                    names.functions[alias.asname or alias.name] = alias.name
+    return names
+
+
+def _find_einops(node: ast.AST, names: EinopsNames) -> list[EinopsCall]:
     calls: list[EinopsCall] = []
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
-        name = _decorator_name(child).split(".")[-1]
-        if name not in _EINOPS_FUNCS:
+        name = names.func_of(child)
+        if name is None:
             continue
         pattern = next(
             (
@@ -216,7 +264,7 @@ def _find_einops(node: ast.AST) -> list[EinopsCall]:
     return calls
 
 
-def _parse_param(arg: ast.arg, has_default: bool) -> Param:
+def _parse_param(arg: ast.arg, has_default: bool, positional_only: bool = False) -> Param:
     position = Position.of(arg)
     spec: Spec | None = None
     error: str | None = None
@@ -235,6 +283,7 @@ def _parse_param(arg: ast.arg, has_default: bool) -> Param:
         has_default=has_default,
         annotation_error=error,
         plain_type=plain,
+        positional_only=positional_only,
     )
 
 
@@ -287,7 +336,11 @@ def _params_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Param]:
     positional = args.posonlyargs + args.args
     defaults_start = len(positional) - len(args.defaults)
     params = [
-        _parse_param(arg, has_default=index >= defaults_start)
+        _parse_param(
+            arg,
+            has_default=index >= defaults_start,
+            positional_only=index < len(args.posonlyargs),
+        )
         for index, arg in enumerate(positional)
     ]
     params += [
@@ -313,6 +366,7 @@ def scan_source(source: str, path: str) -> FileScan:
 
     targets: list[Target] = []
     classes: list[ClassInfo] = []
+    einops_names = _einops_names(tree)
 
     def visit_function(fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None) -> None:
         returns: Spec | None = None
@@ -335,9 +389,10 @@ def scan_source(source: str, path: str) -> FileScan:
                 returns=returns,
                 returns_position=Position.of(fn.returns) if fn.returns else None,
                 decorators=[_decorator_name(d) for d in fn.decorator_list],
+                end_line=(fn.end_lineno or fn.lineno) - 1,
                 owner=owner,
                 annotation_error=error,
-                einops_calls=_find_einops(fn),
+                einops_calls=_find_einops(fn, einops_names),
             )
         )
 

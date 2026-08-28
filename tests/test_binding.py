@@ -87,3 +87,41 @@ def test_two_variadics_rejected():
     binder = DimBinder()
     with pytest.raises(BindingError):
         shape_for(spec("... a ..."), binder)
+
+
+def test_describe_names_a_variadic_dimension():
+    binder = DimBinder()
+    binder.bind_variadic("batch")
+    assert binder.describe(binder.variadics["batch"][0]) == "batch[0]"
+
+
+def test_factored_axis_keeps_the_variadic_name():
+    binder = DimBinder()
+    batch = binder.bind_variadic("batch")
+    d_model = binder.bind("d_model")
+    factored = binder.describe(batch[0] * d_model)
+    assert set(factored.split("*")) == {"batch[0]", "d_model"}
+
+
+def test_variadic_conflict_is_reported_as_dim_inconsistent():
+    binder = DimBinder()
+    shape = shape_for(spec("*batch d"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("*batch d"), shape[1:], binder)
+    assert caught.value.rule == "dim-inconsistent"
+
+
+def test_rank_error_carries_the_rank_rule():
+    binder = DimBinder()
+    shape = shape_for(spec("a b c"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("a b c"), shape[:2], binder)
+    assert caught.value.rule == "rank-mismatch"
+
+
+def test_swapped_dims_stay_a_shape_mismatch():
+    binder = DimBinder()
+    a, b = shape_for(spec("a b"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("a b"), (b, a), binder)
+    assert caught.value.rule == "shape-mismatch"

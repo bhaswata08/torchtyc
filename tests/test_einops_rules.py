@@ -67,3 +67,39 @@ def f(x, y):
     return einsum(x, y, "a b, b c -> a c")
 """
     assert rules_for(source) == []
+
+
+def test_torch_einsum_is_left_alone():
+    source = """
+import torch
+def f(x, y):
+    return torch.einsum("bij,bjk->bik", x, y)
+"""
+    assert rules_for(source) == []
+
+
+def test_torch_einsum_sublist_form_is_left_alone():
+    source = """
+import torch
+def f(a, b):
+    return torch.einsum("ij,jk->ik", [a, b])
+"""
+    assert rules_for(source) == []
+
+
+def test_aliased_einops_call_is_still_checked():
+    source = """
+from einops import rearrange as rr
+def f(x):
+    return rr(x, "a b, b c -> a c")
+"""
+    assert "einops-pattern" in rules_for(source)
+
+
+def test_module_attribute_call_is_still_checked():
+    source = """
+import einops
+def f(x):
+    return einops.repeat(x, "a -> a b")
+"""
+    assert "einops-unknown-axis" in rules_for(source)

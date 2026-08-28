@@ -42,9 +42,18 @@ _PRIME_POOL = _primes_from(FIRST_PRIME, 512)
 class BindingError(ValueError):
     """A shape could not be matched against a spec."""
 
-    def __init__(self, message: str, *, expected: str = "", got: str = "", hint: str = ""):
+    def __init__(
+        self,
+        message: str,
+        *,
+        rule: str = "shape-mismatch",
+        expected: str = "",
+        got: str = "",
+        hint: str = "",
+    ):
         super().__init__(message)
         self.message = message
+        self.rule = rule
         self.expected = expected
         self.got = got
         self.hint = hint
@@ -98,9 +107,9 @@ class DimBinder:
 
     def _factor_names(self, size: int) -> list[str]:
         by_value = {v: k for k, v in self.sizes.items()}
-        for values in self.variadics.values():
+        for name, values in self.variadics.items():
             for index, value in enumerate(values):
-                by_value.setdefault(value, str(value))
+                by_value.setdefault(value, f"{name}[{index}]")
         names: list[str] = []
         remaining = size
         for value, name in sorted(by_value.items(), reverse=True):
@@ -179,6 +188,7 @@ def check_shape(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> N
         if len(shape) != fixed_rank:
             raise BindingError(
                 f"expected {fixed_rank} dimensions, traced {len(shape)}",
+                rule="rank-mismatch",
                 expected=spec.shape_str(),
                 got=binder.render_shape(shape),
                 hint=_rank_hint(spec, shape, binder),
@@ -188,6 +198,7 @@ def check_shape(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> N
         if len(shape) < fixed_rank:
             raise BindingError(
                 f"expected at least {fixed_rank} dimensions, traced {len(shape)}",
+                rule="rank-mismatch",
                 expected=spec.shape_str(),
                 got=binder.render_shape(shape),
             )
@@ -212,6 +223,7 @@ def _check_variadic(
         raise BindingError(
             f"*{variadic.name} was {binder.render_shape(known)} earlier "
             f"but traced {binder.render_shape(middle)} here",
+            rule="dim-inconsistent",
             expected=spec.shape_str(),
             got=binder.render_shape(middle),
         )

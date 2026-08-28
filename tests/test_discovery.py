@@ -84,3 +84,60 @@ def test_syntax_error_is_reported_not_raised():
     scan = scan_source("def broken(:\n", "bad.py")
     assert scan.syntax_error is not None
     assert scan.targets == []
+
+
+def test_end_line_covers_the_whole_function():
+    scan = scan_source(SOURCE, "net.py")
+    free = next(t for t in scan.targets if t.qualname == "free")
+    lines = SOURCE.splitlines()
+    assert lines[free.position.line].lstrip().startswith("def free")
+    assert lines[free.end_line].strip() == "return x"
+
+
+def test_positional_only_params_are_marked():
+    scan = scan_source("def f(a, /, b, *, c=1): ...\n", "a.py")
+    target = scan.targets[0]
+    assert [(p.name, p.positional_only) for p in target.params] == [
+        ("a", True),
+        ("b", False),
+        ("c", False),
+    ]
+
+
+def test_torch_einsum_is_not_an_einops_call():
+    source = """
+import torch
+
+
+def f(x, y):
+    return torch.einsum("bij,bjk->bik", x, y)
+"""
+    scan = scan_source(source, "a.py")
+    assert scan.targets[0].einops_calls == []
+
+
+def test_aliased_einops_imports_are_recognised():
+    source = """
+import einops as E
+from einops import rearrange as rr
+
+
+def f(x):
+    y = rr(x, "a b -> b a")
+    return E.reduce(y, "a b -> a", "sum")
+"""
+    scan = scan_source(source, "a.py")
+    assert {c.func for c in scan.targets[0].einops_calls} == {"rearrange", "reduce"}
+
+
+def test_a_local_function_sharing_an_einops_name_is_not_claimed():
+    source = """
+def rearrange(x, pattern):
+    return x
+
+
+def f(x):
+    return rearrange(x, "not a pattern")
+"""
+    scan = scan_source(source, "a.py")
+    assert scan.targets[1].einops_calls == []

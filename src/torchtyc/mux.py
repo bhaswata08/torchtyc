@@ -48,11 +48,17 @@ _CONCAT = {
 
 
 async def _read_message(stream: asyncio.StreamReader) -> dict[str, Any] | None:
+    """Read one LSP frame.
+
+    Returns None for a frame that could not be understood, which the caller
+    skips. End of stream raises EOFError instead, because that is the only
+    condition that should take a pump down.
+    """
     headers: dict[str, str] = {}
     while True:
         line = await stream.readline()
         if not line:
-            return None
+            raise EOFError
         text = line.decode("ascii", "replace").strip()
         if not text:
             break
@@ -60,8 +66,12 @@ async def _read_message(stream: asyncio.StreamReader) -> dict[str, Any] | None:
             key, value = text.split(":", 1)
             headers[key.strip().lower()] = value.strip()
 
-    length = int(headers.get("content-length", 0))
+    try:
+        length = int(headers.get("content-length", 0))
+    except ValueError:
+        length = 0
     if length <= 0:
+        log.warning("dropping a frame with no usable Content-Length")
         return None
     body = await stream.readexactly(length)
     try:
@@ -150,9 +160,12 @@ class Mux:
 
     async def pump_client(self, reader: asyncio.StreamReader) -> None:
         while True:
-            message = await _read_message(reader)
-            if message is None:
+            try:
+                message = await _read_message(reader)
+            except (EOFError, asyncio.IncompleteReadError):
                 break
+            if message is None:
+                continue
             await self.from_client(message)
 
     async def from_client(self, message: dict[str, Any]) -> None:
@@ -186,9 +199,12 @@ class Mux:
         server = self.servers[index]
         assert server.process.stdout is not None
         while True:
-            message = await _read_message(server.process.stdout)
-            if message is None:
+            try:
+                message = await _read_message(server.process.stdout)
+            except (EOFError, asyncio.IncompleteReadError):
                 break
+            if message is None:
+                continue
             await self.from_server(index, message)
 
     async def from_server(self, index: int, message: dict[str, Any]) -> None:
@@ -333,9 +349,26 @@ async def _run(commands: list[str]) -> int:
     return 0
 
 
+def torchtyc_command(config: Config) -> str:
+    """The child `torchtyc lsp` command, carrying this config on its argv.
+
+    The child reads pyproject.toml itself, but the options given on the mux
+    command line exist only here, so they are passed on explicitly.
+    """
+    argv = [sys.executable, "-m", "torchtyc.cli", "lsp"]
+    if config.python:
+        argv += ["--python", config.python]
+    argv += ["--variadic-rank", str(config.variadic_rank)]
+    for rule in sorted(config.ignore):
+        argv += ["--ignore", rule]
+    argv += ["--severity", config.severity.label]
+    argv += ["--timeout", str(config.timeout)]
+    return shlex.join(argv)
+
+
 def serve_mux(config: Config, servers: list[str]) -> int:
     """Run torchtyc's own server alongside the given commands."""
-    commands = [f"{sys.executable} -m torchtyc.cli lsp", *servers]
+    commands = [torchtyc_command(config), *servers]
     try:
         return asyncio.run(_run(commands))
     except KeyboardInterrupt:

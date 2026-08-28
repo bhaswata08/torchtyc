@@ -214,7 +214,9 @@ def _target_at(ls: TorchtycServer, uri: str, line: int) -> Target | None:
         return None
     best: Target | None = None
     for target in scan.targets:
-        if target.position.line <= line and (
+        # The cursor has to be inside the function, or module-level code below
+        # the last one would show that function's shapes.
+        if target.position.line <= line <= target.end_line and (
             best is None or target.position.line > best.position.line
         ):
             best = target

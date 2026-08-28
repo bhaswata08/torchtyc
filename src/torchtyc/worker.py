@@ -13,6 +13,7 @@ one JSON result on stdout. It lives in a separate process for three reasons:
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import sys
 import traceback
@@ -25,8 +26,14 @@ from .discovery import ClassInfo, Position, Target, scan_source
 from .tracing import TraceSkipped, check_return, describe, instantiate, trace
 
 
-def import_from_path(path: Path) -> Any:
-    """Import a file as part of its package, so relative imports resolve."""
+def import_from_path(path: Path, source: str | None = None) -> Any:
+    """Import a file as part of its package, so relative imports resolve.
+
+    With `source` given, that text is executed instead of the file on disk. The
+    module keeps the dotted name and the `__file__` it would have had, so
+    relative imports still resolve and a traceback still points at the real
+    path. That is what lets the editor check a buffer before it is saved.
+    """
     path = path.resolve()
     parts = [path.stem]
     root = path.parent
@@ -38,11 +45,29 @@ def import_from_path(path: Path) -> Any:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
-    # Drop any cached copy so an edit on disk is what gets checked.
+    # Drop any cached copy so the current text is what gets checked.
     for name in [n for n in sys.modules if n == dotted or n.startswith(dotted + ".")]:
         del sys.modules[name]
 
-    return importlib.import_module(dotted)
+    if source is None:
+        return importlib.import_module(dotted)
+
+    package, _, _ = dotted.rpartition(".")
+    if package:
+        importlib.import_module(package)
+
+    spec = importlib.util.spec_from_file_location(dotted, str(path))
+    if spec is None:
+        raise ImportError(f"cannot build a module spec for {path}")
+    module = importlib.util.module_from_spec(spec)
+    module.__file__ = str(path)
+    sys.modules[dotted] = module
+    try:
+        exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102
+    except BaseException:
+        sys.modules.pop(dotted, None)
+        raise
+    return module
 
 
 def _anchor(exc: BaseException, path: str, fallback: Position) -> tuple[Position, str]:
@@ -218,9 +243,8 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     hovers: dict[str, dict[str, str]] = {}
 
     for path in job["paths"]:
-        source = job.get("sources", {}).get(path)
-        if source is None:
-            source = Path(path).read_text(encoding="utf-8")
+        buffer = job.get("sources", {}).get(path)
+        source = buffer if buffer is not None else Path(path).read_text(encoding="utf-8")
         scan = scan_source(source, path)
         if scan.syntax_error is not None:
             continue  # the in-process pass already reported it
@@ -231,7 +255,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             continue
 
         try:
-            module = import_from_path(Path(path))
+            module = import_from_path(Path(path), buffer)
         except Exception as exc:  # noqa: BLE001
             position, text = _anchor(exc, path, Position(0, 0, 0, 1))
             diagnostics.append(
