@@ -1,3 +1,4 @@
+import re
 import threading
 
 import pytest
@@ -230,3 +231,28 @@ def test_suggest_dims_collapses_an_anonymous_run():
     binder = DimBinder(variadic_rank=3)
     shape = shape_for(spec("... d"), binder)
     assert binder.suggest_dims(shape) == "... d"
+
+
+def test_anonymous_axis_never_shows_its_prime():
+    binder = DimBinder()
+    built = shape_for(spec("_ d"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("d _"), built, binder)
+    error = caught.value
+    assert error.got == "(_, d)"
+    assert not re.search(r"\d", error.message)
+    assert not re.search(r"\d", error.got)
+
+
+def test_no_suggestion_when_the_shape_holds_an_anonymous_axis():
+    binder = DimBinder()
+    built = shape_for(spec("_ d"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("d _"), built, binder)
+    assert caught.value.suggestion is None
+
+
+def test_anonymous_axes_render_one_each_but_a_variadic_run_collapses():
+    binder = DimBinder(variadic_rank=3)
+    assert binder.render_shape(shape_for(spec("_ _ d"), binder)) == "(_, _, d)"
+    assert binder.render_shape(shape_for(spec("... e"), binder)) == "(..., e)"

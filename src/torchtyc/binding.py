@@ -73,6 +73,9 @@ class DimBinder:
     # Sizes standing in for an unnamed `...`. They have no name the user wrote,
     # so reporting the prime would be noise; they render as `...` instead.
     anonymous: set[int] = field(default_factory=set)
+    # Sizes standing in for a single unnamed `_` axis. Same reasoning as above,
+    # but they render as `_` so the shape mirrors what the annotation wrote.
+    anonymous_dims: set[int] = field(default_factory=set)
     _next: int = 0
 
     def fresh(self) -> int:
@@ -97,6 +100,11 @@ class DimBinder:
             self.variadics[name] = tuple(self.fresh() for _ in range(self.variadic_rank))
         return self.variadics[name]
 
+    def bind_anonymous(self) -> int:
+        value = self.fresh()
+        self.anonymous_dims.add(value)
+        return value
+
     def describe(self, size: int) -> str:
         """Render a concrete size back as a name where one is known.
 
@@ -111,6 +119,8 @@ class DimBinder:
                 return f"{name}[{values.index(size)}]"
         if size in self.anonymous:
             return "..."
+        if size in self.anonymous_dims:
+            return "_"
         factors = self._factor_names(size)
         if factors:
             return "*".join(factors)
@@ -155,8 +165,9 @@ class DimBinder:
                     continue
                 parts.append("...")
                 continue
-            # A product or an unnamed size is not something to paste back.
-            if "*" in rendered or "[" in rendered or rendered == str(size):
+            # A product, an axis with no name, or a bare size is not something
+            # to paste back over an annotation.
+            if "*" in rendered or "[" in rendered or rendered == "_" or rendered == str(size):
                 return None
             parts.append(rendered)
         # jaxtyping allows at most one variadic, and so does the binder. Two
@@ -181,7 +192,7 @@ def _size_of(dim: Dim, binder: DimBinder) -> int:
         assert dim.size is not None
         return dim.size
     if dim.kind == "anonymous":
-        return binder.fresh()
+        return binder.bind_anonymous()
     if dim.kind == "named":
         assert dim.name is not None
         return binder.bind(dim.name)
@@ -324,6 +335,8 @@ def _check_dim(
 def _swap_hint(name: str, size: int, binder: DimBinder) -> str:
     """When the traced size is another known dimension, say which one."""
     other = binder.describe(size)
+    if other in ("_", "..."):
+        return ""
     if other != str(size) and other != name:
         return f"this dimension is `{other}`, so the annotation likely names the wrong axis"
     return ""

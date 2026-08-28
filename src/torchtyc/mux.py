@@ -91,8 +91,6 @@ class Downstream:
     process: asyncio.subprocess.Process
     # Diagnostics this server last published, keyed by document uri.
     diagnostics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    capabilities: dict[str, Any] = field(default_factory=dict)
-    ready: asyncio.Event = field(default_factory=asyncio.Event)
 
     def send(self, message: dict[str, Any]) -> None:
         assert self.process.stdin is not None
@@ -241,10 +239,7 @@ class Mux:
         if "error" in message:
             pending.errors.append(message["error"])
         else:
-            result = message.get("result")
-            pending.results.append(result)
-            if pending.method == "initialize" and isinstance(result, dict):
-                self.servers[index].capabilities = result.get("capabilities", {}) or {}
+            pending.results.append(message.get("result"))
 
         if pending.complete:
             self.pending.pop(token, None)

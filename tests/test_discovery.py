@@ -1,4 +1,5 @@
 from torchtyc.annotations import ArraySpec
+from torchtyc.diagnostics import Diagnostic, Severity
 from torchtyc.discovery import scan_source
 
 SOURCE = """
@@ -143,3 +144,32 @@ def f(x):
 """
     scan = scan_source(source, "a.py")
     assert scan.targets[1].einops_calls == []
+
+
+def _suppressed(source: str, rules: list[str]) -> list[str]:
+    """Which of these rules survive the suppressions written in this source."""
+    from torchtyc.engine import apply_suppressions
+
+    scan = scan_source(source, "a.py")
+    diagnostics = [
+        Diagnostic(path="a.py", line=0, column=0, rule=rule, severity=Severity.ERROR, message="")
+        for rule in rules
+    ]
+    return [d.rule for d in apply_suppressions(diagnostics, scan.suppressions)]
+
+
+def test_two_scoped_ignores_on_one_line_both_apply():
+    source = "x = 1  # torchtyc: ignore[rank-mismatch]  # torchtyc: ignore[dtype-mismatch]\n"
+    assert _suppressed(source, ["rank-mismatch", "dtype-mismatch", "unused-dim"]) == ["unused-dim"]
+
+
+def test_a_bare_ignore_beside_a_scoped_one_covers_every_rule():
+    source = "x = 1  # torchtyc: ignore[rank-mismatch]  # torchtyc: ignore\n"
+    assert _suppressed(source, ["rank-mismatch", "unused-dim"]) == []
+
+
+def test_class_position_spans_the_class_name():
+    source = "class Net:\n    x = 1\n    y = 2\n"
+    info = scan_source(source, "a.py").classes[0]
+    assert (info.position.line, info.position.end_line) == (0, 0)
+    assert source.splitlines()[0][info.position.column : info.position.end_column] == "class Net"

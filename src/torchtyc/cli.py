@@ -105,8 +105,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
     report = check_paths([path], config, hover=True)
     traced = report.shapes_in(path)
     shapes = traced.get(qualname)
-    if shapes is None:
-        available = ", ".join(sorted(traced)) or "none"
+    # An empty entry means the trace ran and failed: the worker records the
+    # target with no shapes. Treat it like a target that was never traced.
+    if not shapes:
+        available = ", ".join(sorted(name for name, found in traced.items() if found)) or "none"
         print(f"could not trace `{qualname}` (traceable here: {available})", file=sys.stderr)
         for diagnostic in report.diagnostics:
             if diagnostic.function == qualname:
@@ -158,7 +160,7 @@ def cmd_lsp(args: argparse.Namespace) -> int:
         print("lsp needs the `lsp` extra: pip install 'torchtyc[lsp]'", file=sys.stderr)
         return 2
 
-    return serve(_config_from(args, "."), tcp_port=args.tcp, overrides=_overrides_from(args))
+    return serve(tcp_port=args.tcp, overrides=_overrides_from(args))
 
 
 def cmd_mux(args: argparse.Namespace) -> int:

@@ -511,3 +511,28 @@ def test_dtype_mismatch_suggests_the_right_dtype_class(project):
     report = check_paths(paths, config)
     diagnostic = next(d for d in report.diagnostics if d.rule == "dtype-mismatch")
     assert diagnostic.suggestion == 'Int[Tensor, "b"]'
+
+
+def test_trace_command_reports_a_failed_trace(tmp_path, capsys):
+    from torchtyc.cli import build_parser, cmd_trace
+
+    path = tmp_path / "model.py"
+    path.write_text(
+        textwrap.dedent(
+            """
+            from jaxtyping import Float
+            from torch import Tensor
+
+
+            def bad(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                y = x @ x
+                return y
+            """
+        )
+    )
+    args = build_parser().parse_args(["trace", f"{path}::bad", "--python", sys.executable])
+
+    assert cmd_trace(args) != 0
+    captured = capsys.readouterr()
+    assert "trace-error" in captured.err
+    assert "primes" not in captured.out

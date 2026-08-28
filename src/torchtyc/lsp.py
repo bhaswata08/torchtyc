@@ -85,7 +85,6 @@ class TorchtycServer(LanguageServer):
     def __init__(self) -> None:
         super().__init__(name="torchtyc", version=__version__)
         self.overrides: Overrides = Overrides()
-        self.config: Config = config_module.load(".")
         self.pending: dict[str, asyncio.Task] = {}
         self.reports: dict[str, Report] = {}
         self.scans: dict[str, Any] = {}
@@ -346,7 +345,7 @@ def code_action(ls: TorchtycServer, params: lsp.CodeActionParams) -> list[lsp.Co
         rule = diagnostic.code
         line = diagnostic.range.start.line
         try:
-            text = document.lines[line].rstrip("\n")
+            text = document.lines[line].rstrip("\r\n")
         except IndexError:
             continue
 
@@ -442,7 +441,8 @@ def _rewrite_annotation(
 
 @server.feature(lsp.WORKSPACE_DID_CHANGE_CONFIGURATION)
 async def did_change_configuration(ls: TorchtycServer, params: Any) -> None:
-    ls.config = ls.config_for(".")
+    # Every path reloads the config from disk, so there is nothing to refresh
+    # here beyond rechecking the files already open.
     for uri in list(ls.reports):
         await ls.trace_soon(uri, delay=0.0)
 
@@ -465,9 +465,8 @@ async def command_recheck(ls: TorchtycServer, args: list[Any]) -> None:
         await ls.trace_now(uri)
 
 
-def serve(config: Config, tcp_port: int | None = None, overrides: Overrides | None = None) -> int:
+def serve(tcp_port: int | None = None, overrides: Overrides | None = None) -> int:
     server.overrides = overrides or Overrides()
-    server.config = config
     if tcp_port:
         server.start_tcp("127.0.0.1", tcp_port)
     else:

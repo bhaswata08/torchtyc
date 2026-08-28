@@ -413,7 +413,12 @@ def scan_source(source: str, path: str) -> FileScan:
     def visit_class(node: ast.ClassDef) -> None:
         info = ClassInfo(
             name=node.name,
-            position=Position.of(node),
+            position=Position(
+                node.lineno - 1,
+                node.col_offset,
+                node.lineno - 1,
+                node.col_offset + len("class ") + len(node.name),
+            ),
             bases=[_base_name(base) for base in node.bases],
         )
         classes.append(info)
@@ -456,17 +461,22 @@ def scan_suppressions(source: str) -> list[Suppression]:
             (index + 1, line) for index, line in enumerate(source.splitlines()) if "#" in line
         ]
     for lineno, text in comments:
-        match = _IGNORE.search(text)
-        if match is None:
+        # A line carries one comment token but may hold several ignores, since
+        # the editor's silence action appends to whatever is already there.
+        named: set[str] = set()
+        bare = False
+        seen = False
+        for match in _IGNORE.finditer(text):
+            seen = True
+            rules = match.group(1)
+            if rules is None:
+                bare = True
+            else:
+                named.update(r.strip() for r in rules.split(",") if r.strip())
+        if not seen:
             continue
-        rules = match.group(1)
         found.append(
-            Suppression(
-                line=lineno - 1,
-                rules=(
-                    frozenset(r.strip() for r in rules.split(",") if r.strip()) if rules else None
-                ),
-            )
+            Suppression(line=lineno - 1, rules=None if bare or not named else frozenset(named))
         )
     return found
 

@@ -12,7 +12,6 @@ roughly a dictionary lookup per operator and zero FLOPs.
 from __future__ import annotations
 
 import contextlib
-import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,7 +70,6 @@ class TraceSkipped(Exception):
 class TraceResult:
     binder: DimBinder
     returned: Any
-    arguments: dict[str, Any]
     # Shapes of every annotated argument, for hover and inlay hints.
     argument_shapes: dict[str, tuple[int, ...]]
 
@@ -264,7 +262,6 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     binder = DimBinder(variadic_rank=variadic_rank)
     fn, params = resolve_callable(module, target, binder)
 
-    arguments: dict[str, Any] = {}
     shapes: dict[str, tuple[int, ...]] = {}
     # A parameter declared before `/` cannot be passed by name, so it goes in a
     # separate list. Once one of them falls back to its default every later
@@ -281,7 +278,6 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
             if param.positional_only:
                 positional_open = False
             continue
-        arguments[param.name] = value
         if param.positional_only:
             positional.append(value)
         else:
@@ -294,9 +290,7 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     with torch.device("meta"), torch.no_grad():
         returned = fn(*positional, **keywords)
 
-    return TraceResult(
-        binder=binder, returned=returned, arguments=arguments, argument_shapes=shapes
-    )
+    return TraceResult(binder=binder, returned=returned, argument_shapes=shapes)
 
 
 def describe(value: Any, binder: DimBinder) -> str:
@@ -420,14 +414,3 @@ def _dtype_class(dtype: torch.dtype) -> str | None:
         if entry and dtype in entry[1]:
             return name
     return None
-
-
-def signature_defaults(fn: Any) -> set[str]:
-    try:
-        return {
-            name
-            for name, p in inspect.signature(fn).parameters.items()
-            if p.default is not inspect.Parameter.empty
-        }
-    except (TypeError, ValueError):
-        return set()

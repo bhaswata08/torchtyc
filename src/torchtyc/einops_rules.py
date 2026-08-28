@@ -29,7 +29,6 @@ _ONE_SIDED = {"pack", "unpack"}
 class Pattern:
     left: list[list[str]]
     right: list[str]
-    has_ellipsis: bool
 
 
 class PatternError(ValueError):
@@ -45,7 +44,7 @@ def parse_pattern(text: str) -> Pattern:
     left_text, right_text = text.split("->")
     left = [_axes(group) for group in left_text.split(",")]
     right = _axes(right_text)
-    return Pattern(left=left, right=right, has_ellipsis="..." in text)
+    return Pattern(left=left, right=right)
 
 
 def _axes(text: str) -> list[str]:

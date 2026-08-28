@@ -177,7 +177,7 @@ def check_attributes(
                 path=path,
                 line=info.position.line,
                 column=info.position.column,
-                end_line=info.position.line,
+                end_line=info.position.end_line,
                 end_column=info.position.end_column,
                 rule=exc.rule,
                 severity=_severity(exc.rule),
