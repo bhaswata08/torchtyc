@@ -331,3 +331,29 @@ def test_a_size_one_dimension_does_not_stall_the_worker(project):
     report = check_paths(paths, config)
     assert report.worker_error is None
     assert "attribute-mismatch" in rules(report)
+
+
+def test_a_package_init_is_imported_once(tmp_path):
+    """`pkg/__init__.py` is the module `pkg`, so its body must not run twice."""
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        textwrap.dedent(HEADER)
+        + textwrap.dedent(
+            """
+            from pathlib import Path
+
+            LOG = Path(__file__).with_name("imports.log")
+            LOG.write_text(LOG.read_text() + "x" if LOG.exists() else "x")
+
+            def scale(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x * 2
+            """
+        )
+    )
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths([str(package / "__init__.py")], config)
+
+    assert report.worker_error is None
+    assert report.diagnostics == []
+    assert (package / "imports.log").read_text() == "x"

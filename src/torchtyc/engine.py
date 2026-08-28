@@ -83,7 +83,7 @@ def lint_scan(scan: FileScan, config: Config) -> list[Diagnostic]:
     scopes = _name_counts(scan)
 
     for target in scan.targets:
-        scope = scopes[target.owner.name if target.owner else ""]
+        scope = scopes[_scope_key(target)]
         out.extend(_lint_target(target, path, file_uses_jaxtyping, scope))
         if config.einops:
             for call in target.einops_calls:
@@ -92,9 +92,20 @@ def lint_scan(scan: FileScan, config: Config) -> list[Diagnostic]:
     return out
 
 
+def _scope_key(target: Target) -> str:
+    """A method shares its class's dimension names; a plain function shares nobody's.
+
+    A method legitimately gets a dimension from `self.W` or from an `__init__`
+    parameter, so the whole class is one scope. Two unrelated module-level
+    functions share nothing, so each gets its own scope and one function reusing
+    a name cannot mask another's unconstrained dimension.
+    """
+    return target.owner.name if target.owner else f"\0{target.qualname}"
+
+
 def _name_counts(scan: FileScan) -> dict[str, dict[str, int]]:
-    """How many times each dimension name is written, per class and at module level."""
-    scopes: dict[str, dict[str, int]] = {"": {}}
+    """How many times each dimension name is written, per class and per free function."""
+    scopes: dict[str, dict[str, int]] = {}
 
     def add(scope: dict[str, int], spec) -> None:
         for array in _arrays(spec):
@@ -113,7 +124,7 @@ def _name_counts(scan: FileScan) -> dict[str, dict[str, int]]:
                 scope[param.name] = scope.get(param.name, 0) + 1
 
     for target in scan.targets:
-        scope = scopes.setdefault(target.owner.name if target.owner else "", {})
+        scope = scopes.setdefault(_scope_key(target), {})
         for param in target.params:
             add(scope, param.spec)
         add(scope, target.returns)

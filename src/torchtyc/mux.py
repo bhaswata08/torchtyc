@@ -42,7 +42,6 @@ _CONCAT = {
     "textDocument/typeDefinition",
     "textDocument/implementation",
     "textDocument/declaration",
-    "textDocument/semanticTokens/full/delta",
     "workspace/symbol",
 }
 

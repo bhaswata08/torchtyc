@@ -32,4 +32,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras --dev
-      - run: uv run torchtyc check tests/fixtures --format github || true
+      # The fixtures are deliberately wrong, so exit 1 (findings) is the
+      # expected result. Anything else is torchtyc itself failing.
+      - run: |
+          status=0
+          uv run torchtyc check tests/fixtures --format github || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "torchtyc exited $status, which is a torchtyc failure" >&2
+            exit "$status"
+          fi

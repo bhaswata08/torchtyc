@@ -51,6 +51,15 @@ def f(x, y):
     assert "einops-pattern" in rules_for(source)
 
 
+def test_starred_operands_skip_the_count_check():
+    source = """
+from einops import einsum
+def f(operands):
+    return einsum(*operands, "a b, b c -> a c")
+"""
+    assert rules_for(source) == []
+
+
 def test_comma_in_rearrange_flagged():
     source = """
 from einops import rearrange

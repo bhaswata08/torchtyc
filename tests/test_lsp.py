@@ -144,3 +144,35 @@ def test_serve_hands_the_command_line_options_to_the_server(monkeypatch, tmp_pat
     config = lsp_module.server.config_for(str(root / "model.py"))
     assert config.python == "/from/cli/python"
     assert config.variadic_rank == 4
+
+
+LINT_SOURCE = """\
+from jaxtyping import Float
+from torch import Tensor
+
+
+def pool(x: Float[Tensor, "batch d"]) -> Float[Tensor, "batch"]:{ignore}
+    return x.sum(-1)
+"""
+
+
+def lint_rules(tmp_path, source: str) -> list[str]:
+    """Rules the fast, on-every-keystroke pass would publish for this buffer."""
+    path = tmp_path / "model.py"
+    path.write_text(source)
+
+    server = TorchtycServer()
+    published: list[list[Diagnostic]] = []
+    server.source_of = lambda _uri: source
+    server.publish = lambda _uri, diagnostics: published.append(diagnostics)
+    server.lint_now(path_to_uri(str(path)))
+    return [d.rule for d in published[0]]
+
+
+def test_the_fast_pass_reports_an_unsuppressed_lint_rule(tmp_path):
+    assert "unused-dim" in lint_rules(tmp_path, LINT_SOURCE.format(ignore=""))
+
+
+def test_the_fast_pass_honours_an_ignore_comment(tmp_path):
+    source = LINT_SOURCE.format(ignore="  # torchtyc: ignore[unused-dim]")
+    assert "unused-dim" not in lint_rules(tmp_path, source)

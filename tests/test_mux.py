@@ -57,6 +57,11 @@ def test_hovers_stack():
     assert "from torchtyc" in merged["contents"]["value"]
 
 
+def test_semantic_tokens_delta_is_passed_through_unwrapped():
+    delta = {"resultId": "7", "edits": [{"start": 0, "deleteCount": 1, "data": [1, 2, 3]}]}
+    assert merge("textDocument/semanticTokens/full/delta", [delta]) == delta
+
+
 def test_other_methods_take_the_first_answer():
     assert merge("textDocument/rename", [{"changes": {}}, {"changes": {"x": 1}}]) == {"changes": {}}
 

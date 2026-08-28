@@ -25,7 +25,7 @@ from . import config as config_module
 from .config import Config, Overrides
 from .diagnostics import Diagnostic, Severity
 from .discovery import Target, scan_source
-from .engine import Report, check_paths, lint_scan
+from .engine import Report, apply_suppressions, check_paths, lint_scan
 
 try:  # pygls 2.x
     from pygls.lsp.server import LanguageServer
@@ -112,7 +112,7 @@ class TorchtycServer(LanguageServer):
         self.scans[uri] = scan
         diagnostics = [
             d
-            for d in lint_scan(scan, config)
+            for d in apply_suppressions(lint_scan(scan, config), scan.suppressions)
             if d.rule not in config.ignore and d.severity <= config.severity
         ]
         # Keep whatever the last trace found, so results do not flicker away

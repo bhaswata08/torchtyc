@@ -23,7 +23,7 @@ from typing import Any
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import ClassInfo, Position, Target, scan_source
-from .tracing import TraceSkipped, check_return, describe, instantiate, trace
+from .tracing import TraceResult, TraceSkipped, check_return, describe, instantiate, trace
 
 
 def import_from_path(path: Path, source: str | None = None) -> Any:
@@ -35,8 +35,10 @@ def import_from_path(path: Path, source: str | None = None) -> Any:
     path. That is what lets the editor check a buffer before it is saved.
     """
     path = path.resolve()
-    parts = [path.stem]
     root = path.parent
+    # `pkg/__init__.py` is the module `pkg`, not `pkg.__init__`: importing the
+    # latter runs the package body a second time under a second name.
+    parts = [] if path.stem == "__init__" else [path.stem]
     while (root / "__init__.py").exists():
         parts.append(root.name)
         root = root.parent
@@ -91,7 +93,14 @@ def _severity(rule: str) -> Severity:
     return entry.severity if entry else Severity.ERROR
 
 
-def check_target(module: Any, target: Target, path: str, variadic_rank: int) -> list[Diagnostic]:
+def check_target(
+    module: Any, target: Target, path: str, variadic_rank: int
+) -> tuple[list[Diagnostic], TraceResult | None]:
+    """Trace one target once, returning its diagnostics and the trace itself.
+
+    The trace is handed back so hover can be derived from it: tracing runs the
+    forward pass, and the editor asks for both on every keystroke.
+    """
     out: list[Diagnostic] = []
     anchor = target.returns_position or target.position
 
@@ -111,7 +120,7 @@ def check_target(module: Any, target: Target, path: str, variadic_rank: int) -> 
                 function=target.qualname,
                 hint=exc.hint or None,
             )
-        ]
+        ], None
     except Exception as exc:  # noqa: BLE001 - any user error is a finding
         position, text = _anchor(exc, path, target.position)
         return [
@@ -127,7 +136,7 @@ def check_target(module: Any, target: Target, path: str, variadic_rank: int) -> 
                 function=target.qualname,
                 traceback=text,
             )
-        ]
+        ], None
 
     for problem in check_return(target.returns, result.returned, result.binder):
         out.append(
@@ -147,7 +156,7 @@ def check_target(module: Any, target: Target, path: str, variadic_rank: int) -> 
             )
         )
 
-    return out
+    return out, result
 
 
 def check_attributes(
@@ -200,6 +209,11 @@ def check_attributes(
             continue
         value = getattr(instance, attribute.name)
         for problem in check_return(attribute.spec, value, binder):
+            rule = (
+                "attribute-mismatch"
+                if problem["rule"] in ("shape-mismatch", "rank-mismatch")
+                else problem["rule"]
+            )
             out.append(
                 Diagnostic(
                     path=path,
@@ -207,12 +221,8 @@ def check_attributes(
                     column=attribute.position.column,
                     end_line=attribute.position.end_line,
                     end_column=attribute.position.end_column,
-                    rule=(
-                        "attribute-mismatch"
-                        if problem["rule"] in ("shape-mismatch", "rank-mismatch")
-                        else problem["rule"]
-                    ),
-                    severity=_severity(problem["rule"]),
+                    rule=rule,
+                    severity=_severity(rule),
                     message=f"`self.{attribute.name}`: {problem['message']}",
                     function=info.name,
                     expected=problem.get("expected"),
@@ -223,12 +233,8 @@ def check_attributes(
     return out
 
 
-def shapes_for_hover(module: Any, target: Target, variadic_rank: int) -> dict[str, str]:
-    """Best-effort argument and return shapes, used by hover and inlay hints."""
-    try:
-        result = trace(module, target, variadic_rank)
-    except Exception:  # noqa: BLE001
-        return {}
+def shapes_for_hover(result: TraceResult) -> dict[str, str]:
+    """Argument and return shapes of a completed trace, for hover and inlay hints."""
     hints = {
         name: result.binder.render_shape(shape) for name, shape in result.argument_shapes.items()
     }
@@ -278,10 +284,11 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 diagnostics.append(diagnostic.to_json())
 
         for target in targets:
-            for diagnostic in check_target(module, target, path, variadic_rank):
+            found, result = check_target(module, target, path, variadic_rank)
+            for diagnostic in found:
                 diagnostics.append(diagnostic.to_json())
             if want_hover:
-                hovers[target.qualname] = shapes_for_hover(module, target, variadic_rank)
+                hovers[target.qualname] = shapes_for_hover(result) if result is not None else {}
 
     return {"diagnostics": diagnostics, "hovers": hovers}
 

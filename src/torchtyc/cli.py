@@ -149,7 +149,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
 
 def cmd_lsp(args: argparse.Namespace) -> int:
-    from .lsp import serve
+    try:
+        from .lsp import serve
+    except ImportError:
+        print("lsp needs the `lsp` extra: pip install 'torchtyc[lsp]'", file=sys.stderr)
+        return 2
 
     return serve(_config_from(args, "."), tcp_port=args.tcp, overrides=_overrides_from(args))
 

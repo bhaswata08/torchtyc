@@ -139,13 +139,18 @@ def _github(report: Report, root: Path) -> str:
     levels = {Severity.ERROR: "error", Severity.WARNING: "warning", Severity.INFO: "notice"}
     lines: list[str] = []
     for d in report.diagnostics:
-        message = d.message.replace("\n", "%0A")
+        message = _escape_workflow(d.message)
         if d.hint:
-            message += f"%0Ahint: {d.hint}"
+            message += f"%0Ahint: {_escape_workflow(d.hint)}"
         lines.append(
             f"::{levels[d.severity]} file={_relative(d.path, root)},"
             f"line={d.line + 1},col={d.column + 1},title=torchtyc[{d.rule}]::{message}"
         )
     if report.worker_error:
-        lines.append(f"::error title=torchtyc::{report.worker_error}")
+        lines.append(f"::error title=torchtyc::{_escape_workflow(report.worker_error)}")
     return "\n".join(lines)
+
+
+def _escape_workflow(text: str) -> str:
+    """Escape per the GitHub workflow-command spec: `%` first, then CR and LF."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")

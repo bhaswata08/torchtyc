@@ -136,6 +136,8 @@ class EinopsCall:
     # Positional arguments that are not the pattern string. For einsum that is
     # the number of operand tensors, which the pattern must agree with.
     tensor_args: int = 0
+    # `f(*operands, pattern)` hides the real operand count from the AST.
+    starred_args: bool = False
     keywords: frozenset[str] = frozenset()
 
 
@@ -258,6 +260,7 @@ def _find_einops(node: ast.AST, names: EinopsNames) -> list[EinopsCall]:
                 pattern=pattern,
                 position=Position.of(child),
                 tensor_args=tensor_args,
+                starred_args=any(isinstance(arg, ast.Starred) for arg in child.args),
                 keywords=frozenset(k.arg for k in child.keywords if k.arg),
             )
         )
