@@ -50,6 +50,7 @@ class BindingError(ValueError):
         expected: str = "",
         got: str = "",
         hint: str = "",
+        suggestion: str | None = None,
     ):
         super().__init__(message)
         self.message = message
@@ -57,6 +58,9 @@ class BindingError(ValueError):
         self.expected = expected
         self.got = got
         self.hint = hint
+        # A dim string the user could paste over the annotation, when the whole
+        # traced shape has names. None when any axis cannot be named.
+        self.suggestion = suggestion
 
 
 @dataclass
@@ -66,6 +70,9 @@ class DimBinder:
     variadic_rank: int = DEFAULT_VARIADIC_RANK
     sizes: dict[str, int] = field(default_factory=dict)
     variadics: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # Sizes standing in for an unnamed `...`. They have no name the user wrote,
+    # so reporting the prime would be noise; they render as `...` instead.
+    anonymous: set[int] = field(default_factory=set)
     _next: int = 0
 
     def fresh(self) -> int:
@@ -83,7 +90,9 @@ class DimBinder:
 
     def bind_variadic(self, name: str | None) -> tuple[int, ...]:
         if name is None:
-            return tuple(self.fresh() for _ in range(self.variadic_rank))
+            sizes = tuple(self.fresh() for _ in range(self.variadic_rank))
+            self.anonymous.update(sizes)
+            return sizes
         if name not in self.variadics:
             self.variadics[name] = tuple(self.fresh() for _ in range(self.variadic_rank))
         return self.variadics[name]
@@ -100,6 +109,8 @@ class DimBinder:
         for name, values in self.variadics.items():
             if size in values:
                 return f"{name}[{values.index(size)}]"
+        if size in self.anonymous:
+            return "..."
         factors = self._factor_names(size)
         if factors:
             return "*".join(factors)
@@ -122,7 +133,33 @@ class DimBinder:
         return names if remaining == 1 and len(names) > 1 else []
 
     def render_shape(self, shape: tuple[int, ...]) -> str:
-        return "(" + ", ".join(self.describe(s) for s in shape) + ")"
+        parts: list[str] = []
+        for size in shape:
+            rendered = self.describe(size)
+            if rendered == "..." and parts and parts[-1] == "...":
+                continue
+            parts.append(rendered)
+        return "(" + ", ".join(parts) + ")"
+
+    def suggest_dims(self, shape: tuple[int, ...]) -> str | None:
+        """Render a traced shape as a dim string fit to paste into an annotation.
+
+        Returns None when any axis has no name the user would recognise, since
+        suggesting `(107, out_features)` would be worse than suggesting nothing.
+        """
+        parts: list[str] = []
+        for size in shape:
+            rendered = self.describe(size)
+            if rendered == "...":
+                if parts and parts[-1] == "...":
+                    continue
+                parts.append("...")
+                continue
+            # A product or an unnamed size is not something to paste back.
+            if "*" in rendered or "[" in rendered or rendered == str(size):
+                return None
+            parts.append(rendered)
+        return " ".join(parts) if parts else None
 
 
 def _split_variadic(spec: ArraySpec) -> tuple[list[Dim], Dim | None, list[Dim]]:
@@ -195,6 +232,7 @@ def check_shape(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> N
                 expected=spec.shape_str(),
                 got=binder.render_shape(shape),
                 hint=_rank_hint(spec, shape, binder),
+                suggestion=binder.suggest_dims(shape),
             )
         pairs = list(zip(spec.dims, shape))
     else:
@@ -204,6 +242,7 @@ def check_shape(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> N
                 rule="rank-mismatch",
                 expected=spec.shape_str(),
                 got=binder.render_shape(shape),
+                suggestion=binder.suggest_dims(shape),
             )
         middle = shape[len(prefix) : len(shape) - len(suffix)]
         _check_variadic(variadic, middle, binder, spec)
@@ -263,12 +302,16 @@ def _check_dim(
     if dim.name in binder.sizes:
         expected = binder.sizes[dim.name]
         if size != expected:
+            traced = binder.describe(size)
+            named = traced != str(size)
             raise BindingError(
-                f"`{dim.name}` is {expected} here, but the traced dimension is "
-                f"{binder.describe(size)}",
+                f"annotated `{dim.name}`, but the traced dimension is `{traced}`"
+                if named
+                else f"annotated `{dim.name}`, but this axis traced {size}",
                 expected=spec.shape_str(),
                 got=binder.render_shape(shape),
                 hint=_swap_hint(dim.name, size, binder),
+                suggestion=binder.suggest_dims(shape),
             )
     else:
         binder.sizes[dim.name] = size

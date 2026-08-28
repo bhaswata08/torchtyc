@@ -57,6 +57,8 @@ def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
         message += f"\n  expected: {diagnostic.expected}\n  got:      {diagnostic.got}"
     if diagnostic.hint:
         message += f"\n  hint: {diagnostic.hint}"
+    if diagnostic.suggestion:
+        message += f"\n  try: {diagnostic.suggestion}"
 
     end_line = diagnostic.end_line if diagnostic.end_line is not None else diagnostic.line
     end_column = (
@@ -354,20 +356,28 @@ def code_action(ls: TorchtycServer, params: lsp.CodeActionParams) -> list[lsp.Co
             )
         )
 
-        got = _extract(diagnostic.message, "got:")
-        if rule in ("shape-mismatch", "rank-mismatch") and got and got.startswith("("):
-            dims = got.strip("()").replace(",", " ").split()
-            if all(not d.isdigit() for d in dims):
-                actions.append(
-                    lsp.CodeAction(
-                        title=f'Change the annotation to "{" ".join(dims)}"',
-                        kind=lsp.CodeActionKind.QuickFix,
-                        diagnostics=[diagnostic],
-                        edit=_rewrite_dims(uri, line, text, " ".join(dims)),
-                    )
+        suggestion = _extract(diagnostic.message, "try:")
+        dims = _dims_of(suggestion) if suggestion else None
+        if dims:
+            actions.append(
+                lsp.CodeAction(
+                    title=f'Change the annotation to "{dims}"',
+                    kind=lsp.CodeActionKind.QuickFix,
+                    diagnostics=[diagnostic],
+                    edit=_rewrite_dims(uri, line, text, dims),
+                    is_preferred=True,
                 )
+            )
 
     return actions
+
+
+def _dims_of(suggestion: str) -> str | None:
+    """Pull the dim string out of a suggested `Float[Tensor, "a b"]`."""
+    import re
+
+    match = re.search(r'"([^"]*)"', suggestion)
+    return match.group(1) if match else None
 
 
 def _extract(message: str, marker: str) -> str | None:

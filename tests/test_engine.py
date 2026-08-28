@@ -386,3 +386,84 @@ def test_an_excluded_name_above_the_target_does_not_hide_the_tree(tmp_path):
 
     config = Config(root=tmp_path, python=sys.executable)
     assert collect_files([str(project_dir)], config) == [str(project_dir / "model.py")]
+
+
+def test_shape_mismatch_suggests_the_traced_annotation(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((out_features, in_features)))
+
+        def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... in_features"]:
+            return einsum(x, self.W, "... in_features, out_features in_features -> ... out_features")
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert diagnostic.suggestion == 'Float[Tensor, "... out_features"]'
+
+
+def test_message_does_not_leak_the_prime_when_both_axes_are_named(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((out_features, in_features)))
+
+        def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... in_features"]:
+            return einsum(x, self.W, "... in_features, out_features in_features -> ... out_features")
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert "101" not in diagnostic.message
+    assert "in_features" in diagnostic.message and "out_features" in diagnostic.message
+
+
+def test_traced_shape_renders_the_variadic_as_ellipsis(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((out_features, in_features)))
+
+        def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... in_features"]:
+            return einsum(x, self.W, "... in_features, out_features in_features -> ... out_features")
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert diagnostic.got == "(..., out_features)"
+
+
+def test_no_suggestion_when_the_traced_shape_has_a_product(project):
+    paths, config = project(
+        HEADER
+        + """
+    def flat(x: Float[Tensor, "b s d"]) -> Float[Tensor, "b s d"]:
+        return x.reshape(x.shape[0], -1)
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "rank-mismatch")
+    assert diagnostic.suggestion is None
+
+
+def test_dtype_mismatch_suggests_the_right_dtype_class(project):
+    paths, config = project(
+        HEADER
+        + """
+    def to_int(x: Float[Tensor, "b"]) -> Float[Tensor, "b"]:
+        return x.long()
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "dtype-mismatch")
+    assert diagnostic.suggestion == 'Int[Tensor, "b"]'

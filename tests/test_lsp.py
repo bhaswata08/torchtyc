@@ -176,3 +176,22 @@ def test_the_fast_pass_reports_an_unsuppressed_lint_rule(tmp_path):
 def test_the_fast_pass_honours_an_ignore_comment(tmp_path):
     source = LINT_SOURCE.format(ignore="  # torchtyc: ignore[unused-dim]")
     assert "unused-dim" not in lint_rules(tmp_path, source)
+
+
+def test_suggestion_reaches_the_lsp_message():
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=1,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        suggestion='Float[Tensor, "... out_features"]',
+    )
+    assert 'try: Float[Tensor, "... out_features"]' in to_lsp(diagnostic).message
+
+
+def test_quick_fix_applies_the_suggested_dim_string():
+    from torchtyc.lsp import _dims_of
+
+    assert _dims_of('Float[Tensor, "... out_features"]') == "... out_features"
+    assert _dims_of("no quotes here") is None

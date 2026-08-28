@@ -79,6 +79,8 @@ def _full(report: Report, root: Path, color: bool) -> str:
         source = _source_line(d)
         if source:
             body.append(_paint(f"    {d.line + 1} | {source}", _DIM, color))
+        if d.suggestion:
+            body.append(f"  try:  {d.suggestion}")
         if d.hint:
             body.append(_paint(f"  hint: {d.hint}", _DIM, color))
         blocks.append("\n".join(body))
@@ -140,6 +142,8 @@ def _github(report: Report, root: Path) -> str:
     lines: list[str] = []
     for d in report.diagnostics:
         message = _escape_workflow(d.message)
+        if d.suggestion:
+            message += f"%0Atry: {_escape_workflow(d.suggestion)}"
         if d.hint:
             message += f"%0Ahint: {_escape_workflow(d.hint)}"
         lines.append(

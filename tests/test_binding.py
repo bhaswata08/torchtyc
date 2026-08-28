@@ -162,3 +162,71 @@ def test_describe_survives_a_variadic_bound_to_one():
     binder.variadics["batch"] = (1, 1)
     binder.sizes["d_model"] = 101
     assert describe_within(binder, 7) == "7"
+
+
+def test_anonymous_variadic_renders_as_ellipsis():
+    binder = DimBinder()
+    shape = shape_for(spec("... d"), binder)
+    rendered = binder.render_shape(shape)
+    # The primes standing in for `...` are bookkeeping, not something the user
+    # wrote, so they must not surface.
+    assert rendered == "(..., d)"
+    assert "10" not in rendered
+
+
+def test_named_variadic_keeps_its_name():
+    binder = DimBinder()
+    shape = shape_for(spec("*batch d"), binder)
+    assert "batch[0]" in binder.render_shape(shape)
+
+
+def test_mismatch_message_names_both_axes_without_primes():
+    binder = DimBinder()
+    binder.bind("in_features")
+    binder.bind("out_features")
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("in_features"), (binder.sizes["out_features"],), binder)
+    message = caught.value.message
+    assert "`in_features`" in message and "`out_features`" in message
+    assert str(binder.sizes["in_features"]) not in message
+
+
+def test_mismatch_message_falls_back_to_a_number_when_unnamed():
+    binder = DimBinder()
+    binder.bind("d")
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("d"), (7,), binder)
+    assert "7" in caught.value.message
+
+
+def test_suggestion_is_offered_when_every_axis_has_a_name():
+    binder = DimBinder()
+    binder.bind("in_features")
+    out = binder.bind("out_features")
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("... in_features"), (*binder.bind_variadic(None), out), binder)
+    assert caught.value.suggestion == "... out_features"
+
+
+def test_no_suggestion_when_an_axis_is_a_product():
+    binder = DimBinder()
+    binder.sizes.update({"seq": 101, "d_model": 103})
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("seq d_model"), (101 * 103,), binder)
+    # Suggesting `seq*d_model` would not be a valid dim string, so nothing is
+    # offered rather than something wrong.
+    assert caught.value.suggestion is None
+
+
+def test_no_suggestion_when_an_axis_has_no_name():
+    binder = DimBinder()
+    binder.bind("d")
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("d"), (7,), binder)
+    assert caught.value.suggestion is None
+
+
+def test_suggest_dims_collapses_an_anonymous_run():
+    binder = DimBinder(variadic_rank=3)
+    shape = shape_for(spec("... d"), binder)
+    assert binder.suggest_dims(shape) == "... d"

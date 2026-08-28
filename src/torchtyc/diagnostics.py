@@ -127,6 +127,10 @@ class Diagnostic:
     expected: str | None = None
     got: str | None = None
     hint: str | None = None
+    # A concrete replacement the user can apply, such as the dim string the
+    # annotation should have carried. Only set when torchtyc can name every
+    # axis involved, so a suggestion is never a guess.
+    suggestion: str | None = None
     traceback: str | None = None
     related: list[dict[str, Any]] = field(default_factory=list)
 

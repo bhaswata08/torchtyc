@@ -361,12 +361,18 @@ def check_return(spec: Spec | None, value: Any, binder: DimBinder) -> list[dict[
 
     accepted = accepted_dtypes(spec)
     if accepted and value.dtype not in accepted:
+        suggested = _dtype_class(value.dtype)
         problems.append(
             {
                 "rule": "dtype-mismatch",
                 "message": f"returned {_dtype_name(value.dtype)}, annotated `{spec.dtype}`",
                 "expected": spec.dtype,
                 "got": _dtype_name(value.dtype),
+                "suggestion": (
+                    f'{suggested}[{spec.array_type}, "{" ".join(str(d) for d in spec.dims)}"]'
+                    if suggested
+                    else None
+                ),
             }
         )
 
@@ -391,10 +397,29 @@ def check_return(spec: Spec | None, value: Any, binder: DimBinder) -> list[dict[
                 "expected": exc.expected or spec.shape_str(),
                 "got": exc.got or binder.render_shape(tuple(value.shape)),
                 "hint": exc.hint,
+                "suggestion": (
+                    f'{spec.dtype}[{spec.array_type}, "{exc.suggestion}"]'
+                    if exc.suggestion
+                    else None
+                ),
             }
         )
 
     return problems
+
+
+def _dtype_class(dtype: torch.dtype) -> str | None:
+    """The broadest jaxtyping dtype class that accepts this dtype.
+
+    Preferring the broad class (`Float` over `Float32`) matches how annotations
+    are normally written, and keeps the suggestion from over-constraining a
+    function that is fine in half precision too.
+    """
+    for name in ("Float", "Complex", "Int", "UInt", "Bool"):
+        entry = DTYPES.get(name)
+        if entry and dtype in entry[1]:
+            return name
+    return None
 
 
 def signature_defaults(fn: Any) -> set[str]:

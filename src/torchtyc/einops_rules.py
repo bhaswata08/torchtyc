@@ -82,11 +82,7 @@ def check_call(call: EinopsCall, target: Target, path: str) -> list[Diagnostic]:
 
     out: list[Diagnostic] = []
 
-    if (
-        call.func == "einsum"
-        and not call.starred_args
-        and len(pattern.left) != call.tensor_args
-    ):
+    if call.func == "einsum" and not call.starred_args and len(pattern.left) != call.tensor_args:
         out.append(
             Diagnostic(
                 **base,

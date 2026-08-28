@@ -153,6 +153,7 @@ def check_target(
                 expected=problem.get("expected"),
                 got=problem.get("got"),
                 hint=problem.get("hint") or None,
+                suggestion=problem.get("suggestion"),
             )
         )
 
@@ -228,6 +229,7 @@ def check_attributes(
                     expected=problem.get("expected"),
                     got=problem.get("got"),
                     hint=problem.get("hint") or None,
+                    suggestion=problem.get("suggestion"),
                 )
             )
     return out
