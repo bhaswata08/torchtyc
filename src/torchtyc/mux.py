@@ -26,7 +26,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import Config
+from .config import Overrides
 
 log = logging.getLogger("torchtyc.mux")
 
@@ -349,26 +349,30 @@ async def _run(commands: list[str]) -> int:
     return 0
 
 
-def torchtyc_command(config: Config) -> str:
-    """The child `torchtyc lsp` command, carrying this config on its argv.
+def torchtyc_command(overrides: Overrides) -> str:
+    """The child `torchtyc lsp` command, carrying the mux options on its argv.
 
-    The child reads pyproject.toml itself, but the options given on the mux
-    command line exist only here, so they are passed on explicitly.
+    Only what the user typed is passed on. The child discovers pyproject.toml
+    per file itself, so forwarding the resolved values would flatten a monorepo
+    onto whichever project the mux happened to start in.
     """
     argv = [sys.executable, "-m", "torchtyc.cli", "lsp"]
-    if config.python:
-        argv += ["--python", config.python]
-    argv += ["--variadic-rank", str(config.variadic_rank)]
-    for rule in sorted(config.ignore):
+    if overrides.python:
+        argv += ["--python", overrides.python]
+    if overrides.variadic_rank is not None:
+        argv += ["--variadic-rank", str(overrides.variadic_rank)]
+    for rule in sorted(overrides.ignore):
         argv += ["--ignore", rule]
-    argv += ["--severity", config.severity.label]
-    argv += ["--timeout", str(config.timeout)]
+    if overrides.severity is not None:
+        argv += ["--severity", overrides.severity.label]
+    if overrides.timeout is not None:
+        argv += ["--timeout", str(overrides.timeout)]
     return shlex.join(argv)
 
 
-def serve_mux(config: Config, servers: list[str]) -> int:
+def serve_mux(overrides: Overrides, servers: list[str]) -> int:
     """Run torchtyc's own server alongside the given commands."""
-    commands = [torchtyc_command(config), *servers]
+    commands = [torchtyc_command(overrides), *servers]
     try:
         return asyncio.run(_run(commands))
     except KeyboardInterrupt:

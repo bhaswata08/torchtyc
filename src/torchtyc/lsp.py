@@ -22,7 +22,7 @@ from lsprotocol import types as lsp
 
 from . import __version__
 from . import config as config_module
-from .config import Config
+from .config import Config, Overrides
 from .diagnostics import Diagnostic, Severity
 from .discovery import Target, scan_source
 from .engine import Report, check_paths, lint_scan
@@ -81,6 +81,7 @@ def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
 class TorchtycServer(LanguageServer):
     def __init__(self) -> None:
         super().__init__(name="torchtyc", version=__version__)
+        self.overrides: Overrides = Overrides()
         self.config: Config = config_module.load(".")
         self.pending: dict[str, asyncio.Task] = {}
         self.reports: dict[str, Report] = {}
@@ -90,8 +91,12 @@ class TorchtycServer(LanguageServer):
         return self.workspace.get_text_document(uri).source
 
     def config_for(self, path: str) -> Config:
-        """Reload config per file, so a monorepo with several projects works."""
-        return config_module.load(path)
+        """Reload config per file, so a monorepo with several projects works.
+
+        What the user typed on the command line is applied on top, so it wins
+        wherever the file happens to live.
+        """
+        return self.overrides.apply(config_module.load(path))
 
     def publish(self, uri: str, diagnostics: list[Diagnostic]) -> None:
         self.text_document_publish_diagnostics(
@@ -404,7 +409,7 @@ def _rewrite_dims(uri: str, line: int, text: str, dims: str) -> lsp.WorkspaceEdi
 
 @server.feature(lsp.WORKSPACE_DID_CHANGE_CONFIGURATION)
 async def did_change_configuration(ls: TorchtycServer, params: Any) -> None:
-    ls.config = config_module.load(".")
+    ls.config = ls.config_for(".")
     for uri in list(ls.reports):
         await ls.trace_soon(uri, delay=0.0)
 
@@ -426,7 +431,8 @@ async def command_recheck(ls: TorchtycServer, args: list[Any]) -> None:
         await ls.trace_now(uri)
 
 
-def serve(config: Config, tcp_port: int | None = None) -> int:
+def serve(config: Config, tcp_port: int | None = None, overrides: Overrides | None = None) -> int:
+    server.overrides = overrides or Overrides()
     server.config = config
     if tcp_port:
         server.start_tcp("127.0.0.1", tcp_port)

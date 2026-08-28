@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from torchtyc.annotations import ArraySpec, parse_dim_string
@@ -125,3 +127,38 @@ def test_swapped_dims_stay_a_shape_mismatch():
     with pytest.raises(BindingError) as caught:
         check_shape(spec("a b"), (b, a), binder)
     assert caught.value.rule == "shape-mismatch"
+
+
+def describe_within(binder: DimBinder, size: int, seconds: float = 5.0) -> str:
+    """describe() in a thread, so a non-terminating loop fails fast."""
+    out: list[str] = []
+    worker = threading.Thread(target=lambda: out.append(binder.describe(size)), daemon=True)
+    worker.start()
+    worker.join(timeout=seconds)
+    assert not worker.is_alive(), "describe did not return"
+    return out[0]
+
+
+def test_describe_returns_when_a_name_is_bound_to_one():
+    binder = DimBinder()
+    binder.sizes.update({"one": 1, "d_model": 101})
+    assert describe_within(binder, 7) == "7"
+
+
+def test_a_name_bound_to_one_does_not_pad_a_factored_axis():
+    binder = DimBinder()
+    binder.sizes.update({"one": 1, "seq": 101, "d_model": 103})
+    assert set(describe_within(binder, 101 * 103).split("*")) == {"seq", "d_model"}
+
+
+def test_describe_survives_a_name_bound_to_zero():
+    binder = DimBinder()
+    binder.sizes.update({"empty": 0, "d_model": 101})
+    assert describe_within(binder, 7) == "7"
+
+
+def test_describe_survives_a_variadic_bound_to_one():
+    binder = DimBinder()
+    binder.variadics["batch"] = (1, 1)
+    binder.sizes["d_model"] = 101
+    assert describe_within(binder, 7) == "7"

@@ -39,6 +39,34 @@ class Config:
         return sys.executable
 
 
+@dataclass(frozen=True)
+class Overrides:
+    """Options given on a command line, which win over any pyproject.toml.
+
+    They are kept apart from Config so a long-running server can still discover
+    the project a file belongs to and then apply what the user asked for on top.
+    """
+
+    python: str | None = None
+    variadic_rank: int | None = None
+    ignore: frozenset[str] = frozenset()
+    severity: Severity | None = None
+    timeout: float | None = None
+
+    def apply(self, config: Config) -> Config:
+        if self.python is not None:
+            config.python = self.python
+        if self.variadic_rank is not None:
+            config.variadic_rank = self.variadic_rank
+        if self.ignore:
+            config.ignore = config.ignore | self.ignore
+        if self.severity is not None:
+            config.severity = self.severity
+        if self.timeout is not None:
+            config.timeout = self.timeout
+        return config
+
+
 def find_root(start: Path) -> Path:
     start = start.resolve()
     for directory in [start, *start.parents]:

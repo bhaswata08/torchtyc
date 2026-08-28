@@ -106,10 +106,13 @@ class DimBinder:
         return str(size)
 
     def _factor_names(self, size: int) -> list[str]:
-        by_value = {v: k for k, v in self.sizes.items()}
+        # Only a size above one can be a factor. A name bound to 1 would never
+        # shrink the remainder, and one bound to 0 would divide by zero.
+        by_value = {v: k for k, v in self.sizes.items() if v > 1}
         for name, values in self.variadics.items():
             for index, value in enumerate(values):
-                by_value.setdefault(value, f"{name}[{index}]")
+                if value > 1:
+                    by_value.setdefault(value, f"{name}[{index}]")
         names: list[str] = []
         remaining = size
         for value, name in sorted(by_value.items(), reverse=True):

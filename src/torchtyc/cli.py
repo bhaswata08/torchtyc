@@ -26,19 +26,19 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=float, help="seconds to allow the worker")
 
 
+def _overrides_from(args: argparse.Namespace) -> config_module.Overrides:
+    severity = getattr(args, "severity", None)
+    return config_module.Overrides(
+        python=getattr(args, "python", None) or None,
+        variadic_rank=getattr(args, "variadic_rank", None) or None,
+        ignore=frozenset(getattr(args, "ignore", None) or ()),
+        severity=Severity.parse(severity) if severity else None,
+        timeout=getattr(args, "timeout", None) or None,
+    )
+
+
 def _config_from(args: argparse.Namespace, start: str):
-    config = config_module.load(start)
-    if getattr(args, "python", None):
-        config.python = args.python
-    if getattr(args, "variadic_rank", None):
-        config.variadic_rank = args.variadic_rank
-    if getattr(args, "ignore", None):
-        config.ignore = config.ignore | frozenset(args.ignore)
-    if getattr(args, "severity", None):
-        config.severity = Severity.parse(args.severity)
-    if getattr(args, "timeout", None):
-        config.timeout = args.timeout
-    return config
+    return _overrides_from(args).apply(config_module.load(start))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -151,14 +151,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_lsp(args: argparse.Namespace) -> int:
     from .lsp import serve
 
-    return serve(_config_from(args, "."), tcp_port=args.tcp)
+    return serve(_config_from(args, "."), tcp_port=args.tcp, overrides=_overrides_from(args))
 
 
 def cmd_mux(args: argparse.Namespace) -> int:
     from .mux import serve_mux
 
     servers = args.server or ["basedpyright-langserver --stdio"]
-    return serve_mux(_config_from(args, "."), servers)
+    return serve_mux(_overrides_from(args), servers)
 
 
 def cmd_rules(_: argparse.Namespace) -> int:

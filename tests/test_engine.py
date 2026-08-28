@@ -314,3 +314,20 @@ def test_a_buffer_inside_a_package_keeps_its_relative_imports(tmp_path):
     report = check_paths([str(model)], config, sources={str(model): buffer})
     assert report.diagnostics == []
     assert report.worker_error is None
+
+
+def test_a_size_one_dimension_does_not_stall_the_worker(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Net(nn.Module):
+        def __init__(self, d_in: int) -> None:
+            super().__init__()
+            self.bias: Float[nn.Parameter, "one"] = nn.Parameter(torch.empty(1))
+            self.W: Float[nn.Parameter, "d_in one"] = nn.Parameter(torch.empty((7, 1)))
+    """
+    )
+    config.timeout = 20.0
+    report = check_paths(paths, config)
+    assert report.worker_error is None
+    assert "attribute-mismatch" in rules(report)

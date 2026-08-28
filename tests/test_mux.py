@@ -3,8 +3,8 @@ import shlex
 
 import pytest
 
-from torchtyc.cli import _config_from, build_parser
-from torchtyc.config import Config
+from torchtyc.cli import _overrides_from, build_parser
+from torchtyc.config import Overrides
 from torchtyc.diagnostics import Severity
 from torchtyc.mux import (
     Mux,
@@ -131,19 +131,21 @@ def test_a_malformed_frame_does_not_stop_the_pump():
     assert [m["method"] for m in seen] == ["exit"]
 
 
-def test_mux_forwards_its_options_to_the_child_server(tmp_path):
-    config = Config(
-        root=tmp_path,
+def child_overrides(overrides: Overrides) -> Overrides:
+    argv = shlex.split(torchtyc_command(overrides))
+    return _overrides_from(build_parser().parse_args(argv[argv.index("lsp") :]))
+
+
+def test_mux_forwards_its_options_to_the_child_server():
+    overrides = Overrides(
         python="/tmp/venv/bin/python",
         variadic_rank=4,
         ignore=frozenset({"unused-dim"}),
         severity=Severity.WARNING,
         timeout=5.0,
     )
-    argv = shlex.split(torchtyc_command(config))
-    child = _config_from(build_parser().parse_args(argv[argv.index("lsp") :]), str(tmp_path))
-    assert child.python == config.python
-    assert child.variadic_rank == 4
-    assert child.severity is Severity.WARNING
-    assert child.timeout == 5.0
-    assert "unused-dim" in child.ignore
+    assert child_overrides(overrides) == overrides
+
+
+def test_mux_forwards_nothing_the_user_did_not_ask_for():
+    assert child_overrides(Overrides()) == Overrides()
