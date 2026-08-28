@@ -151,7 +151,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_lsp(args: argparse.Namespace) -> int:
     try:
         from .lsp import serve
-    except ImportError:
+    except ImportError as exc:
+        if (exc.name or "").split(".")[0] not in ("pygls", "lsprotocol"):
+            raise
         print("lsp needs the `lsp` extra: pip install 'torchtyc[lsp]'", file=sys.stderr)
         return 2
 

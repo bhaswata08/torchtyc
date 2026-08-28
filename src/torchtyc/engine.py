@@ -103,6 +103,15 @@ def _scope_key(target: Target) -> str:
     return target.owner.name if target.owner else f"\0{target.qualname}"
 
 
+def _may_supply_dim(param) -> bool:
+    """Whether the tracer would bind this parameter to a dimension of that name."""
+    return (
+        bool(param.name)
+        and not isinstance(param.spec, (ArraySpec, TupleSpec))
+        and param.plain_type in (None, "int")
+    )
+
+
 def _name_counts(scan: FileScan) -> dict[str, dict[str, int]]:
     """How many times each dimension name is written, per class and per free function."""
     scopes: dict[str, dict[str, int]] = {}
@@ -127,6 +136,10 @@ def _name_counts(scan: FileScan) -> dict[str, dict[str, int]]:
         scope = scopes.setdefault(_scope_key(target), {})
         for param in target.params:
             add(scope, param.spec)
+            if _may_supply_dim(param):
+                # An integer parameter that names a dimension is where that
+                # dimension gets its size, exactly as in a constructor.
+                scope[param.name] = scope.get(param.name, 0) + 1
         add(scope, target.returns)
 
     return scopes
@@ -376,7 +389,9 @@ def collect_files(targets: list[str], config: Config) -> list[str]:
         path = Path(target)
         if path.is_dir():
             for child in sorted(path.rglob("*.py")):
-                if any(part in config.exclude for part in child.parts):
+                # Only what is below the directory the user asked for: a
+                # checkout that happens to live under `build` is not excluded.
+                if any(part in config.exclude for part in child.relative_to(path).parts):
                     continue
                 found.append(str(child))
         elif path.suffix == ".py":

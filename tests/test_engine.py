@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from torchtyc.config import Config
-from torchtyc.engine import check_paths
+from torchtyc.engine import check_paths, collect_files
 
 
 @pytest.fixture
@@ -357,3 +357,32 @@ def test_a_package_init_is_imported_once(tmp_path):
     assert report.worker_error is None
     assert report.diagnostics == []
     assert (package / "imports.log").read_text() == "x"
+
+
+def test_a_module_that_prints_on_import_still_reports_its_diagnostics(project):
+    paths, config = project(
+        HEADER
+        + """
+    print("loading the model")
+
+    def linear(
+        x: Float[Tensor, "b d_in"], w: Float[Tensor, "d_out d_in"]
+    ) -> Float[Tensor, "b d_in"]:
+        return einsum(x, w, "b d_in, d_out d_in -> b d_out")
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.worker_error is None
+    assert "shape-mismatch" in rules(report)
+
+
+def test_an_excluded_name_above_the_target_does_not_hide_the_tree(tmp_path):
+    """`build` is excluded, but only below the directory the user asked for."""
+    project_dir = tmp_path / "build" / "proj"
+    project_dir.mkdir(parents=True)
+    (project_dir / "model.py").write_text("")
+    (project_dir / "build").mkdir()
+    (project_dir / "build" / "generated.py").write_text("")
+
+    config = Config(root=tmp_path, python=sys.executable)
+    assert collect_files([str(project_dir)], config) == [str(project_dir / "model.py")]

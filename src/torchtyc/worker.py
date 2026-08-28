@@ -294,10 +294,16 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
+    # stdout is this process's JSON channel, and importing user code runs
+    # module-level prints. Hold the real stream and point `sys.stdout` at
+    # stderr before any of that code can reach it.
+    channel = sys.stdout
+    sys.stdout = sys.stderr
+
     try:
         job = json.loads(sys.stdin.read())
     except json.JSONDecodeError as exc:
-        json.dump({"error": f"bad job: {exc}"}, sys.stdout)
+        json.dump({"error": f"bad job: {exc}"}, channel)
         return 2
 
     try:
@@ -309,7 +315,8 @@ def main() -> int:
             "diagnostics": [],
             "hovers": {},
         }
-    json.dump(result, sys.stdout)
+    json.dump(result, channel)
+    channel.flush()
     return 0
 
 

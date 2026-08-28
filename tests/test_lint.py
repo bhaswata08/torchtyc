@@ -78,3 +78,37 @@ def double(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
 """
     )
     assert unused_dims(source) == set()
+
+
+def test_an_integer_parameter_supplies_the_dimension_it_names():
+    source = (
+        HEADER
+        + """
+def positional_encoding(seq_len: int, d_model: int) -> Float[Tensor, "seq_len d_model"]:
+    return torch.zeros(seq_len, d_model)
+"""
+    )
+    assert unused_dims(source) == set()
+
+
+def test_an_integer_parameter_of_a_method_supplies_its_dimension():
+    source = (
+        HEADER
+        + """
+class Net(nn.Module):
+    def forward(self, x: Float[Tensor, "b d"], n_heads: int) -> Float[Tensor, "b n_heads d"]:
+        return x[:, None].expand(-1, n_heads, -1)
+"""
+    )
+    assert unused_dims(source) == set()
+
+
+def test_a_dimension_no_parameter_supplies_is_still_reported():
+    source = (
+        HEADER
+        + """
+def pad(x: Float[Tensor, "b d"], width: int) -> Float[Tensor, "b d extra"]:
+    return x[..., None]
+"""
+    )
+    assert unused_dims(source) == {("pad", "extra")}

@@ -36,3 +36,23 @@ def test_worker_error_is_escaped_too():
     report = Report(worker_error="died at 90%\nno output")
     (line,) = github(report)
     assert line == "::error title=torchtyc::died at 90%25%0Ano output"
+
+
+def test_a_comma_in_a_path_does_not_split_the_property_list():
+    report = Report(
+        diagnostics=[
+            Diagnostic(
+                path="/project/my,model.py",
+                line=0,
+                column=0,
+                rule="shape-mismatch",
+                severity=Severity.ERROR,
+                message="wrong",
+            )
+        ]
+    )
+    (line,) = github(report)
+    command, _, _ = line.partition("::")[2].partition("::")
+    properties = dict(item.split("=", 1) for item in command.split(" ", 1)[1].split(","))
+    assert properties["file"] == "my%2Cmodel.py"
+    assert set(properties) == {"file", "line", "col", "title"}

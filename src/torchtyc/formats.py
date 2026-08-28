@@ -143,8 +143,9 @@ def _github(report: Report, root: Path) -> str:
         if d.hint:
             message += f"%0Ahint: {_escape_workflow(d.hint)}"
         lines.append(
-            f"::{levels[d.severity]} file={_relative(d.path, root)},"
-            f"line={d.line + 1},col={d.column + 1},title=torchtyc[{d.rule}]::{message}"
+            f"::{levels[d.severity]} file={_escape_property(_relative(d.path, root))},"
+            f"line={d.line + 1},col={d.column + 1},"
+            f"title={_escape_property(f'torchtyc[{d.rule}]')}::{message}"
         )
     if report.worker_error:
         lines.append(f"::error title=torchtyc::{_escape_workflow(report.worker_error)}")
@@ -154,3 +155,8 @@ def _github(report: Report, root: Path) -> str:
 def _escape_workflow(text: str) -> str:
     """Escape per the GitHub workflow-command spec: `%` first, then CR and LF."""
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _escape_property(text: str) -> str:
+    """A property value also escapes the separators of the `k=v,k=v` list."""
+    return _escape_workflow(text).replace(":", "%3A").replace(",", "%2C")
