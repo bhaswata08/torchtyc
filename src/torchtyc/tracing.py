@@ -135,7 +135,9 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
         return torch.float32
     if plain == "Tensor" or (plain or "").endswith(".Tensor"):
         # An unannotated tensor: one dimension is the least constraining guess.
-        return torch.empty((binder.fresh(),), device="meta")
+        # The axis carries no name the user wrote, so it binds as anonymous and
+        # renders as `_` instead of leaking the synthetic prime.
+        return torch.empty((binder.bind_anonymous(),), device="meta")
 
     if param.has_default:
         raise _UseDefault()
@@ -158,8 +160,6 @@ def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[s
     kwargs: dict[str, Any] = {}
     positional_open = True
     for param in owner.init_params:
-        if param.name in ("args", "kwargs"):
-            continue
         if param.positional_only and not positional_open:
             continue
         try:
@@ -171,7 +171,7 @@ def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[s
         except TraceSkipped as exc:
             raise TraceSkipped(
                 "uninstantiable",
-                f"cannot construct `{owner.name}`: {exc.message}",
+                f"cannot construct `{owner.qualname or owner.name}`: {exc.message}",
                 hint=exc.hint,
             ) from exc
         if param.positional_only:
@@ -183,7 +183,9 @@ def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[s
         try:
             return cls(*args, **kwargs)
         except TypeError as exc:
-            raise TraceSkipped("uninstantiable", f"cannot construct `{owner.name}`: {exc}") from exc
+            raise TraceSkipped(
+                "uninstantiable", f"cannot construct `{owner.qualname or owner.name}`: {exc}"
+            ) from exc
 
 
 @contextlib.contextmanager
@@ -232,19 +234,36 @@ def _identity_init(original):
     return wrapper
 
 
+def resolve_qualname(module: Any, qualname: str) -> Any:
+    """Walk a dotted qualname from the module down to the object it names.
+
+    Nesting means the name is no longer a module attribute: `Outer.Inner` needs
+    two lookups. A qualname holding `<locals>` names something built inside a
+    function call, which no amount of `getattr` can reach, so it is skipped with
+    a diagnostic rather than left silently unchecked.
+    """
+    if "<locals>" in qualname:
+        raise TraceSkipped(
+            "local-definition",
+            f"`{qualname}` is defined inside a function body, so it cannot be checked",
+            hint="move it to module level or into a class to bring it under the checker",
+        )
+    found = module
+    for part in qualname.split("."):
+        found = getattr(found, part, None)
+        if found is None:
+            raise TraceSkipped("trace-error", f"`{qualname}` is not defined after import")
+    return found
+
+
 def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[Any, list[Param]]:
     """Find the function to call, constructing an instance when it is a method."""
     params = list(target.params)
 
     if target.owner is None:
-        fn = getattr(module, target.name, None)
-        if fn is None:
-            raise TraceSkipped("trace-error", f"`{target.name}` is not defined after import")
-        return fn, params
+        return resolve_qualname(module, target.qualname), params
 
-    cls = getattr(module, target.owner.name, None)
-    if cls is None:
-        raise TraceSkipped("trace-error", f"`{target.owner.name}` is not defined after import")
+    cls = resolve_qualname(module, target.owner.qualname)
 
     if "staticmethod" in target.decorators:
         return getattr(cls, target.name), params

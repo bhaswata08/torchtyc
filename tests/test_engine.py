@@ -536,3 +536,111 @@ def test_trace_command_reports_a_failed_trace(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "trace-error" in captured.err
     assert "primes" not in captured.out
+
+
+def test_a_nested_class_is_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Outer:
+        class Inner(nn.Module):
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+                return x
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert diagnostic.function == "Outer.Inner.forward"
+
+
+def test_a_class_under_a_module_level_if_is_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    if True:
+
+        class Conditional(nn.Module):
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+                return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+
+
+def test_a_class_in_a_factory_function_is_reported_not_skipped_silently(project):
+    paths, config = project(
+        HEADER
+        + """
+    def factory():
+        class Made(nn.Module):
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+                return x
+
+        return Made
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "local-definition")
+    assert "factory.<locals>.Made" in diagnostic.message
+
+
+def test_call_is_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Wrong(nn.Module):
+        def __call__(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert diagnostic.function == "Wrong.__call__"
+
+
+def test_an_unannotated_tensor_argument_never_leaks_a_prime(project):
+    paths, config = project(
+        HEADER
+        + """
+    def slice_to(bias: Tensor, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x[:, : bias.shape[0]]
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert "_" in (diagnostic.got or "")
+    assert not any(char.isdigit() for char in diagnostic.message)
+
+
+def test_an_init_parameter_named_args_is_still_passed(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, args: int) -> None:
+            super().__init__()
+            self.W: Float[nn.Parameter, "args"] = nn.Parameter(torch.empty((args,)))
+
+        def forward(self, x: Float[Tensor, "b args"]) -> Float[Tensor, "b args"]:
+            return x + self.W
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+
+
+def test_a_trace_error_underlines_the_statement_not_the_indentation(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x @ x
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    line = Path(paths[0]).read_text().splitlines()[diagnostic.line]
+    # The span is the failing expression itself, never the leading indentation.
+    assert line[diagnostic.column : diagnostic.end_column] == "x @ x"

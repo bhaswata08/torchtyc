@@ -72,6 +72,9 @@ class Attribute:
 class ClassInfo:
     name: str
     position: Position
+    # Dotted path from the module to this class, as Python's own `__qualname__`
+    # spells it: `Outer.Inner`, or `factory.<locals>.Inner` inside a function.
+    qualname: str = ""
     init_params: list[Param] = field(default_factory=list)
     bases: list[str] = field(default_factory=list)
     attributes: list[Attribute] = field(default_factory=list)
@@ -90,7 +93,7 @@ class ClassInfo:
         """
         names: set[str] = set(self.method_dim_names)
         for attribute in self.attributes:
-            for array in _iter_arrays(attribute.spec):
+            for array in iter_arrays(attribute.spec):
                 names.update(array.named_dims)
         return names
 
@@ -138,7 +141,7 @@ class Target:
         names: set[str] = set()
         specs = [p.spec for p in self.params] + [self.returns]
         for spec in specs:
-            for array in _iter_arrays(spec):
+            for array in iter_arrays(spec):
                 names.update(array.named_dims)
         return names
 
@@ -172,12 +175,13 @@ class FileScan:
     syntax_error: tuple[str, Position] | None = None
 
 
-def _iter_arrays(spec: Spec | None):
+def iter_arrays(spec: Spec | None):
+    """Flatten a spec into its array leaves."""
     if isinstance(spec, ArraySpec):
         yield spec
     elif isinstance(spec, TupleSpec):
         for item in spec.items:
-            yield from _iter_arrays(item)
+            yield from iter_arrays(item)
 
 
 def _decorator_name(node: ast.expr) -> str:
@@ -399,6 +403,70 @@ def _params_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Param]:
     return params
 
 
+# Dunder methods worth tracing. `__call__` is where a callable module or a
+# functional wrapper puts its real signature, so skipping it would leave that
+# code silently unchecked. Every other dunder either has a fixed signature the
+# checker cannot build values for, or is not a shape-carrying entry point.
+_TRACED_DUNDERS = frozenset({"__call__"})
+
+# Statements that hold nested bodies without opening a new naming scope, so a
+# class or function under one is still defined at the enclosing scope.
+_NESTING = (
+    ast.If,
+    ast.Try,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+    ast.Match,
+)
+
+
+def _is_type_checking(node: ast.If) -> bool:
+    """Whether an `if` guards a block that never runs at import time.
+
+    `if TYPE_CHECKING:` bodies exist only for static checkers, so a class
+    defined there is genuinely absent after import. Reporting it as unreachable
+    would be noise, not a finding.
+    """
+    test = node.test
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return False
+    return _base_name(test).split(".")[-1] == "TYPE_CHECKING"
+
+
+def _statements(body: list[ast.stmt]):
+    """Every statement in a body, descending through blocks that do not scope.
+
+    A class under a module-level `if` or `try` is a module-level class, so the
+    scanner has to see it. Function and class bodies are left alone here,
+    because they open a scope the caller handles itself.
+    """
+    for node in body:
+        if isinstance(node, _NESTING):
+            if isinstance(node, ast.If) and _is_type_checking(node):
+                yield from _statements(node.orelse)
+                continue
+            for nested in _nested_bodies(node):
+                yield from _statements(nested)
+        else:
+            yield node
+
+
+def _nested_bodies(node: ast.stmt):
+    for name in ("body", "orelse", "finalbody"):
+        block = getattr(node, name, None)
+        if block:
+            yield block
+    for handler in getattr(node, "handlers", []):
+        if handler.body:
+            yield handler.body
+    for case in getattr(node, "cases", []):
+        if case.body:
+            yield case.body
+
+
 def scan_source(source: str, path: str) -> FileScan:
     """Parse one file and collect targets and suppressions."""
     try:
@@ -417,7 +485,19 @@ def scan_source(source: str, path: str) -> FileScan:
     classes: list[ClassInfo] = []
     einops_names = _einops_names(tree)
 
-    def visit_function(fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None) -> None:
+    def visit_function(
+        fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None, prefix: str
+    ) -> None:
+        qualname = f"{prefix}.{fn.name}" if prefix else fn.name
+        if owner is None or not fn.name.startswith("__") or fn.name in _TRACED_DUNDERS:
+            add_target(fn, owner, qualname)
+        # A function body is a new scope, and anything defined in it is a local
+        # of that function, exactly as `__qualname__` records it.
+        visit_body(fn.body, None, f"{qualname}.<locals>")
+
+    def add_target(
+        fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None, qualname: str
+    ) -> None:
         returns: Spec | None = None
         error: str | None = None
         try:
@@ -425,7 +505,7 @@ def scan_source(source: str, path: str) -> FileScan:
         except AnnotationError as exc:
             error = str(exc)
         target = Target(
-            qualname=f"{owner.name}.{fn.name}" if owner else fn.name,
+            qualname=qualname,
             name=fn.name,
             position=Position(
                 fn.lineno - 1,
@@ -447,9 +527,11 @@ def scan_source(source: str, path: str) -> FileScan:
         if owner is not None:
             owner.method_dim_names.update(target.dim_names)
 
-    def visit_class(node: ast.ClassDef) -> None:
+    def visit_class(node: ast.ClassDef, prefix: str) -> None:
+        qualname = f"{prefix}.{node.name}" if prefix else node.name
         info = ClassInfo(
             name=node.name,
+            qualname=qualname,
             position=Position(
                 node.lineno - 1,
                 node.col_offset,
@@ -461,24 +543,23 @@ def scan_source(source: str, path: str) -> FileScan:
         classes.append(info)
         # __init__ first, so every method sees the constructor parameters and
         # the annotated attributes they may refer to.
-        for child in node.body:
+        for child in _statements(node.body):
             if (
                 isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and child.name == "__init__"
             ):
                 info.init_params = _params_of(child)[1:]  # drop self
                 info.attributes = _attributes_of(child)
-        for child in node.body:
-            if isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef)
-            ) and not child.name.startswith("__"):
-                visit_function(child, info)
+        visit_body(node.body, info, qualname)
 
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            visit_function(node, None)
-        elif isinstance(node, ast.ClassDef):
-            visit_class(node)
+    def visit_body(body: list[ast.stmt], owner: ClassInfo | None, prefix: str) -> None:
+        for node in _statements(body):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit_function(node, owner, prefix)
+            elif isinstance(node, ast.ClassDef):
+                visit_class(node, prefix)
+
+    visit_body(tree.body, None, "")
 
     return FileScan(
         path=path,

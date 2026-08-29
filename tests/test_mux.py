@@ -1,5 +1,6 @@
 import asyncio
 import shlex
+import sys
 
 import pytest
 
@@ -7,6 +8,7 @@ from torchtyc.cli import _overrides_from, build_parser
 from torchtyc.config import Overrides
 from torchtyc.diagnostics import Severity
 from torchtyc.mux import (
+    Downstream,
     Mux,
     Pending,
     _deep_merge,
@@ -154,3 +156,29 @@ def test_mux_forwards_its_options_to_the_child_server():
 
 def test_mux_forwards_nothing_the_user_did_not_ask_for():
     assert child_overrides(Overrides()) == Overrides()
+
+
+def test_send_blocks_once_a_downstream_server_stops_reading():
+    """A stalled server must slow the mux down, not let it buffer without bound."""
+
+    async def run():
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        server = Downstream(name="stalled", process=process)
+        # Far more than any pipe buffer holds, so a sender that respects
+        # backpressure cannot get through all of it.
+        big = {"method": "textDocument/didChange", "params": {"blob": "a" * 200_000}}
+        try:
+            with pytest.raises(TimeoutError):
+                for _ in range(20):
+                    await asyncio.wait_for(server.send(big), timeout=2.0)
+        finally:
+            process.kill()
+            await process.wait()
+
+    asyncio.run(run())

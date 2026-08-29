@@ -224,3 +224,76 @@ def test_signature_end_never_runs_past_the_body():
 def test_signature_end_without_a_return_annotation():
     lines = SIGNATURES.splitlines()
     assert lines[signature_end("unannotated_return")].lstrip().startswith("def unannotated_return")
+
+
+NESTED = """
+from jaxtyping import Float
+from torch import Tensor
+
+
+class Outer:
+    class Inner:
+        def forward(self, x: Float[Tensor, "a b"]) -> Float[Tensor, "a b"]:
+            return x
+
+
+def factory():
+    class Made:
+        def forward(self, x: Float[Tensor, "a b"]) -> Float[Tensor, "a b"]:
+            return x
+
+    return Made
+
+
+if True:
+    class Conditional:
+        def forward(self, x: Float[Tensor, "a b"]) -> Float[Tensor, "a b"]:
+            return x
+
+
+class Callable_:
+    def __call__(self, x: Float[Tensor, "a b"]) -> Float[Tensor, "a b"]:
+        return x
+
+    def __repr__(self) -> str:
+        return "Callable_()"
+"""
+
+
+def test_a_class_nested_in_a_class_is_discovered():
+    scan = scan_source(NESTED, "n.py")
+    assert "Outer.Inner.forward" in {t.qualname for t in scan.targets}
+    assert "Outer.Inner" in {c.qualname for c in scan.classes}
+
+
+def test_a_class_in_a_factory_function_is_discovered_under_locals():
+    scan = scan_source(NESTED, "n.py")
+    assert "factory.<locals>.Made.forward" in {t.qualname for t in scan.targets}
+
+
+def test_a_class_under_a_module_level_if_is_discovered():
+    scan = scan_source(NESTED, "n.py")
+    assert "Conditional.forward" in {t.qualname for t in scan.targets}
+
+
+def test_call_is_traced_but_other_dunders_are_not():
+    names = {t.qualname for t in scan_source(NESTED, "n.py").targets}
+    assert "Callable_.__call__" in names
+    assert "Callable_.__repr__" not in names
+
+
+def test_a_class_under_type_checking_is_not_discovered():
+    source = """
+from typing import TYPE_CHECKING
+
+from jaxtyping import Float
+from torch import Tensor
+
+if TYPE_CHECKING:
+    class Phantom:
+        def forward(self, x: Float[Tensor, "a b"]) -> Float[Tensor, "a b"]:
+            return x
+"""
+    scan = scan_source(source, "t.py")
+    assert scan.targets == []
+    assert scan.classes == []

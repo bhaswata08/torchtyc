@@ -244,6 +244,7 @@ when the worker itself failed.
 | `uninstantiable` | warning | a module's `__init__` could not be called automatically |
 | `unresolved-arg` | warning | a parameter has no annotation and no default |
 | `unsupported-annotation` | warning | an annotation could not be parsed |
+| `local-definition` | info | a target inside a function body cannot be reached after import |
 | `anonymous-return` | info | arguments are annotated but the return is not |
 | `missing-annotation` | info | a public function has no jaxtyping annotation |
 | `unused-dim` | info | a dimension name is used once, so it constrains nothing |
@@ -253,6 +254,12 @@ when the worker itself failed.
 
 torchtyc imports your module, so module-level side effects run. Keep training
 loops behind `if __name__ == "__main__":`.
+
+Classes and functions nested inside other classes, or written under a
+module-level `if` or `try`, are checked like any other. One inside a *function
+body* is not: after import there is no name to reach it by, so it reports
+`local-definition` rather than passing silently. A `if TYPE_CHECKING:` block is
+skipped without a diagnostic, because nothing in it exists at runtime.
 
 It runs one concrete trace, not a proof. A function whose control flow depends
 on tensor *values* rather than shapes takes whichever branch the primes send it

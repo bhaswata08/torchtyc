@@ -79,6 +79,11 @@ UNINSTANTIABLE = _rule(
 UNRESOLVED_ARG = _rule(
     "unresolved-arg", Severity.WARNING, "a parameter has no annotation and no default"
 )
+LOCAL_DEFINITION = _rule(
+    "local-definition",
+    Severity.INFO,
+    "a target defined inside a function body cannot be reached after import",
+)
 UNSUPPORTED_ANNOTATION = _rule(
     "unsupported-annotation", Severity.WARNING, "an annotation could not be parsed"
 )

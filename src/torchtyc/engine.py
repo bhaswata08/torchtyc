@@ -21,7 +21,7 @@ from pathlib import Path
 from .annotations import ArraySpec, TupleSpec
 from .config import Config
 from .diagnostics import RULES, Diagnostic, Severity
-from .discovery import FileScan, Suppression, Target, scan_source
+from .discovery import FileScan, Suppression, Target, iter_arrays, scan_source
 from .einops_rules import check_call
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -105,7 +105,7 @@ def _scope_key(target: Target) -> str:
     functions share nothing, so each gets its own scope and one function reusing
     a name cannot mask another's unconstrained dimension.
     """
-    return target.owner.name if target.owner else f"\0{target.qualname}"
+    return target.owner.qualname if target.owner else f"\0{target.qualname}"
 
 
 def _may_supply_dim(param) -> bool:
@@ -122,13 +122,13 @@ def _name_counts(scan: FileScan) -> dict[str, dict[str, int]]:
     scopes: dict[str, dict[str, int]] = {}
 
     def add(scope: dict[str, int], spec) -> None:
-        for array in _arrays(spec):
+        for array in iter_arrays(spec):
             for dim in array.dims:
                 if dim.kind in ("named", "variadic") and dim.name:
                     scope[dim.name] = scope.get(dim.name, 0) + 1
 
     for info in scan.classes:
-        scope = scopes.setdefault(info.name, {})
+        scope = scopes.setdefault(info.qualname, {})
         for attribute in info.attributes:
             add(scope, attribute.spec)
         for param in info.init_params:
@@ -212,7 +212,7 @@ def _lint_target(
     local: set[str] = set()
     specs = [p.spec for p in target.params] + [target.returns]
     for spec in specs:
-        for array in _arrays(spec):
+        for array in iter_arrays(spec):
             for dim in array.dims:
                 if dim.kind in ("named", "variadic") and dim.name:
                     local.add(dim.name)
@@ -229,14 +229,6 @@ def _lint_target(
             )
 
     return out
-
-
-def _arrays(spec):
-    if isinstance(spec, ArraySpec):
-        yield spec
-    elif isinstance(spec, TupleSpec):
-        for item in spec.items:
-            yield from _arrays(item)
 
 
 def run_worker(

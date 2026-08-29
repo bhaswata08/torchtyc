@@ -25,6 +25,14 @@ from pathlib import Path
 
 
 def timed(fn, repeats: int) -> dict[str, float]:
+    """Time `fn` `repeats` times, after one warm-up call that is not recorded.
+
+    The first call to any of these paths pays a one-off cost the later ones do
+    not: a thread pool spinning up, an import landing in a cache, a page being
+    faulted in. Recording it would put a number in the table that no second run
+    reproduces.
+    """
+    fn()
     samples = []
     for _ in range(repeats):
         start = time.perf_counter()
@@ -149,22 +157,35 @@ def bench_worker_startup(python: str, repeats: int) -> dict:
 
 
 def bench_real_vs_meta(width: int, batch: int, repeats: int) -> dict:
-    """The same forward pass, on real CPU tensors and on meta tensors."""
+    """The same forward pass, on real CPU tensors and on meta tensors.
+
+    The operands are built once per device and outside the timed region. A real
+    `(width, width)` allocation is 256 MB at width 8192 and a meta one is free,
+    so timing the build would charge the real device for memory the comparison
+    is not about and inflate the ratio.
+    """
     import torch
     from einops import einsum
 
     def build(device: str):
-        w = torch.empty((width, width), device=device)
-        x = torch.empty((batch, width), device=device)
+        # `torch.ones`, not `torch.empty`: uninitialised memory can hold
+        # denormal floats, and denormal arithmetic runs an order of magnitude
+        # slower on x86. That cost belongs to the garbage in the buffer, not to
+        # the einsum, and it lands unpredictably depending on which pages the
+        # allocator hands back.
+        w = torch.ones((width, width), device=device)
+        x = torch.ones((batch, width), device=device)
         return x, w
 
-    def run(device: str):
-        x, w = build(device)
+    real_x, real_w = build("cpu")
+    meta_x, meta_w = build("meta")
+
+    def run(x, w):
         einsum(x, w, "b d_in, d_out d_in -> b d_out")
 
     return {
-        "real_cpu": timed(lambda: run("cpu"), repeats),
-        "meta": timed(lambda: run("meta"), repeats),
+        "real_cpu": timed(lambda: run(real_x, real_w), repeats),
+        "meta": timed(lambda: run(meta_x, meta_w), repeats),
     }
 
 

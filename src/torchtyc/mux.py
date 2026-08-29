@@ -92,9 +92,19 @@ class Downstream:
     # Diagnostics this server last published, keyed by document uri.
     diagnostics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
-    def send(self, message: dict[str, Any]) -> None:
+    async def send(self, message: dict[str, Any]) -> None:
+        """Write one frame downstream, waiting for the pipe to accept it.
+
+        Draining is what applies backpressure. Without it a server that stops
+        reading, such as basedpyright indexing a large workspace, would let the
+        mux buffer every forwarded message in memory instead of slowing down.
+        """
         assert self.process.stdin is not None
         self.process.stdin.write(_encode(message))
+        try:
+            await self.process.stdin.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            log.warning("%s closed its input", self.name)
 
 
 @dataclass
@@ -172,14 +182,14 @@ class Mux:
             await self.fan_out(message)
         elif "method" in message:
             for server in self.servers:
-                server.send(message)
+                await server.send(message)
         else:
             # A response to something a server asked the client.
             entry = self.upstream.pop(message.get("id"), None)
             if entry is None:
                 return
             index, original = entry
-            self.servers[index].send({**message, "id": original})
+            await self.servers[index].send({**message, "id": original})
 
     async def fan_out(self, message: dict[str, Any]) -> None:
         method = message["method"]
@@ -190,7 +200,7 @@ class Mux:
         for index, server in enumerate(self.servers):
             issued = self.next_id()
             self.downstream[(index, issued)] = token
-            server.send({**message, "id": issued})
+            await server.send({**message, "id": issued})
 
     # ------------------------------------------------------------------ server
 

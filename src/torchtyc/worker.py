@@ -23,7 +23,15 @@ from typing import Any
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import ClassInfo, Position, Target, scan_source
-from .tracing import TraceResult, TraceSkipped, check_return, describe, instantiate, trace
+from .tracing import (
+    TraceResult,
+    TraceSkipped,
+    check_return,
+    describe,
+    instantiate,
+    resolve_qualname,
+    trace,
+)
 
 
 def import_from_path(path: Path, source: str | None = None) -> Any:
@@ -77,6 +85,10 @@ def _anchor(exc: BaseException, path: str, fallback: Position) -> tuple[Position
 
     A shape error usually surfaces several frames down, inside einsum or matmul.
     The line the user needs to see is the last one they wrote, not torch's.
+
+    The span comes from the frame's column offsets rather than its source text,
+    because `FrameSummary.line` is stripped of leading indentation: measuring it
+    would start the underline inside the indent and stop short of the statement.
     """
     frames = traceback.extract_tb(exc.__traceback__)
     mine = [f for f in frames if f.filename and Path(f.filename).resolve() == Path(path).resolve()]
@@ -85,7 +97,11 @@ def _anchor(exc: BaseException, path: str, fallback: Position) -> tuple[Position
     if chosen is None:
         return fallback, text
     line = chosen.lineno - 1 if chosen.lineno else fallback.line
-    return Position(line, 0, line, len(chosen.line or "") if chosen.line else 1), text
+    end_line = chosen.end_lineno - 1 if chosen.end_lineno else line
+    if chosen.colno is not None and chosen.end_colno is not None:
+        return Position(line, chosen.colno, end_line, chosen.end_colno), text
+    # No column information: fall back to underlining the whole line.
+    return Position(line, 0, line, len(chosen.line or "") or 1), text
 
 
 def _severity(rule: str) -> Severity:
@@ -165,11 +181,9 @@ def check_attributes(
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
     binder = DimBinder(variadic_rank=variadic_rank)
-    cls = getattr(module, info.name, None)
-    if cls is None:
-        return []
 
     try:
+        cls = resolve_qualname(module, info.qualname or info.name)
         instance = instantiate(info, cls, binder, info.dim_names)
     except TraceSkipped as exc:
         return [
@@ -182,7 +196,7 @@ def check_attributes(
                 rule=exc.rule,
                 severity=_severity(exc.rule),
                 message=exc.message,
-                function=info.name,
+                function=info.qualname or info.name,
                 hint=exc.hint or None,
             )
         ]
@@ -197,8 +211,8 @@ def check_attributes(
                 end_column=position.end_column,
                 rule="trace-error",
                 severity=Severity.ERROR,
-                message=f"constructing `{info.name}`: {type(exc).__name__}: {exc}",
-                function=info.name,
+                message=f"constructing `{info.qualname or info.name}`: {type(exc).__name__}: {exc}",
+                function=info.qualname or info.name,
                 traceback=text,
             )
         ]
@@ -224,7 +238,7 @@ def check_attributes(
                     rule=rule,
                     severity=_severity(rule),
                     message=f"`self.{attribute.name}`: {problem['message']}",
-                    function=info.name,
+                    function=info.qualname or info.name,
                     expected=problem.get("expected"),
                     got=problem.get("got"),
                     hint=problem.get("hint") or None,
