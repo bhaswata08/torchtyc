@@ -8,6 +8,7 @@ from torchtyc.cli import _overrides_from, build_parser
 from torchtyc.config import Overrides
 from torchtyc.diagnostics import Severity
 from torchtyc.mux import (
+    QUEUE_LIMIT,
     Downstream,
     Mux,
     Pending,
@@ -158,27 +159,96 @@ def test_mux_forwards_nothing_the_user_did_not_ask_for():
     assert child_overrides(Overrides()) == Overrides()
 
 
-def test_send_blocks_once_a_downstream_server_stops_reading():
-    """A stalled server must slow the mux down, not let it buffer without bound."""
+async def _stalled_server(name: str = "stalled"):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    return Downstream(name=name, process=process)
+
+
+async def _reading_server(name: str = "reading"):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.buffer.read()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    return Downstream(name=name, process=process)
+
+
+def test_a_stalled_server_is_dropped_instead_of_stalling_the_client_loop():
+    """One server that stops reading must not hold up the others."""
 
     async def run():
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-c",
-            "import time; time.sleep(30)",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-        )
-        server = Downstream(name="stalled", process=process)
-        # Far more than any pipe buffer holds, so a sender that respects
-        # backpressure cannot get through all of it.
-        big = {"method": "textDocument/didChange", "params": {"blob": "a" * 200_000}}
+        stalled = await _stalled_server()
+        reading = await _reading_server()
+        mux = Mux([])
+        mux.servers = [stalled, reading]
+        writers = [asyncio.create_task(s.pump_writes()) for s in mux.servers]
+        note = {"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {"x": "y" * 4096}}
         try:
-            with pytest.raises(TimeoutError):
-                for _ in range(20):
-                    await asyncio.wait_for(server.send(big), timeout=2.0)
+            # More frames than one server's queue holds, so the stalled server
+            # must be given up on rather than blocking the loop.
+            async def feed():
+                for _ in range(QUEUE_LIMIT + 50):
+                    await mux.from_client(dict(note))
+                    # Let the reading server finish each frame, so what fills up
+                    # is only ever the queue of the server that stopped reading.
+                    await reading.outbox.join()
+
+            await asyncio.wait_for(feed(), timeout=30.0)
+            # The stalled server never read a byte, yet the loop ran to the end
+            # and its neighbour took every frame.
+            assert stalled.alive is False
+            assert reading.alive is True
+            assert reading.outbox.empty()
         finally:
-            process.kill()
-            await process.wait()
+            for task in writers:
+                task.cancel()
+            for server in mux.servers:
+                if server.process.returncode is None:
+                    server.process.kill()
+                await server.process.wait()
+
+    asyncio.run(run())
+
+
+def test_a_request_already_sent_to_a_dropped_server_still_answers_the_client():
+    """The client must not wait forever for a server the mux gave up on."""
+
+    async def run():
+        stalled = await _stalled_server()
+        mux = Mux([])
+        mux.servers = [stalled]
+        answered: list[dict] = []
+
+        async def capture(message):
+            answered.append(message)
+
+        mux.to_client = capture  # type: ignore[method-assign]
+        writer = asyncio.create_task(stalled.pump_writes())
+        try:
+            for index in range(QUEUE_LIMIT + 50):
+                await mux.from_client(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": index,
+                        "method": "textDocument/hover",
+                        "params": {"blob": "z" * 4096},
+                    }
+                )
+            assert stalled.alive is False
+            # Every request the mux accepted has an answer, error or otherwise.
+            assert len(answered) == QUEUE_LIMIT + 50
+            assert mux.pending == {}
+        finally:
+            writer.cancel()
+            stalled.process.kill()
+            await stalled.process.wait()
 
     asyncio.run(run())

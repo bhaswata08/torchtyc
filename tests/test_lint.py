@@ -1,5 +1,6 @@
 """The in-process lint pass: no import, no torch, just the parsed file."""
 
+import textwrap
 from pathlib import Path
 
 from torchtyc.config import Config
@@ -112,3 +113,22 @@ def pad(x: Float[Tensor, "b d"], width: int) -> Float[Tensor, "b d extra"]:
 """
     )
     assert unused_dims(source) == {("pad", "extra")}
+
+
+def test_an_einops_call_in_a_nested_helper_is_reported_once():
+    source = textwrap.dedent("""
+        from einops import rearrange
+        from jaxtyping import Float
+        from torch import Tensor
+
+
+        def outer(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            def helper(y):
+                return rearrange(y, "b d -> b e")
+
+            return helper(x)
+    """)
+    scan = scan_source(source, "m.py")
+    found = lint_scan(scan, Config(root=Path(".")))
+    axis = [d for d in found if d.rule == "einops-unknown-axis"]
+    assert len(axis) == 1

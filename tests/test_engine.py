@@ -644,3 +644,144 @@ def test_a_trace_error_underlines_the_statement_not_the_indentation(project):
     line = Path(paths[0]).read_text().splitlines()[diagnostic.line]
     # The span is the failing expression itself, never the leading indentation.
     assert line[diagnostic.column : diagnostic.end_column] == "x @ x"
+
+
+def test_a_class_under_a_guard_that_never_runs_is_not_reported(project):
+    paths, config = project(
+        """
+    import sys
+
+    from jaxtyping import Float
+    from torch import Tensor, nn
+
+    if sys.version_info >= (3, 99):
+
+        class Legacy(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "d d"] = nn.Parameter(torch.empty((3, 3)))
+
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_only_the_branch_the_import_took_is_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    import sys
+
+    if sys.version_info >= (3, 0):
+
+        def widen(x: Float[Tensor, "a"]) -> Float[Tensor, "a b"]:
+            return x[:, None] * torch.ones((1, 4))
+
+    else:
+
+        def widen(x: Float[Tensor, "a"]) -> Float[Tensor, "a"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The losing branch annotates one axis; tracing it against the live
+    # two-axis function is what used to raise a false rank-mismatch.
+    assert "rank-mismatch" not in rules(report)
+    assert report.ok
+
+
+def test_a_guarded_fallback_shadowed_by_an_import_is_not_traced(tmp_path: Path):
+    (tmp_path / "fast.py").write_text(
+        textwrap.dedent("""
+        from jaxtyping import Float
+        from torch import Tensor, nn
+
+
+        class Block(nn.Module):
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+        """)
+    )
+    path = tmp_path / "model.py"
+    path.write_text(
+        textwrap.dedent(HEADER)
+        + textwrap.dedent("""
+        try:
+            from fast import Block
+        except ImportError:
+
+            class Block(nn.Module):
+                def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+                    return x
+        """)
+    )
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths([str(path)], config)
+    assert report.diagnostics == []
+
+
+def test_a_guarded_definition_that_is_live_is_still_checked(project):
+    paths, config = project(
+        HEADER
+        + """
+    import sys
+
+    if sys.version_info >= (3, 0):
+
+        def flip(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x.T
+    """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+
+
+def test_a_trace_error_reports_axis_names_not_primes(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_in: int, d_out: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((d_out, d_in)))
+
+        def forward(self, x: Float[Tensor, "b d_in"]) -> Float[Tensor, "b d_out"]:
+            return x @ self.W
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert "d_in" in diagnostic.message
+    assert "d_out" in diagnostic.message
+    assert "101" not in diagnostic.message
+    assert "103" not in diagnostic.message
+
+
+def test_a_local_class_is_reported_once(project):
+    paths, config = project(
+        HEADER
+        + """
+    def factory():
+        class Made(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "d d"] = nn.Parameter(torch.empty((3, 3)))
+
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+
+        return Made
+    """
+    )
+    report = check_paths(paths, config)
+    local = [d for d in report.diagnostics if d.rule == "local-definition"]
+    assert len(local) == 1
+    assert local[0].line == next(
+        index
+        for index, line in enumerate(Path(paths[0]).read_text().splitlines())
+        if line.strip().startswith("class Made")
+    )

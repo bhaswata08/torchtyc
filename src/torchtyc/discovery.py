@@ -74,7 +74,14 @@ class ClassInfo:
     position: Position
     # Dotted path from the module to this class, as Python's own `__qualname__`
     # spells it: `Outer.Inner`, or `factory.<locals>.Inner` inside a function.
-    qualname: str = ""
+    qualname: str
+    # The lines the whole `class` statement covers, decorators included. Used
+    # after import to tell this definition from another one of the same name.
+    def_line: int = 0
+    end_line: int = 0
+    # Reached through an `if`, `try` or loop, so the import may never have run
+    # it. Such a definition is only traced once it proves it is the live one.
+    conditional: bool = False
     init_params: list[Param] = field(default_factory=list)
     bases: list[str] = field(default_factory=list)
     attributes: list[Attribute] = field(default_factory=list)
@@ -113,8 +120,14 @@ class Target:
     returns: Spec | None
     returns_position: Position | None
     decorators: list[str]
+    # First line of the whole `def` statement, decorators included. Used after
+    # import to tell this definition from another one of the same name.
+    def_line: int = 0
     # Last line of the function body, so a cursor below it belongs to no target.
     end_line: int = 0
+    # Reached through an `if`, `try` or loop, so the import may never have run
+    # it. Such a definition is only traced once it proves it is the live one.
+    conditional: bool = False
     # 0-based line the `def` header finishes on, which is not `position.line`
     # once a signature wraps across several lines. `position` deliberately
     # covers the function name, because that is what a diagnostic underlines,
@@ -252,9 +265,22 @@ def _einops_names(tree: ast.Module) -> EinopsNames:
     return names
 
 
+def _own_nodes(node: ast.AST):
+    """Every node belonging to `node` itself, stopping at a nested scope.
+
+    A nested function or class is its own target and collects its own calls, so
+    walking into one here would report everything inside it twice.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield child
+        yield from _own_nodes(child)
+
+
 def _find_einops(node: ast.AST, names: EinopsNames) -> list[EinopsCall]:
     calls: list[EinopsCall] = []
-    for child in ast.walk(node):
+    for child in _own_nodes(node):
         if not isinstance(child, ast.Call):
             continue
         name = names.func_of(child)
@@ -436,22 +462,31 @@ def _is_type_checking(node: ast.If) -> bool:
     return _base_name(test).split(".")[-1] == "TYPE_CHECKING"
 
 
-def _statements(body: list[ast.stmt]):
-    """Every statement in a body, descending through blocks that do not scope.
+def _def_line(node: ast.stmt) -> int:
+    """The 0-based first line of a `def` or `class`, decorators included."""
+    lines = [node.lineno]
+    lines += [d.lineno for d in getattr(node, "decorator_list", [])]
+    return min(lines) - 1
+
+
+def _statements(body: list[ast.stmt], conditional: bool = False):
+    """Every statement in a body, with whether a branch guards it.
 
     A class under a module-level `if` or `try` is a module-level class, so the
-    scanner has to see it. Function and class bodies are left alone here,
-    because they open a scope the caller handles itself.
+    scanner has to see it. It may equally never run, so each statement carries
+    whether it was reached through a branch; the tracer uses that to tell a
+    definition the import produced from one it did not. Function and class
+    bodies are left alone here, because they open a scope the caller handles.
     """
     for node in body:
         if isinstance(node, _NESTING):
             if isinstance(node, ast.If) and _is_type_checking(node):
-                yield from _statements(node.orelse)
+                yield from _statements(node.orelse, conditional)
                 continue
             for nested in _nested_bodies(node):
-                yield from _statements(nested)
+                yield from _statements(nested, True)
         else:
-            yield node
+            yield node, conditional
 
 
 def _nested_bodies(node: ast.stmt):
@@ -486,17 +521,23 @@ def scan_source(source: str, path: str) -> FileScan:
     einops_names = _einops_names(tree)
 
     def visit_function(
-        fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None, prefix: str
+        fn: ast.FunctionDef | ast.AsyncFunctionDef,
+        owner: ClassInfo | None,
+        prefix: str,
+        conditional: bool,
     ) -> None:
         qualname = f"{prefix}.{fn.name}" if prefix else fn.name
         if owner is None or not fn.name.startswith("__") or fn.name in _TRACED_DUNDERS:
-            add_target(fn, owner, qualname)
+            add_target(fn, owner, qualname, conditional)
         # A function body is a new scope, and anything defined in it is a local
         # of that function, exactly as `__qualname__` records it.
-        visit_body(fn.body, None, f"{qualname}.<locals>")
+        visit_body(fn.body, None, f"{qualname}.<locals>", conditional)
 
     def add_target(
-        fn: ast.FunctionDef | ast.AsyncFunctionDef, owner: ClassInfo | None, qualname: str
+        fn: ast.FunctionDef | ast.AsyncFunctionDef,
+        owner: ClassInfo | None,
+        qualname: str,
+        conditional: bool,
     ) -> None:
         returns: Spec | None = None
         error: str | None = None
@@ -517,7 +558,9 @@ def scan_source(source: str, path: str) -> FileScan:
             returns=returns,
             returns_position=Position.of(fn.returns) if fn.returns else None,
             decorators=[_decorator_name(d) for d in fn.decorator_list],
+            def_line=_def_line(fn),
             end_line=(fn.end_lineno or fn.lineno) - 1,
+            conditional=conditional or (owner.conditional if owner else False),
             signature_end_line=_signature_end_line(fn),
             owner=owner,
             annotation_error=error,
@@ -527,7 +570,7 @@ def scan_source(source: str, path: str) -> FileScan:
         if owner is not None:
             owner.method_dim_names.update(target.dim_names)
 
-    def visit_class(node: ast.ClassDef, prefix: str) -> None:
+    def visit_class(node: ast.ClassDef, prefix: str, conditional: bool) -> None:
         qualname = f"{prefix}.{node.name}" if prefix else node.name
         info = ClassInfo(
             name=node.name,
@@ -538,28 +581,33 @@ def scan_source(source: str, path: str) -> FileScan:
                 node.lineno - 1,
                 node.col_offset + len("class ") + len(node.name),
             ),
+            def_line=_def_line(node),
+            end_line=(node.end_lineno or node.lineno) - 1,
+            conditional=conditional,
             bases=[_base_name(base) for base in node.bases],
         )
         classes.append(info)
         # __init__ first, so every method sees the constructor parameters and
         # the annotated attributes they may refer to.
-        for child in _statements(node.body):
+        for child, _ in _statements(node.body):
             if (
                 isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and child.name == "__init__"
             ):
                 info.init_params = _params_of(child)[1:]  # drop self
                 info.attributes = _attributes_of(child)
-        visit_body(node.body, info, qualname)
+        visit_body(node.body, info, qualname, conditional)
 
-    def visit_body(body: list[ast.stmt], owner: ClassInfo | None, prefix: str) -> None:
-        for node in _statements(body):
+    def visit_body(
+        body: list[ast.stmt], owner: ClassInfo | None, prefix: str, conditional: bool
+    ) -> None:
+        for node, guarded in _statements(body, conditional):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                visit_function(node, owner, prefix)
+                visit_function(node, owner, prefix, guarded)
             elif isinstance(node, ast.ClassDef):
-                visit_class(node, prefix)
+                visit_class(node, prefix, guarded)
 
-    visit_body(tree.body, None, "")
+    visit_body(tree.body, None, "", False)
 
     return FileScan(
         path=path,

@@ -24,6 +24,8 @@ from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import ClassInfo, Position, Target, scan_source
 from .tracing import (
+    NotLive,
+    TraceFailed,
     TraceResult,
     TraceSkipped,
     check_return,
@@ -122,6 +124,24 @@ def check_target(
 
     try:
         result = trace(module, target, variadic_rank)
+    except NotLive:
+        return [], None
+    except TraceFailed as exc:
+        position, text = _anchor(exc.error, path, target.position)
+        return [
+            Diagnostic(
+                path=path,
+                line=position.line,
+                column=position.column,
+                end_line=position.end_line,
+                end_column=position.end_column,
+                rule="trace-error",
+                severity=Severity.ERROR,
+                message=exc.binder.rename_primes(f"{type(exc.error).__name__}: {exc.error}"),
+                function=target.qualname,
+                traceback=text,
+            )
+        ], None
     except TraceSkipped as exc:
         return [
             Diagnostic(
@@ -183,8 +203,15 @@ def check_attributes(
     binder = DimBinder(variadic_rank=variadic_rank)
 
     try:
-        cls = resolve_qualname(module, info.qualname or info.name)
+        cls = resolve_qualname(
+            module,
+            info.qualname,
+            conditional=info.conditional,
+            span=(info.def_line, info.end_line),
+        )
         instance = instantiate(info, cls, binder, info.dim_names)
+    except NotLive:
+        return []
     except TraceSkipped as exc:
         return [
             Diagnostic(
@@ -196,7 +223,7 @@ def check_attributes(
                 rule=exc.rule,
                 severity=_severity(exc.rule),
                 message=exc.message,
-                function=info.qualname or info.name,
+                function=info.qualname,
                 hint=exc.hint or None,
             )
         ]
@@ -211,8 +238,10 @@ def check_attributes(
                 end_column=position.end_column,
                 rule="trace-error",
                 severity=Severity.ERROR,
-                message=f"constructing `{info.qualname or info.name}`: {type(exc).__name__}: {exc}",
-                function=info.qualname or info.name,
+                message=binder.rename_primes(
+                    f"constructing `{info.qualname}`: {type(exc).__name__}: {exc}"
+                ),
+                function=info.qualname,
                 traceback=text,
             )
         ]
@@ -238,7 +267,7 @@ def check_attributes(
                     rule=rule,
                     severity=_severity(rule),
                     message=f"`self.{attribute.name}`: {problem['message']}",
-                    function=info.qualname or info.name,
+                    function=info.qualname,
                     expected=problem.get("expected"),
                     got=problem.get("got"),
                     hint=problem.get("hint") or None,
@@ -257,6 +286,10 @@ def shapes_for_hover(result: TraceResult) -> dict[str, str]:
     return hints
 
 
+def _is_local(qualname: str) -> bool:
+    return "<locals>" in qualname
+
+
 def run_job(job: dict[str, Any]) -> dict[str, Any]:
     variadic_rank = job.get("variadic_rank", 2)
     want_hover = job.get("hover", False)
@@ -273,7 +306,11 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             continue  # the in-process pass already reported it
 
         targets = [t for t in scan.targets if t.has_array_annotation]
-        classes = [c for c in scan.classes if c.attributes]
+        # A class inside a function body reports once, at the class line, so a
+        # factory with several annotated methods does not repeat itself.
+        local_classes = {c.qualname for c in scan.classes if _is_local(c.qualname)}
+        targets = [t for t in targets if t.owner is None or t.owner.qualname not in local_classes]
+        classes = [c for c in scan.classes if c.attributes or _is_local(c.qualname)]
         if not targets and not classes:
             continue
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -154,6 +155,20 @@ class _UseDefault(Exception):
     """Internal: the parameter has a default, so leave it out of the call."""
 
 
+class TraceFailed(Exception):
+    """The traced call raised.
+
+    Carries the binder alongside the original error, because torch reports a
+    shape bug with the concrete sizes it saw, and those are torchtyc's primes.
+    The caller needs the binder to put the user's own axis names back.
+    """
+
+    def __init__(self, error: BaseException, binder: DimBinder):
+        super().__init__(str(error))
+        self.error = error
+        self.binder = binder
+
+
 def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[str]) -> Any:
     """Construct a module on the meta device so its parameters cost nothing."""
     args: list[Any] = []
@@ -234,13 +249,76 @@ def _identity_init(original):
     return wrapper
 
 
-def resolve_qualname(module: Any, qualname: str) -> Any:
+class NotLive(Exception):
+    """A guarded definition that this import did not actually produce.
+
+    Scanning descends into every branch, so a `class` under
+    `if sys.version_info >= (3, 99)` is discovered even though the import never
+    ran it, and a name defined in both branches of a guard is discovered twice.
+    Neither is a finding about the user's code, so the caller drops the target
+    without reporting anything.
+    """
+
+
+def _code_positions(obj: Any) -> list[tuple[str, int]]:
+    """Where the code behind an object was written: (filename, 1-based line)."""
+    code = getattr(obj, "__code__", None)
+    if code is not None:
+        return [(code.co_filename, code.co_firstlineno)]
+    if isinstance(obj, type):
+        found = []
+        for value in vars(obj).values():
+            fn = value.__func__ if isinstance(value, (staticmethod, classmethod)) else value
+            code = getattr(fn, "__code__", None)
+            if code is not None:
+                found.append((code.co_filename, code.co_firstlineno))
+        return found
+    return []
+
+
+def is_live_definition(obj: Any, module: Any, first_line: int, last_line: int) -> bool:
+    """Whether `obj` is what this particular definition site produced.
+
+    Two things disqualify it: coming from another module altogether, which is
+    what a `try: from fast import Block / except ImportError: class Block`
+    fallback leaves behind, and being written at other lines of this same file,
+    which is what the losing branch of a guard sees. An object whose code cannot
+    be placed at all counts as live, because a decorator returning a wrapper
+    from some other file is not evidence of shadowing.
+    """
+    module_name = getattr(module, "__name__", None)
+    if module_name is not None and getattr(obj, "__module__", module_name) != module_name:
+        return False
+
+    path = getattr(module, "__file__", None)
+    if path is None:
+        return True
+    here = Path(path).resolve()
+    same_file = [
+        line for filename, line in _code_positions(obj) if Path(filename).resolve() == here
+    ]
+    if not same_file:
+        return True
+    return any(first_line <= line - 1 <= last_line for line in same_file)
+
+
+def resolve_qualname(
+    module: Any,
+    qualname: str,
+    *,
+    conditional: bool = False,
+    span: tuple[int, int] = (0, 0),
+) -> Any:
     """Walk a dotted qualname from the module down to the object it names.
 
     Nesting means the name is no longer a module attribute: `Outer.Inner` needs
     two lookups. A qualname holding `<locals>` names something built inside a
     function call, which no amount of `getattr` can reach, so it is skipped with
     a diagnostic rather than left silently unchecked.
+
+    A `conditional` definition sits under a branch that the import may not have
+    taken, so it has to prove it is the live one. An unguarded definition that
+    is missing after import stays an error, because there the absence is real.
     """
     if "<locals>" in qualname:
         raise TraceSkipped(
@@ -252,7 +330,11 @@ def resolve_qualname(module: Any, qualname: str) -> Any:
     for part in qualname.split("."):
         found = getattr(found, part, None)
         if found is None:
+            if conditional:
+                raise NotLive(qualname)
             raise TraceSkipped("trace-error", f"`{qualname}` is not defined after import")
+    if conditional and not is_live_definition(found, module, span[0], span[1]):
+        raise NotLive(qualname)
     return found
 
 
@@ -261,9 +343,20 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
     params = list(target.params)
 
     if target.owner is None:
-        return resolve_qualname(module, target.qualname), params
+        return resolve_qualname(
+            module,
+            target.qualname,
+            conditional=target.conditional,
+            span=(target.def_line, target.end_line),
+        ), params
 
-    cls = resolve_qualname(module, target.owner.qualname)
+    owner = target.owner
+    cls = resolve_qualname(
+        module,
+        owner.qualname,
+        conditional=owner.conditional,
+        span=(owner.def_line, owner.end_line),
+    )
 
     if "staticmethod" in target.decorators:
         return getattr(cls, target.name), params
@@ -272,7 +365,7 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
     if "property" in target.decorators:
         raise TraceSkipped("uninstantiable", "properties are not traced")
 
-    instance = instantiate(target.owner, cls, binder, target.owner.dim_names)
+    instance = instantiate(owner, cls, binder, owner.dim_names)
     return getattr(instance, target.name), params[1:]  # drop self
 
 
@@ -307,7 +400,10 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     # nn.Module.__call__ runs hooks that can allocate; calling forward directly
     # keeps the trace to the user's own code.
     with torch.device("meta"), torch.no_grad():
-        returned = fn(*positional, **keywords)
+        try:
+            returned = fn(*positional, **keywords)
+        except Exception as exc:
+            raise TraceFailed(exc, binder) from exc
 
     return TraceResult(binder=binder, returned=returned, argument_shapes=shapes)
 

@@ -122,7 +122,7 @@ def bench_worker_startup(python: str, repeats: int) -> dict:
     """The fixed cost of a check, broken into the steps that make it up.
 
     A check pays for a process, then for `import torch`, then for the rest of
-    the imports. Measuring them separately is what says where the ~1.2 s of a
+    the imports. Measuring them separately is what says where the ~1.3 s of a
     check actually goes, and therefore what is worth attacking.
     """
     job = json.dumps({"paths": [], "variadic_rank": 2, "sources": {}, "hover": False})

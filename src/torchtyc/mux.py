@@ -85,26 +85,57 @@ def _encode(message: dict[str, Any]) -> bytes:
     return b"Content-Length: %d\r\n\r\n" % len(body) + body
 
 
+# How many frames may wait for one downstream server before the mux gives up on
+# it. Large enough that an ordinary indexing pause is absorbed, small enough
+# that a server which has genuinely stopped reading is noticed quickly.
+QUEUE_LIMIT = 512
+
+
 @dataclass
 class Downstream:
     name: str
     process: asyncio.subprocess.Process
     # Diagnostics this server last published, keyed by document uri.
     diagnostics: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Frames waiting for this server, drained by its own writer task. Each
+    # server queues separately, so one that stops reading fills its own queue
+    # and leaves every other server and the client loop running at full speed.
+    outbox: asyncio.Queue[dict[str, Any]] = field(
+        default_factory=lambda: asyncio.Queue(QUEUE_LIMIT)
+    )
+    alive: bool = True
 
-    async def send(self, message: dict[str, Any]) -> None:
-        """Write one frame downstream, waiting for the pipe to accept it.
+    def send(self, message: dict[str, Any]) -> bool:
+        """Queue one frame. False means this server has fallen too far behind.
 
-        Draining is what applies backpressure. Without it a server that stops
-        reading, such as basedpyright indexing a large workspace, would let the
-        mux buffer every forwarded message in memory instead of slowing down.
+        Queueing never blocks the caller. A server that lets `QUEUE_LIMIT`
+        frames pile up is not going to catch up, and dropping single frames
+        would leave it out of step with the client, so the mux drops the server
+        instead and keeps the rest of the session coherent.
         """
-        assert self.process.stdin is not None
-        self.process.stdin.write(_encode(message))
+        if not self.alive:
+            return False
         try:
-            await self.process.stdin.drain()
-        except (ConnectionResetError, BrokenPipeError):
-            log.warning("%s closed its input", self.name)
+            self.outbox.put_nowait(message)
+        except asyncio.QueueFull:
+            self.alive = False
+            return False
+        return True
+
+    async def pump_writes(self) -> None:
+        """Write queued frames to this server until it dies or stops reading."""
+        assert self.process.stdin is not None
+        while True:
+            message = await self.outbox.get()
+            self.process.stdin.write(_encode(message))
+            try:
+                await self.process.stdin.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                log.warning("%s closed its input", self.name)
+                self.alive = False
+                return
+            finally:
+                self.outbox.task_done()
 
 
 @dataclass
@@ -181,15 +212,25 @@ class Mux:
         if "method" in message and "id" in message:
             await self.fan_out(message)
         elif "method" in message:
-            for server in self.servers:
-                await server.send(message)
+            for index in range(len(self.servers)):
+                await self.deliver(index, message)
         else:
             # A response to something a server asked the client.
             entry = self.upstream.pop(message.get("id"), None)
             if entry is None:
                 return
             index, original = entry
-            await self.servers[index].send({**message, "id": original})
+            await self.deliver(index, {**message, "id": original})
+
+    async def deliver(self, index: int, message: dict[str, Any]) -> bool:
+        """Queue one frame for one server, giving up on it if it has stopped reading."""
+        server = self.servers[index]
+        was_alive = server.alive
+        if server.send(message):
+            return True
+        if was_alive:
+            await self.drop_server(index)
+        return False
 
     async def fan_out(self, message: dict[str, Any]) -> None:
         method = message["method"]
@@ -200,7 +241,45 @@ class Mux:
         for index, server in enumerate(self.servers):
             issued = self.next_id()
             self.downstream[(index, issued)] = token
-            await server.send({**message, "id": issued})
+            if await self.deliver(index, {**message, "id": issued}):
+                continue
+            # `drop_server` answers whatever it still held. It only runs on the
+            # frame that kills the server, so a later one accounts for itself.
+            if self.downstream.pop((index, issued), None) is not None:
+                pending.errors.append(_stalled_error(server))
+        # Every server may already have been dropped, leaving nobody to answer.
+        if token in self.pending and pending.complete:
+            self.pending.pop(token, None)
+            await self.reply(pending)
+
+    async def drop_server(self, index: int) -> None:
+        """Give up on a server, answering whatever the client is still waiting for.
+
+        A request already fanned out to it would otherwise never complete, and
+        the client would wait forever on a reply the mux can no longer produce.
+        """
+        server = self.servers[index]
+        server.alive = False
+        print(f"torchtyc mux: {server.name} stopped reading, dropping it", file=sys.stderr)
+
+        error = _stalled_error(server)
+        for key in [k for k in self.downstream if k[0] == index]:
+            token = self.downstream.pop(key)
+            pending = self.pending.get(token)
+            if pending is None:
+                continue
+            pending.errors.append(error)
+            if pending.complete:
+                self.pending.pop(token, None)
+                await self.reply(pending)
+
+        if server.diagnostics:
+            uris = list(server.diagnostics)
+            server.diagnostics.clear()
+            for uri in uris:
+                await self.merge_diagnostics(index, {"uri": uri, "diagnostics": []})
+        if server.process.returncode is None:
+            server.process.terminate()
 
     # ------------------------------------------------------------------ server
 
@@ -318,6 +397,10 @@ class Mux:
         )
 
 
+def _stalled_error(server: Downstream) -> dict[str, Any]:
+    return {"code": -32603, "message": f"{server.name} stopped reading"}
+
+
 def _hover_text(contents: Any) -> str:
     if contents is None:
         return ""
@@ -354,9 +437,10 @@ async def _run(commands: list[str]) -> int:
 
     tasks = [asyncio.create_task(mux.pump_client(reader))]
     tasks += [asyncio.create_task(mux.pump_server(i)) for i in range(len(mux.servers))]
+    writers = [asyncio.create_task(server.pump_writes()) for server in mux.servers]
 
     _, remaining = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in remaining:
+    for task in [*remaining, *writers]:
         task.cancel()
     failed = False
     for server in mux.servers:

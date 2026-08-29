@@ -15,6 +15,7 @@ the tracer runs on meta tensors.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .annotations import ArraySpec, Dim
@@ -141,6 +142,33 @@ class DimBinder:
                 names.append(name)
                 remaining //= value
         return names if remaining == 1 and len(names) > 1 else []
+
+    def issued(self) -> dict[int, str]:
+        """Every size this binder handed out, mapped back to what it stands for."""
+        table: dict[int, str] = {}
+        for name, value in self.sizes.items():
+            table.setdefault(value, name)
+        for name, values in self.variadics.items():
+            for index, value in enumerate(values):
+                table.setdefault(value, f"{name}[{index}]")
+        for value in self.anonymous:
+            table.setdefault(value, "...")
+        for value in self.anonymous_dims:
+            table.setdefault(value, "_")
+        return table
+
+    def rename_primes(self, text: str) -> str:
+        """Put axis names back into a message torch wrote in concrete sizes.
+
+        A shape bug usually surfaces as a torch error quoting the sizes it saw,
+        which are this binder's primes. Only a number the binder actually issued
+        is replaced, so a rank, an index or a dtype width in the same sentence
+        is left exactly as it was.
+        """
+        table = self.issued()
+        if not table:
+            return text
+        return re.sub(r"\d+", lambda m: table.get(int(m.group()), m.group()), text)
 
     def render_shape(self, shape: tuple[int, ...]) -> str:
         parts: list[str] = []
