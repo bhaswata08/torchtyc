@@ -22,7 +22,7 @@ from typing import Any
 
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
-from .discovery import ClassInfo, Position, Target, scan_source
+from .discovery import Attribute, ClassInfo, Position, Target, scan_source
 from .tracing import (
     NotLive,
     TraceFailed,
@@ -216,7 +216,7 @@ def check_attributes(
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
     binder = DimBinder(variadic_rank=variadic_rank)
-    attributes = info.attributes
+    attributes: list[Attribute] = []
 
     try:
         cls = resolve_qualname(
@@ -227,10 +227,9 @@ def check_attributes(
         )
         # The annotations to check are the ones the live constructor wrote, so
         # a guarded `__init__` that this import skipped reports nothing.
-        chosen = live_init(info, cls)
-        if chosen is not None:
-            attributes = chosen.attributes
-        instance = instantiate(info, cls, binder, info.dim_names)
+        chosen = live_init(info, cls, module)
+        attributes = chosen.attributes if chosen is not None else []
+        instance = instantiate(info, cls, binder, info.dim_names, module)
     except NotLive:
         return []
     except TraceSkipped as exc:

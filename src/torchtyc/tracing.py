@@ -171,31 +171,38 @@ class TraceFailed(Exception):
         self.binder = binder
 
 
-def live_init(owner: ClassInfo, cls: type) -> InitDef | None:
+def live_init(owner: ClassInfo, cls: type, module: Any) -> InitDef | None:
     """Which of the `__init__` definitions in the body this import produced.
 
-    A class that writes `__init__` in both arms of a guard has two definitions
-    and one constructor. Source order cannot say which arm ran, but the code
-    object behind the live `__init__` names the lines it was written at.
+    A guarded constructor has to prove it ran, exactly as a guarded class or
+    method does, and that holds whether the class writes one of them or several:
+    the single `__init__` of a branch the import never took is not the
+    constructor to build with. None means no written constructor is live, so the
+    class builds the way Python would build it, through whatever it inherits.
     """
-    if len(owner.inits) < 2:
-        return owner.init
-    code = getattr(getattr(cls, "__init__", None), "__code__", None)
-    if code is None:
-        return owner.init
-    line = code.co_firstlineno - 1
-    for candidate in owner.inits:
-        if candidate.def_line <= line <= candidate.end_line:
+    found = getattr(cls, "__init__", None)
+    candidates = [
+        init
+        for init in owner.inits
+        if not init.conditional
+        or (found is not None and is_live_definition(found, module, init.def_line, init.end_line))
+    ]
+    if not candidates:
+        return None
+    for candidate in reversed(candidates):
+        if not candidate.conditional:
             return candidate
-    return owner.init
+    return candidates[-1]
 
 
-def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[str]) -> Any:
+def instantiate(
+    owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[str], module: Any
+) -> Any:
     """Construct a module on the meta device so its parameters cost nothing."""
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
     positional_open = True
-    init = live_init(owner, cls)
+    init = live_init(owner, cls, module)
     for param in init.params if init else []:
         if param.positional_only and not positional_open:
             continue
@@ -388,7 +395,7 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
     if "classmethod" in target.decorators:
         return _live_method(module, cls, target), params[1:]
 
-    instance = instantiate(owner, cls, binder, owner.dim_names)
+    instance = instantiate(owner, cls, binder, owner.dim_names, module)
     return _live_method(module, instance, target), params[1:]  # drop self
 
 

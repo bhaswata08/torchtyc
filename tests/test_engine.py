@@ -1076,3 +1076,26 @@ def test_an_attribute_of_a_guarded_init_is_checked_when_that_arm_is_live(project
     report = check_paths(paths, config)
     assert "attribute-mismatch" in rules(report)
     assert report.worker_error is None
+
+
+def test_a_class_whose_only_init_did_not_run_is_left_alone(project):
+    paths, config = project(
+        HEADER
+        + """
+    FAST = False
+
+    class Block(nn.Module):
+        if FAST:
+            def __init__(self, d_model: int) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "d_model d_model"] = nn.Parameter(
+                    torch.empty(d_model, d_model)
+                )
+
+        def forward(self, x: Float[Tensor, "b d_model"]) -> Float[Tensor, "b d_model"]:
+            return x * 2
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.worker_error is None
