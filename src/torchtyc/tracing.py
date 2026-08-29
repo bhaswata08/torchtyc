@@ -358,20 +358,57 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
         span=(owner.def_line, owner.end_line),
     )
 
-    if "staticmethod" in target.decorators:
-        return getattr(cls, target.name), params
-    if "classmethod" in target.decorators:
-        return getattr(cls, target.name), params[1:]
     if "property" in target.decorators:
         raise TraceSkipped("uninstantiable", "properties are not traced")
 
+    if "staticmethod" in target.decorators:
+        return _live_method(module, cls, target), params
+    if "classmethod" in target.decorators:
+        return _live_method(module, cls, target), params[1:]
+
     instance = instantiate(owner, cls, binder, owner.dim_names)
-    return getattr(instance, target.name), params[1:]  # drop self
+    return _live_method(module, instance, target), params[1:]  # drop self
+
+
+def _live_method(module: Any, owner: Any, target: Target) -> Any:
+    """The bound method for a target, once it is known to be this definition.
+
+    A guarded `def` in a live class body is the same problem as a guarded one at
+    module level: the class exists, so the owner resolves, but the method behind
+    the name may be a base class's or the winner of the other branch. The class
+    boundary cannot see that, so the check belongs here, where the callable the
+    tracer will actually run is finally in hand.
+    """
+    found = getattr(owner, target.name, None)
+    if found is None:
+        if target.conditional:
+            raise NotLive(target.qualname)
+        raise TraceSkipped("trace-error", f"`{target.qualname}` is not defined after import")
+    if target.conditional and not is_live_definition(
+        found, module, target.def_line, target.end_line
+    ):
+        raise NotLive(target.qualname)
+    return found
 
 
 def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
-    """Call one target on meta tensors and hand back what came out."""
+    """Call one target on meta tensors and hand back what came out.
+
+    Every way this can fail on the user's own code - constructing the module,
+    building an argument, running the body - comes back as `TraceFailed`, which
+    carries the binder. That is what lets the caller report the failure in the
+    user's axis names instead of the primes torch actually saw.
+    """
     binder = DimBinder(variadic_rank=variadic_rank)
+    try:
+        return _trace(module, target, binder)
+    except (TraceSkipped, NotLive, TraceFailed):
+        raise
+    except Exception as exc:
+        raise TraceFailed(exc, binder) from exc
+
+
+def _trace(module: Any, target: Target, binder: DimBinder) -> TraceResult:
     fn, params = resolve_callable(module, target, binder)
 
     shapes: dict[str, tuple[int, ...]] = {}
@@ -400,10 +437,7 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     # nn.Module.__call__ runs hooks that can allocate; calling forward directly
     # keeps the trace to the user's own code.
     with torch.device("meta"), torch.no_grad():
-        try:
-            returned = fn(*positional, **keywords)
-        except Exception as exc:
-            raise TraceFailed(exc, binder) from exc
+        returned = fn(*positional, **keywords)
 
     return TraceResult(binder=binder, returned=returned, argument_shapes=shapes)
 

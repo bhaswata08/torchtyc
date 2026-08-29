@@ -133,6 +133,10 @@ class Target:
     # covers the function name, because that is what a diagnostic underlines,
     # so it is the wrong anchor for anything belonging after the signature.
     signature_end_line: int = 0
+    # Dimension names annotated by the function this one is nested inside. A
+    # helper written inside an annotated function shares its axes by intent even
+    # though it repeats none of them, so the einops near-miss rule reads both.
+    enclosing_dim_names: frozenset[str] = frozenset()
     owner: ClassInfo | None = None
     annotation_error: str | None = None
     einops_calls: list[EinopsCall] = field(default_factory=list)
@@ -157,6 +161,16 @@ class Target:
             for array in iter_arrays(spec):
                 names.update(array.named_dims)
         return names
+
+    @property
+    def visible_dim_names(self) -> set[str]:
+        """Axis names in scope here, this function's own and its enclosing one's.
+
+        Only for reading a name a human wrote nearby. The tracer keeps to
+        `dim_names`, because an enclosing axis must not decide what one of this
+        function's own integer parameters is bound to.
+        """
+        return self.dim_names | set(self.enclosing_dim_names)
 
 
 @dataclass
@@ -525,20 +539,24 @@ def scan_source(source: str, path: str) -> FileScan:
         owner: ClassInfo | None,
         prefix: str,
         conditional: bool,
+        enclosing: frozenset[str],
     ) -> None:
         qualname = f"{prefix}.{fn.name}" if prefix else fn.name
+        inner = enclosing
         if owner is None or not fn.name.startswith("__") or fn.name in _TRACED_DUNDERS:
-            add_target(fn, owner, qualname, conditional)
+            target = add_target(fn, owner, qualname, conditional, enclosing)
+            inner = frozenset(target.visible_dim_names)
         # A function body is a new scope, and anything defined in it is a local
         # of that function, exactly as `__qualname__` records it.
-        visit_body(fn.body, None, f"{qualname}.<locals>", conditional)
+        visit_body(fn.body, None, f"{qualname}.<locals>", conditional, inner)
 
     def add_target(
         fn: ast.FunctionDef | ast.AsyncFunctionDef,
         owner: ClassInfo | None,
         qualname: str,
         conditional: bool,
-    ) -> None:
+        enclosing: frozenset[str],
+    ) -> Target:
         returns: Spec | None = None
         error: str | None = None
         try:
@@ -561,6 +579,7 @@ def scan_source(source: str, path: str) -> FileScan:
             def_line=_def_line(fn),
             end_line=(fn.end_lineno or fn.lineno) - 1,
             conditional=conditional or (owner.conditional if owner else False),
+            enclosing_dim_names=enclosing,
             signature_end_line=_signature_end_line(fn),
             owner=owner,
             annotation_error=error,
@@ -569,8 +588,11 @@ def scan_source(source: str, path: str) -> FileScan:
         targets.append(target)
         if owner is not None:
             owner.method_dim_names.update(target.dim_names)
+        return target
 
-    def visit_class(node: ast.ClassDef, prefix: str, conditional: bool) -> None:
+    def visit_class(
+        node: ast.ClassDef, prefix: str, conditional: bool, enclosing: frozenset[str]
+    ) -> None:
         qualname = f"{prefix}.{node.name}" if prefix else node.name
         info = ClassInfo(
             name=node.name,
@@ -596,18 +618,22 @@ def scan_source(source: str, path: str) -> FileScan:
             ):
                 info.init_params = _params_of(child)[1:]  # drop self
                 info.attributes = _attributes_of(child)
-        visit_body(node.body, info, qualname, conditional)
+        visit_body(node.body, info, qualname, conditional, enclosing)
 
     def visit_body(
-        body: list[ast.stmt], owner: ClassInfo | None, prefix: str, conditional: bool
+        body: list[ast.stmt],
+        owner: ClassInfo | None,
+        prefix: str,
+        conditional: bool,
+        enclosing: frozenset[str],
     ) -> None:
         for node, guarded in _statements(body, conditional):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                visit_function(node, owner, prefix, guarded)
+                visit_function(node, owner, prefix, guarded, enclosing)
             elif isinstance(node, ast.ClassDef):
-                visit_class(node, prefix, guarded)
+                visit_class(node, prefix, guarded, enclosing)
 
-    visit_body(tree.body, None, "", False)
+    visit_body(tree.body, None, "", False, frozenset())
 
     return FileScan(
         path=path,

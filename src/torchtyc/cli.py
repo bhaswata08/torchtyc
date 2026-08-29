@@ -1,4 +1,4 @@
-"""The command line: check, trace, watch, lsp, mux, rules, version."""
+"""The command line: check, trace, watch, lsp, rules, version."""
 
 from __future__ import annotations
 
@@ -65,16 +65,6 @@ def build_parser() -> argparse.ArgumentParser:
     lsp = sub.add_parser("lsp", help="run the language server on stdio")
     lsp.add_argument("--tcp", type=int, metavar="PORT", help="listen on a port instead of stdio")
     _add_common(lsp)
-
-    mux = sub.add_parser("mux", help="run another language server alongside torchtyc")
-    mux.add_argument(
-        "--server",
-        action="append",
-        default=[],
-        metavar="CMD",
-        help="a server to multiplex, repeatable (default: basedpyright-langserver --stdio)",
-    )
-    _add_common(mux)
 
     sub.add_parser("rules", help="list the diagnostic rules")
     sub.add_parser("version", help="print the version")
@@ -163,13 +153,6 @@ def cmd_lsp(args: argparse.Namespace) -> int:
     return serve(tcp_port=args.tcp, overrides=_overrides_from(args))
 
 
-def cmd_mux(args: argparse.Namespace) -> int:
-    from .mux import serve_mux
-
-    servers = args.server or ["basedpyright-langserver --stdio"]
-    return serve_mux(_overrides_from(args), servers)
-
-
 def cmd_rules(_: argparse.Namespace) -> int:
     width = max(len(name) for name in RULES)
     for name, rule in sorted(RULES.items(), key=lambda item: (item[1].severity, item[0])):
@@ -184,7 +167,6 @@ def main(argv: list[str] | None = None) -> int:
         "trace": cmd_trace,
         "watch": cmd_watch,
         "lsp": cmd_lsp,
-        "mux": cmd_mux,
         "rules": cmd_rules,
         "version": lambda _: (print(f"torchtyc {__version__}"), 0)[1],
     }

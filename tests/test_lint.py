@@ -132,3 +132,22 @@ def test_an_einops_call_in_a_nested_helper_is_reported_once():
     found = lint_scan(scan, Config(root=Path(".")))
     axis = [d for d in found if d.rule == "einops-unknown-axis"]
     assert len(axis) == 1
+
+
+def test_the_near_miss_rule_sees_the_enclosing_function_axes():
+    source = textwrap.dedent("""
+        from einops import rearrange
+        from jaxtyping import Float
+        from torch import Tensor
+
+
+        def outer(x: Float[Tensor, "batch dim"]) -> Float[Tensor, "batch dim"]:
+            def helper(y):
+                return rearrange(y, "batch dimn -> batch dimn")
+
+            return helper(x)
+    """)
+    found = lint_scan(scan_source(source, "m.py"), Config(root=Path(".")))
+    messages = [d.message for d in found if d.rule == "einops-unknown-axis"]
+    assert any("`dimn` is one character from annotated dimension `dim`" in m for m in messages)
+    assert len(messages) == 1

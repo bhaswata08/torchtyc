@@ -130,7 +130,7 @@ def check_call(call: EinopsCall, target: Target, path: str) -> list[Diagnostic]:
 
     # An axis name shared with the annotations is the common case, and a name
     # that is one character away from an annotated one is usually a typo.
-    dim_names = target.dim_names
+    dim_names = target.visible_dim_names
     if dim_names:
         for axis in sorted(known - set(call.keywords)):
             if axis in dim_names:

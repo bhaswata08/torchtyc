@@ -104,7 +104,6 @@ torchtyc check <paths>...        Shape-check files or directories
 torchtyc trace <file.py::func>   Show the shapes flowing through one function
 torchtyc watch <paths>...        Re-check on change
 torchtyc lsp                     Language server on stdio
-torchtyc mux                     Language server multiplexed with basedpyright
 torchtyc rules                   List the diagnostic rules
 ```
 
@@ -197,14 +196,6 @@ vim.lsp.config.torchtyc = {
   root_markers = { "pyproject.toml", ".git" },
 }
 vim.lsp.enable("torchtyc")
-```
-
-If your setup allows only one server per filetype, `torchtyc mux` runs
-basedpyright behind the same pipe and merges both servers' diagnostics,
-capabilities, hovers, and code actions:
-
-```lua
-cmd = { "torchtyc", "mux", "--server", "basedpyright-langserver --stdio" }
 ```
 
 The server publishes lint diagnostics immediately on every change, and traces

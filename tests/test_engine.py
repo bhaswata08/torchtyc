@@ -1,5 +1,6 @@
 """End-to-end checks: a real file, a real torch import, a real subprocess."""
 
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -785,3 +786,115 @@ def test_a_local_class_is_reported_once(project):
         for index, line in enumerate(Path(paths[0]).read_text().splitlines())
         if line.strip().startswith("class Made")
     )
+
+
+def test_a_guarded_method_that_never_ran_is_not_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    FLAG = False
+
+
+    class Block(nn.Module):
+        if FLAG:
+
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_only_the_live_branch_of_a_method_is_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    FLAG = True
+
+
+    class Block(nn.Module):
+        if FLAG:
+
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+
+        else:
+
+            def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b"]:
+                return x.sum(-1)
+    """
+    )
+    report = check_paths(paths, config)
+    assert "rank-mismatch" not in rules(report)
+    assert report.ok
+
+
+def test_a_local_class_with_nothing_annotated_is_not_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    def train(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        class _Ctx:
+            pass
+
+        _Ctx()
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "local-definition" not in rules(report)
+    assert report.diagnostics == []
+
+
+def test_a_failure_inside_init_reports_axis_names(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_in: int, d_out: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty(d_out, d_in)).view(d_in, d_out, 2)
+
+        def forward(self, x: Float[Tensor, "b d_in"]) -> Float[Tensor, "b d_out"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert "d_in" in diagnostic.message
+    assert "101" not in diagnostic.message
+
+
+def test_json_output_carries_no_synthetic_primes(project, capsys):
+    import json as json_module
+
+    from torchtyc.binding import _PRIME_POOL
+    from torchtyc.formats import render
+
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_in: int, d_out: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((d_out, d_in)))
+
+        def forward(self, x: Float[Tensor, "b d_in"]) -> Float[Tensor, "b d_out"]:
+            return x @ self.W
+    """
+    )
+    report = check_paths(paths, config)
+    print(render(report, "json", config.root))
+    payload = json_module.loads(capsys.readouterr().out)
+
+    text = json_module.dumps(payload)
+    primes = {str(p) for p in _PRIME_POOL[:8]}
+    numbers = set(re.findall(r"\d+", text))
+    assert not (numbers & primes), f"a synthetic prime reached the json output: {numbers & primes}"
+
+    # The traceback still names the real source lines it points at, which are
+    # positions and not shapes, so renaming must have left them alone.
+    diagnostic = next(d for d in payload["diagnostics"] if d["rule"] == "trace-error")
+    assert f"line {diagnostic['line'] + 1}" in diagnostic["traceback"]

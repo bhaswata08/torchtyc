@@ -82,7 +82,21 @@ def import_from_path(path: Path, source: str | None = None) -> Any:
     return module
 
 
-def _anchor(exc: BaseException, path: str, fallback: Position) -> tuple[Position, str]:
+def _format_traceback(exc: BaseException, binder: DimBinder) -> str:
+    """The traceback, with axis names put back into the exception message.
+
+    Renaming the whole blob would be wrong: a frame line carries `line 101`,
+    which is a source position and not a shape. `format_exception` indents every
+    frame block by two spaces and leaves the message lines flush, so the split
+    is exact and only the message ever passes through the binder.
+    """
+    parts = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return "".join(part if part.startswith("  ") else binder.rename_primes(part) for part in parts)
+
+
+def _anchor(
+    exc: BaseException, path: str, fallback: Position, binder: DimBinder
+) -> tuple[Position, str]:
     """Point at the deepest frame inside the file being checked.
 
     A shape error usually surfaces several frames down, inside einsum or matmul.
@@ -95,7 +109,7 @@ def _anchor(exc: BaseException, path: str, fallback: Position) -> tuple[Position
     frames = traceback.extract_tb(exc.__traceback__)
     mine = [f for f in frames if f.filename and Path(f.filename).resolve() == Path(path).resolve()]
     chosen = mine[-1] if mine else None
-    text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    text = _format_traceback(exc, binder)
     if chosen is None:
         return fallback, text
     line = chosen.lineno - 1 if chosen.lineno else fallback.line
@@ -127,7 +141,7 @@ def check_target(
     except NotLive:
         return [], None
     except TraceFailed as exc:
-        position, text = _anchor(exc.error, path, target.position)
+        position, text = _anchor(exc.error, path, target.position, exc.binder)
         return [
             Diagnostic(
                 path=path,
@@ -158,7 +172,7 @@ def check_target(
             )
         ], None
     except Exception as exc:  # noqa: BLE001 - any user error is a finding
-        position, text = _anchor(exc, path, target.position)
+        position, text = _anchor(exc, path, target.position, DimBinder())
         return [
             Diagnostic(
                 path=path,
@@ -228,7 +242,7 @@ def check_attributes(
             )
         ]
     except Exception as exc:  # noqa: BLE001
-        position, text = _anchor(exc, path, info.position)
+        position, text = _anchor(exc, path, info.position, binder)
         return [
             Diagnostic(
                 path=path,
@@ -307,17 +321,24 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
 
         targets = [t for t in scan.targets if t.has_array_annotation]
         # A class inside a function body reports once, at the class line, so a
-        # factory with several annotated methods does not repeat itself.
-        local_classes = {c.qualname for c in scan.classes if _is_local(c.qualname)}
+        # factory with several annotated methods does not repeat itself. A local
+        # class with nothing annotated is not reported at all: there is no
+        # coverage to miss, so saying so would be noise.
+        annotated_owners = {t.owner.qualname for t in targets if t.owner is not None}
+        local_classes = {
+            c.qualname
+            for c in scan.classes
+            if _is_local(c.qualname) and (c.attributes or c.qualname in annotated_owners)
+        }
         targets = [t for t in targets if t.owner is None or t.owner.qualname not in local_classes]
-        classes = [c for c in scan.classes if c.attributes or _is_local(c.qualname)]
+        classes = [c for c in scan.classes if c.attributes or c.qualname in local_classes]
         if not targets and not classes:
             continue
 
         try:
             module = import_from_path(Path(path), buffer)
         except Exception as exc:  # noqa: BLE001
-            position, text = _anchor(exc, path, Position(0, 0, 0, 1))
+            position, text = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
             diagnostics.append(
                 Diagnostic(
                     path=path,
