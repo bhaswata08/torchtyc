@@ -129,9 +129,9 @@ def _name_counts(scan: FileScan) -> dict[str, dict[str, int]]:
 
     for info in scan.classes:
         scope = scopes.setdefault(info.qualname, {})
-        for attribute in info.attributes:
+        for attribute in info.all_attributes:
             add(scope, attribute.spec)
-        for param in info.init_params:
+        for param in info.all_init_params:
             if param.name:
                 # A constructor parameter that names a dimension counts as a use,
                 # because that is where the dimension gets its size.
@@ -350,7 +350,7 @@ def check_paths(
         report.checked_functions += sum(1 for t in scan.targets if t.has_array_annotation)
         report.diagnostics.extend(lint_scan(scan, config))
         needs_trace = any(t.has_array_annotation for t in scan.targets) or any(
-            c.attributes for c in scan.classes
+            c.all_attributes for c in scan.classes
         )
         if scan.syntax_error is None and needs_trace:
             traceable.append(path)

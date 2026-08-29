@@ -335,10 +335,10 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         local_classes = {
             c.qualname
             for c in scan.classes
-            if _is_local(c.qualname) and (c.attributes or c.qualname in annotated_owners)
+            if _is_local(c.qualname) and (c.all_attributes or c.qualname in annotated_owners)
         }
         targets = [t for t in targets if t.owner is None or t.owner.qualname not in local_classes]
-        classes = [c for c in scan.classes if c.attributes or c.qualname in local_classes]
+        classes = [c for c in scan.classes if c.all_attributes or c.qualname in local_classes]
         if not targets and not classes:
             continue
 

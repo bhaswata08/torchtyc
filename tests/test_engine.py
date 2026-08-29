@@ -1036,3 +1036,43 @@ def test_a_class_with_a_guarded_init_uses_the_one_that_ran(project):
     report = check_paths(paths, config)
     assert report.diagnostics == []
     assert report.worker_error is None
+
+
+def test_a_forgotten_await_in_a_sync_forward_is_still_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Net(nn.Module):
+        async def _helper(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x * 2
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return self._helper(x)
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.function == "Net.forward")
+    assert diagnostic.rule == "not-a-tensor"
+    assert "coroutine" in diagnostic.message
+
+
+def test_an_attribute_of_a_guarded_init_is_checked_when_that_arm_is_live(project):
+    paths, config = project(
+        HEADER
+        + """
+    FAST = True
+
+    class Block(nn.Module):
+        if FAST:
+            def __init__(self, d: int) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "d d"] = nn.Parameter(torch.empty((d, 3)))
+        else:
+            def __init__(self, d: int) -> None:
+                super().__init__()
+                self.W = nn.Parameter(torch.empty((d, d)))
+    """
+    )
+    report = check_paths(paths, config)
+    assert "attribute-mismatch" in rules(report)
+    assert report.worker_error is None

@@ -128,6 +128,22 @@ class ClassInfo:
         return self.init.attributes if self.init else []
 
     @property
+    def all_attributes(self) -> list[Attribute]:
+        """Annotated attributes across every constructor written in the body.
+
+        Which of them are reported is the tracer's call, once the import has
+        said which `__init__` ran. Whether the class is worth constructing at
+        all is decided before that, and deciding it from one guessed
+        constructor would leave a guarded one silently unchecked.
+        """
+        return [attribute for init in self.inits for attribute in init.attributes]
+
+    @property
+    def all_init_params(self) -> list[Param]:
+        """Constructor parameters across every `__init__` written in the body."""
+        return [param for init in self.inits for param in init.params]
+
+    @property
     def dim_names(self) -> set[str]:
         """Every dimension name the class writes, across attributes and methods.
 
@@ -137,7 +153,7 @@ class ClassInfo:
         method would let the same class build under one method and not another.
         """
         names: set[str] = set(self.method_dim_names)
-        for attribute in self.attributes:
+        for attribute in self.all_attributes:
             for array in iter_arrays(attribute.spec):
                 names.update(array.named_dims)
         return names
@@ -178,6 +194,9 @@ class Target:
     owner: ClassInfo | None = None
     annotation_error: str | None = None
     einops_calls: list[EinopsCall] = field(default_factory=list)
+    # Declared `async def`, so the tracer has to await what it returns. A
+    # coroutine out of a plain `def` is a forgotten await, which is a finding.
+    is_async: bool = False
 
     @property
     def is_method(self) -> bool:
@@ -632,6 +651,7 @@ def scan_source(source: str, path: str) -> FileScan:
             owner=owner,
             annotation_error=error,
             einops_calls=_find_einops(fn, einops_names),
+            is_async=isinstance(fn, ast.AsyncFunctionDef),
         )
         targets.append(target)
         if owner is not None:

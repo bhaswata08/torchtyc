@@ -461,20 +461,28 @@ def _trace(module: Any, target: Target, binder: DimBinder) -> TraceResult:
     with torch.device("meta"), torch.no_grad():
         returned = fn(*positional, **keywords)
         if inspect.iscoroutine(returned):
-            returned = _run_coroutine(returned)
+            returned = _settle_coroutine(returned, awaited=target.is_async)
 
     return TraceResult(binder=binder, returned=returned, argument_shapes=shapes)
 
 
-def _run_coroutine(coroutine: Any) -> Any:
-    """Run an `async def` target to completion so its return can be checked.
+def _settle_coroutine(coroutine: Any, *, awaited: bool) -> Any:
+    """Finish with a coroutine, either by running it or by putting it down.
 
-    A coroutine that is never awaited is both a wrong answer, since the shape
-    check would then see a coroutine object rather than a tensor, and a
-    RuntimeWarning on stderr. `asyncio.run` starts it on every path it takes,
-    and closing it afterwards covers the case where the run never got that far.
-    Closing one that already finished, however it finished, does nothing.
+    An `async def` target returns a coroutine because that is what calling one
+    does, so running it to completion is what gives the shape check a tensor to
+    look at. A plain `def` returning one is a forgotten await, and repairing it
+    here would hide the bug: the coroutine comes back untouched for
+    `check_return` to report as `not-a-tensor`.
+
+    Either way it gets closed. A coroutine that is never started raises
+    `RuntimeWarning: coroutine was never awaited` when it is collected, and the
+    worker's stderr is not the place for that. Closing one that already
+    finished, however it finished, does nothing.
     """
+    if not awaited:
+        coroutine.close()
+        return coroutine
     try:
         return asyncio.run(coroutine)
     finally:
