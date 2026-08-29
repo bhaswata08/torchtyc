@@ -173,3 +173,54 @@ def test_class_position_spans_the_class_name():
     info = scan_source(source, "a.py").classes[0]
     assert (info.position.line, info.position.end_line) == (0, 0)
     assert source.splitlines()[0][info.position.column : info.position.end_column] == "class Net"
+
+
+SIGNATURES = """
+from jaxtyping import Float
+from torch import Tensor
+
+
+def one_line(x: Float[Tensor, "a"]) -> Float[Tensor, "a"]:
+    return x
+
+
+def wrapped(
+    x: Float[Tensor, "a b"],
+    y: Float[Tensor, "b c"],
+) -> Float[Tensor, "a c"]:
+    return x @ y
+
+
+def compact(x: Float[Tensor, "a"]) -> Float[Tensor, "a"]: return x
+
+
+def unannotated_return(x: Float[Tensor, "a"]):
+    return x
+"""
+
+
+def signature_end(name: str) -> int:
+    scan = scan_source(SIGNATURES, "sig.py")
+    return next(t for t in scan.targets if t.name == name).signature_end_line
+
+
+def test_signature_end_of_a_single_line_def():
+    # `def one_line(...) -> ...:` is on the 6th line, 0-based 5.
+    assert signature_end("one_line") == 5
+
+
+def test_signature_end_of_a_wrapped_def():
+    lines = SIGNATURES.splitlines()
+    # The header finishes on the line carrying the return annotation, not on
+    # the `def` line.
+    assert lines[signature_end("wrapped")].strip() == ') -> Float[Tensor, "a c"]:'
+
+
+def test_signature_end_never_runs_past_the_body():
+    lines = SIGNATURES.splitlines()
+    assert lines[signature_end("compact")].lstrip().startswith("def compact")
+
+
+def test_signature_end_without_a_return_annotation():
+    lines = SIGNATURES.splitlines()
+    assert lines[signature_end("unannotated_return")].lstrip().startswith("def unannotated_return")

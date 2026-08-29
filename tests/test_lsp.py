@@ -332,3 +332,72 @@ def test_quick_fix_declines_a_multiline_annotation():
     )
     line = "def f(x) -> Float["
     assert quick_fix_edits(line, diagnostic) == []
+
+
+def inlay_positions(source: str, shapes: dict[str, dict[str, str]]) -> list[tuple[int, int]]:
+    """Run the real inlay hint handler over a source string."""
+    from types import SimpleNamespace
+
+    from torchtyc.discovery import scan_source
+    from torchtyc.engine import Report
+    from torchtyc.lsp import inlay_hints
+
+    uri = "file:///a.py"
+    path = uri_to_path(uri)
+    lines = [line + "\n" for line in source.splitlines()]
+    document = SimpleNamespace(lines=lines)
+    ls = SimpleNamespace(
+        workspace=SimpleNamespace(get_text_document=lambda _: document),
+        reports={uri: Report(hovers={path: shapes})},
+        scans={uri: scan_source(source, path)},
+    )
+    params = lsp.InlayHintParams(
+        text_document=lsp.TextDocumentIdentifier(uri=uri),
+        range=lsp.Range(
+            start=lsp.Position(line=0, character=0),
+            end=lsp.Position(line=len(lines), character=0),
+        ),
+    )
+    return [(h.position.line, h.position.character) for h in inlay_hints(ls, params)]
+
+
+SOURCE_ONE_LINE = """from jaxtyping import Float
+from torch import Tensor
+
+
+def forward(x: Float[Tensor, "a"]) -> Float[Tensor, "a"]:
+    return x
+"""
+
+
+def test_inlay_hint_lands_after_the_whole_signature():
+    positions = inlay_positions(SOURCE_ONE_LINE, {"forward": {"return": "float32[(a,)]"}})
+    assert len(positions) == 1
+    line, character = positions[0]
+    text = SOURCE_ONE_LINE.splitlines()[line]
+    # The hint must not split `def forward` from its parameter list, which is
+    # what anchoring at the end of the function name did.
+    assert text.lstrip().startswith("def forward")
+    assert character == len(text)
+    assert character > text.index("(")
+
+
+SOURCE_WRAPPED = """from jaxtyping import Float
+from torch import Tensor
+
+
+def forward(
+    x: Float[Tensor, "a b"],
+    y: Float[Tensor, "b c"],
+) -> Float[Tensor, "a c"]:
+    return x @ y
+"""
+
+
+def test_inlay_hint_follows_a_wrapped_signature_to_its_last_line():
+    positions = inlay_positions(SOURCE_WRAPPED, {"forward": {"return": "float32[(a, c)]"}})
+    assert len(positions) == 1
+    line, character = positions[0]
+    text = SOURCE_WRAPPED.splitlines()[line]
+    assert text.strip() == ') -> Float[Tensor, "a c"]:'
+    assert character == len(text)

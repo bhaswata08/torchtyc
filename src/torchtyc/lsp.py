@@ -265,20 +265,28 @@ def inlay_hints(ls: TorchtycServer, params: lsp.InlayHintParams) -> list[lsp.Inl
         return []
 
     traced = report.shapes_in(uri_to_path(uri))
+    document = ls.workspace.get_text_document(uri)
     hints: list[lsp.InlayHint] = []
     for target in scan.targets:
         shapes = traced.get(target.qualname)
         if not shapes:
             continue
-        line = target.position.line
+        # After the signature, not after the function name. Anchoring at
+        # `position.end_column` put the hint between `def forward` and its
+        # parameter list, splitting the very line it annotates.
+        line = target.signature_end_line
         if not (params.range.start.line <= line <= params.range.end.line):
             continue
         summary = shapes.get("return")
         if summary is None:
             continue
+        try:
+            character = len(document.lines[line].rstrip("\r\n"))
+        except IndexError:
+            continue
         hints.append(
             lsp.InlayHint(
-                position=lsp.Position(line=line, character=target.position.end_column),
+                position=lsp.Position(line=line, character=character),
                 label=f"  traced -> {summary}",
                 kind=lsp.InlayHintKind.Type,
                 padding_left=True,

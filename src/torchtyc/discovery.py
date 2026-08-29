@@ -112,6 +112,11 @@ class Target:
     decorators: list[str]
     # Last line of the function body, so a cursor below it belongs to no target.
     end_line: int = 0
+    # 0-based line the `def` header finishes on, which is not `position.line`
+    # once a signature wraps across several lines. `position` deliberately
+    # covers the function name, because that is what a diagnostic underlines,
+    # so it is the wrong anchor for anything belonging after the signature.
+    signature_end_line: int = 0
     owner: ClassInfo | None = None
     annotation_error: str | None = None
     einops_calls: list[EinopsCall] = field(default_factory=list)
@@ -322,6 +327,37 @@ def _plain_type(node: ast.expr) -> str | None:
     return None
 
 
+def _signature_end_line(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+    """The 0-based line the `def` header finishes on.
+
+    Found from the last thing the header can hold: the return annotation when
+    there is one, otherwise the last argument, annotation or default. The
+    body's first statement bounds it, so a one-line `def f(): return x` gives
+    that same line rather than running past it.
+    """
+    args = fn.args
+    ends = [fn.lineno]
+
+    if fn.returns is not None:
+        ends.append(fn.returns.end_lineno or fn.returns.lineno)
+
+    every_arg = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    if args.vararg is not None:
+        every_arg.append(args.vararg)
+    if args.kwarg is not None:
+        every_arg.append(args.kwarg)
+    for arg in every_arg:
+        ends.append(arg.end_lineno or arg.lineno)
+        if arg.annotation is not None:
+            ends.append(arg.annotation.end_lineno or arg.annotation.lineno)
+
+    for default in [*args.defaults, *(d for d in args.kw_defaults or [] if d is not None)]:
+        ends.append(default.end_lineno or default.lineno)
+
+    body_start = fn.body[0].lineno if fn.body else fn.lineno
+    return min(max(ends), body_start) - 1
+
+
 def _attributes_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Attribute]:
     found: list[Attribute] = []
     for node in ast.walk(fn):
@@ -402,6 +438,7 @@ def scan_source(source: str, path: str) -> FileScan:
             returns_position=Position.of(fn.returns) if fn.returns else None,
             decorators=[_decorator_name(d) for d in fn.decorator_list],
             end_line=(fn.end_lineno or fn.lineno) - 1,
+            signature_end_line=_signature_end_line(fn),
             owner=owner,
             annotation_error=error,
             einops_calls=_find_einops(fn, einops_names),
