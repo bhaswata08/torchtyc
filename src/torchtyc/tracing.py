@@ -11,7 +11,9 @@ roughly a dictionary lookup per operator and zero FLOPs.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,7 @@ import torch
 
 from .annotations import ArraySpec, OpaqueSpec, Spec, TupleSpec
 from .binding import BindingError, DimBinder, check_shape, shape_for
-from .discovery import ClassInfo, Param, Target
+from .discovery import ClassInfo, InitDef, Param, Target
 
 # jaxtyping dtype name -> (dtype used to build an argument, dtypes accepted on
 # the way out). Building picks one representative; checking accepts the family.
@@ -169,12 +171,32 @@ class TraceFailed(Exception):
         self.binder = binder
 
 
+def live_init(owner: ClassInfo, cls: type) -> InitDef | None:
+    """Which of the `__init__` definitions in the body this import produced.
+
+    A class that writes `__init__` in both arms of a guard has two definitions
+    and one constructor. Source order cannot say which arm ran, but the code
+    object behind the live `__init__` names the lines it was written at.
+    """
+    if len(owner.inits) < 2:
+        return owner.init
+    code = getattr(getattr(cls, "__init__", None), "__code__", None)
+    if code is None:
+        return owner.init
+    line = code.co_firstlineno - 1
+    for candidate in owner.inits:
+        if candidate.def_line <= line <= candidate.end_line:
+            return candidate
+    return owner.init
+
+
 def instantiate(owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[str]) -> Any:
     """Construct a module on the meta device so its parameters cost nothing."""
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
     positional_open = True
-    for param in owner.init_params:
+    init = live_init(owner, cls)
+    for param in init.params if init else []:
         if param.positional_only and not positional_open:
             continue
         try:
@@ -438,8 +460,25 @@ def _trace(module: Any, target: Target, binder: DimBinder) -> TraceResult:
     # keeps the trace to the user's own code.
     with torch.device("meta"), torch.no_grad():
         returned = fn(*positional, **keywords)
+        if inspect.iscoroutine(returned):
+            returned = _run_coroutine(returned)
 
     return TraceResult(binder=binder, returned=returned, argument_shapes=shapes)
+
+
+def _run_coroutine(coroutine: Any) -> Any:
+    """Run an `async def` target to completion so its return can be checked.
+
+    A coroutine that is never awaited is both a wrong answer, since the shape
+    check would then see a coroutine object rather than a tensor, and a
+    RuntimeWarning on stderr. `asyncio.run` starts it on every path it takes,
+    and closing it afterwards covers the case where the run never got that far.
+    Closing one that already finished, however it finished, does nothing.
+    """
+    try:
+        return asyncio.run(coroutine)
+    finally:
+        coroutine.close()
 
 
 def describe(value: Any, binder: DimBinder) -> str:

@@ -297,3 +297,32 @@ if TYPE_CHECKING:
     scan = scan_source(source, "t.py")
     assert scan.targets == []
     assert scan.classes == []
+
+
+def test_an_async_def_span_ends_at_the_end_of_the_name():
+    source = "async def forward(x):\n    return x\n"
+    scan = scan_source(source, "net.py")
+    target = next(t for t in scan.targets if t.name == "forward")
+    text = source.splitlines()[target.position.line]
+    assert text[target.position.column : target.position.end_column] == "async def forward"
+
+
+def test_every_init_in_a_guarded_class_body_is_kept():
+    source = (
+        "FAST = True\n"
+        "\n"
+        "class Block:\n"
+        "    if FAST:\n"
+        "        def __init__(self, d_model):\n"
+        "            self.d = d_model\n"
+        "    else:\n"
+        "        def __init__(self, d_model, extra):\n"
+        "            self.d = d_model\n"
+    )
+    scan = scan_source(source, "net.py")
+    info = next(c for c in scan.classes if c.name == "Block")
+    assert [[p.name for p in init.params] for init in info.inits] == [
+        ["d_model"],
+        ["d_model", "extra"],
+    ]
+    assert all(init.conditional for init in info.inits)

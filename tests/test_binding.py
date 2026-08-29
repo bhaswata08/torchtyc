@@ -256,3 +256,31 @@ def test_anonymous_axes_render_one_each_but_a_variadic_run_collapses():
     binder = DimBinder(variadic_rank=3)
     assert binder.render_shape(shape_for(spec("_ _ d"), binder)) == "(_, _, d)"
     assert binder.render_shape(shape_for(spec("... e"), binder)) == "(..., e)"
+
+
+def test_bare_variadic_binds_the_same_axes_across_one_trace():
+    binder = DimBinder()
+    first = shape_for(spec("... d"), binder)
+    second = shape_for(spec("... e"), binder)
+    assert first[:-1] == second[:-1]
+
+
+def test_a_flattened_pair_of_anonymous_axes_never_shows_a_prime():
+    binder = DimBinder()
+    batch = shape_for(spec("... d"), binder)[:-1]
+    flattened = batch[0] * batch[1]
+    assert binder.describe(flattened) == "..."
+    assert str(flattened) not in binder.rename_primes(f"shapes {flattened} and 4 do not match")
+
+
+def test_a_flattened_pair_of_named_axes_renames_to_its_factors():
+    binder = DimBinder()
+    rows, columns = shape_for(spec("s d"), binder)
+    renamed = binder.rename_primes(f"size {rows * columns}")
+    assert renamed in ("size s*d", "size d*s")
+
+
+def test_a_flattened_axis_is_never_suggested_as_a_dim_string():
+    binder = DimBinder()
+    rows, columns = shape_for(spec("s d"), binder)
+    assert binder.suggest_dims((rows * columns,)) is None

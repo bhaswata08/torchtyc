@@ -237,11 +237,19 @@ def run_worker(
     sources: dict[str, str] | None = None,
     hover: bool = False,
 ) -> tuple[list[Diagnostic], dict[str, dict[str, dict[str, str]]], str | None]:
-    """Trace the files in a subprocess and bring back what it found."""
+    """Trace the files in a subprocess and bring back what it found.
+
+    The worker runs with the project root as its working directory, which is
+    not the caller's, so a relative path would resolve against the wrong
+    directory there. Paths go over as absolute and come back mapped to the
+    strings the caller passed, since those are what the rest of the report is
+    keyed by.
+    """
+    absolute = {str(Path(p).resolve()): p for p in paths}
     job = {
-        "paths": paths,
+        "paths": list(absolute),
         "variadic_rank": config.variadic_rank,
-        "sources": sources or {},
+        "sources": {str(Path(p).resolve()): text for p, text in (sources or {}).items()},
         "hover": hover,
     }
 
@@ -278,8 +286,13 @@ def run_worker(
     except json.JSONDecodeError:
         return [], {}, "the worker produced output that was not JSON"
 
-    diagnostics = [Diagnostic.from_json(d) for d in result.get("diagnostics", [])]
-    return diagnostics, result.get("hovers", {}), result.get("error")
+    diagnostics = []
+    for entry in result.get("diagnostics", []):
+        diagnostic = Diagnostic.from_json(entry)
+        diagnostic.path = absolute.get(diagnostic.path, diagnostic.path)
+        diagnostics.append(diagnostic)
+    hovers = {absolute.get(p, p): shapes for p, shapes in result.get("hovers", {}).items()}
+    return diagnostics, hovers, result.get("error")
 
 
 def apply_suppressions(

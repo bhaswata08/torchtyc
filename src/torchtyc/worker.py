@@ -31,6 +31,7 @@ from .tracing import (
     check_return,
     describe,
     instantiate,
+    live_init,
     resolve_qualname,
     trace,
 )
@@ -215,6 +216,7 @@ def check_attributes(
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
     binder = DimBinder(variadic_rank=variadic_rank)
+    attributes = info.attributes
 
     try:
         cls = resolve_qualname(
@@ -223,6 +225,11 @@ def check_attributes(
             conditional=info.conditional,
             span=(info.def_line, info.end_line),
         )
+        # The annotations to check are the ones the live constructor wrote, so
+        # a guarded `__init__` that this import skipped reports nothing.
+        chosen = live_init(info, cls)
+        if chosen is not None:
+            attributes = chosen.attributes
         instance = instantiate(info, cls, binder, info.dim_names)
     except NotLive:
         return []
@@ -261,7 +268,7 @@ def check_attributes(
         ]
 
     out: list[Diagnostic] = []
-    for attribute in info.attributes:
+    for attribute in attributes:
         if not hasattr(instance, attribute.name):
             continue
         value = getattr(instance, attribute.name)

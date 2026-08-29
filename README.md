@@ -256,7 +256,9 @@ It runs one concrete trace, not a proof. A function whose control flow depends
 on tensor *values* rather than shapes takes whichever branch the primes send it
 down. `...` stands for a fixed number of axes, two by default, so code that
 behaves differently at other ranks needs `variadic-rank` or a second annotated
-wrapper.
+wrapper. Every bare `...` in one signature also stands for the *same* axes,
+which is narrower than jaxtyping: a loss taking two `"... d"` arguments traces
+with one batch shape, because that is what the annotation almost always means.
 
 Runtime checking with `jaxtyping` and `beartype` remains worth having. torchtyc
 tells you the shapes are consistent for the sizes it chose; beartype tells you

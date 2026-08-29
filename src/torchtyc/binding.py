@@ -78,6 +78,7 @@ class DimBinder:
     # but they render as `_` so the shape mirrors what the annotation wrote.
     anonymous_dims: set[int] = field(default_factory=set)
     _next: int = 0
+    _anonymous_variadic: tuple[int, ...] | None = None
 
     def fresh(self) -> int:
         if self._next >= len(_PRIME_POOL):
@@ -94,9 +95,16 @@ class DimBinder:
 
     def bind_variadic(self, name: str | None) -> tuple[int, ...]:
         if name is None:
-            sizes = tuple(self.fresh() for _ in range(self.variadic_rank))
-            self.anonymous.update(sizes)
-            return sizes
+            # Every bare `...` in one trace binds to the same axes. jaxtyping
+            # treats each as independent; this is deliberately narrower, because
+            # `f(x: Float[Tensor, "... d"], y: Float[Tensor, "... d"])` means one
+            # batch shape to almost everyone who writes it, and tracing the two
+            # with different shapes reports correct elementwise code as broken.
+            if self._anonymous_variadic is None:
+                sizes = tuple(self.fresh() for _ in range(self.variadic_rank))
+                self.anonymous.update(sizes)
+                self._anonymous_variadic = sizes
+            return self._anonymous_variadic
         if name not in self.variadics:
             self.variadics[name] = tuple(self.fresh() for _ in range(self.variadic_rank))
         return self.variadics[name]
@@ -135,13 +143,32 @@ class DimBinder:
             for index, value in enumerate(values):
                 if value > 1:
                     by_value.setdefault(value, f"{name}[{index}]")
+        # An anonymous axis has no name the user wrote, but its prime still
+        # multiplies into a flattened size. Leaving it out here would let the
+        # product survive into a message as a bare prime product.
+        for value in self.anonymous:
+            if value > 1:
+                by_value.setdefault(value, "...")
+        for value in self.anonymous_dims:
+            if value > 1:
+                by_value.setdefault(value, "_")
+
         names: list[str] = []
+        found = 0
         remaining = size
         for value, name in sorted(by_value.items(), reverse=True):
             while remaining % value == 0 and remaining > 1:
-                names.append(name)
+                found += 1
+                # Two anonymous axes flattened together are still one unnamed
+                # run, exactly as `render_shape` collapses them.
+                if not (name == "..." and names and names[-1] == "..."):
+                    names.append(name)
                 remaining //= value
-        return names if remaining == 1 and len(names) > 1 else []
+        return names if remaining == 1 and found > 1 else []
+
+    def is_flattened(self, size: int) -> bool:
+        """Whether this size is a product of primes rather than one axis."""
+        return size not in self.issued() and bool(self._factor_names(size))
 
     def issued(self) -> dict[int, str]:
         """Every size this binder handed out, mapped back to what it stands for."""
@@ -161,14 +188,24 @@ class DimBinder:
         """Put axis names back into a message torch wrote in concrete sizes.
 
         A shape bug usually surfaces as a torch error quoting the sizes it saw,
-        which are this binder's primes. Only a number the binder actually issued
-        is replaced, so a rank, an index or a dtype width in the same sentence
-        is left exactly as it was.
+        which are this binder's primes. Only a number the binder issued, or a
+        product that factors wholly into such numbers, is replaced, so a rank,
+        an index or a dtype width in the same sentence is left exactly as it
+        was. A flattened axis is quoted as that product, and it leaks a prime
+        just as plainly as a single axis does.
         """
         table = self.issued()
         if not table:
             return text
-        return re.sub(r"\d+", lambda m: table.get(int(m.group()), m.group()), text)
+
+        def replace(match: re.Match[str]) -> str:
+            value = int(match.group())
+            if value in table:
+                return table[value]
+            factors = self._factor_names(value)
+            return "*".join(factors) if factors else match.group()
+
+        return re.sub(r"\d+", replace, text)
 
     def render_shape(self, shape: tuple[int, ...]) -> str:
         parts: list[str] = []
@@ -187,6 +224,9 @@ class DimBinder:
         """
         parts: list[str] = []
         for size in shape:
+            # A flattened axis is not one axis, whatever its factors render as.
+            if self.is_flattened(size):
+                return None
             rendered = self.describe(size)
             if rendered == "...":
                 if parts and parts[-1] == "...":
@@ -372,7 +412,7 @@ def _swap_hint(name: str, size: int, binder: DimBinder) -> str:
 
 def _rank_hint(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> str:
     if len(shape) < len(spec.dims):
-        merged = [binder.describe(s) for s in shape if "*" in binder.describe(s)]
+        merged = [binder.describe(s) for s in shape if binder.is_flattened(s)]
         if merged:
             return f"{merged[0]} looks like two annotated axes flattened into one"
         return "the traced value has fewer axes than annotated, so something reduced"

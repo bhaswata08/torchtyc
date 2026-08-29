@@ -1,12 +1,16 @@
 """End-to-end checks: a real file, a real torch import, a real subprocess."""
 
+import json
 import re
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
+from torchtyc import cli
+from torchtyc.binding import FIRST_PRIME
 from torchtyc.config import Config
 from torchtyc.engine import check_paths, collect_files
 
@@ -898,3 +902,137 @@ def test_json_output_carries_no_synthetic_primes(project, capsys):
     # positions and not shapes, so renaming must have left them alone.
     diagnostic = next(d for d in payload["diagnostics"] if d["rule"] == "trace-error")
     assert f"line {diagnostic['line'] + 1}" in diagnostic["traceback"]
+
+
+def test_a_check_run_from_a_subdirectory_finds_the_file(tmp_path, monkeypatch, capsys):
+    """The worker runs at the project root, so a relative path has to survive it."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+    package = tmp_path / "src"
+    package.mkdir()
+    (package / "model.py").write_text(
+        textwrap.dedent(HEADER)
+        + textwrap.dedent(
+            """
+            def linear(
+                x: Float[Tensor, "b d_in"], w: Float[Tensor, "d_out d_in"]
+            ) -> Float[Tensor, "b d_in"]:
+                return einsum(x, w, "b d_in, d_out d_in -> b d_out")
+            """
+        )
+    )
+    monkeypatch.chdir(package)
+
+    code = cli.main(["check", "model.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+
+    assert code == 1  # findings, not a worker failure
+    assert "shape-mismatch" in out
+    assert "src/model.py" in out
+
+
+def test_a_bare_variadic_is_the_same_batch_in_every_argument(project):
+    paths, config = project(
+        HEADER
+        + """
+    def add(x: Float[Tensor, "... d"], y: Float[Tensor, "... d"]) -> Float[Tensor, "... d"]:
+        return x + y
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.worker_error is None
+
+
+def test_a_correct_async_forward_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Net(nn.Module):
+        async def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x * 2
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.worker_error is None
+
+
+def test_a_wrong_async_forward_reports_the_shape_not_the_coroutine(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Net(nn.Module):
+        async def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x.sum(dim=-1)
+    """
+    )
+    found = rules(check_paths(paths, config))
+    assert "rank-mismatch" in found
+    assert "not-a-tensor" not in found
+
+
+def test_an_async_target_leaves_no_unawaited_coroutine_warning(tmp_path):
+    """The worker's JSON protocol: stdout is the result, stderr is the user's."""
+    path = tmp_path / "model.py"
+    path.write_text(
+        textwrap.dedent(HEADER)
+        + textwrap.dedent(
+            """
+            async def good(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x * 2
+
+            async def bad(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                raise ValueError("boom")
+            """
+        )
+    )
+    completed = subprocess.run(
+        [sys.executable, "-m", "torchtyc.worker"],
+        input=json.dumps({"paths": [str(path)], "variadic_rank": 2, "hover": False}),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "never awaited" not in completed.stderr
+    found = {d["rule"] for d in json.loads(completed.stdout)["diagnostics"]}
+    assert found == {"trace-error"}
+
+
+def test_a_flattened_pair_of_anonymous_axes_leaks_no_prime(project):
+    paths, config = project(
+        HEADER
+        + """
+    def flat(x: Float[Tensor, "... d"]) -> Float[Tensor, "... d"]:
+        merged = x.flatten(0, 1)
+        return merged @ merged
+    """
+    )
+    report = check_paths(paths, config)
+    message = next(d.message for d in report.diagnostics if d.rule == "trace-error")
+    assert not [n for n in re.findall(r"\d+", message) if int(n) >= FIRST_PRIME]
+
+
+def test_a_class_with_a_guarded_init_uses_the_one_that_ran(project):
+    paths, config = project(
+        HEADER
+        + """
+    FAST = True
+
+    class Block(nn.Module):
+        if FAST:
+            def __init__(self, d_model: int) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "d_model d_model"] = nn.Parameter(
+                    torch.empty((d_model, d_model))
+                )
+        else:
+            def __init__(self, d_model: int, extra: int) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "d_model d_model"] = nn.Parameter(
+                    torch.empty((d_model, extra))
+                )
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.worker_error is None

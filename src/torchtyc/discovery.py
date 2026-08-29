@@ -69,6 +69,23 @@ class Attribute:
 
 
 @dataclass
+class InitDef:
+    """One `__init__` written in a class body.
+
+    A class can write more than one, in different branches of a guard, and only
+    the branch the import ran produced the constructor that will be called. The
+    scanner cannot know which that was, so it keeps them all and the tracer
+    picks by the lines the live `__init__` actually came from.
+    """
+
+    params: list[Param] = field(default_factory=list)
+    attributes: list[Attribute] = field(default_factory=list)
+    def_line: int = 0
+    end_line: int = 0
+    conditional: bool = False
+
+
+@dataclass
 class ClassInfo:
     name: str
     position: Position
@@ -82,12 +99,33 @@ class ClassInfo:
     # Reached through an `if`, `try` or loop, so the import may never have run
     # it. Such a definition is only traced once it proves it is the live one.
     conditional: bool = False
-    init_params: list[Param] = field(default_factory=list)
+    # Every `__init__` written in the body, in source order.
+    inits: list[InitDef] = field(default_factory=list)
     bases: list[str] = field(default_factory=list)
-    attributes: list[Attribute] = field(default_factory=list)
     # Dimension names annotated by the class's own methods, filled in as the
     # scanner visits them.
     method_dim_names: set[str] = field(default_factory=set)
+
+    @property
+    def init(self) -> InitDef | None:
+        """The constructor to assume without an imported class to ask.
+
+        An unguarded `__init__` always runs, so the last one wins the way
+        Python's own class body does. With only guarded ones to choose from,
+        the last is as good a guess as any until the tracer narrows it.
+        """
+        for candidate in reversed(self.inits):
+            if not candidate.conditional:
+                return candidate
+        return self.inits[-1] if self.inits else None
+
+    @property
+    def init_params(self) -> list[Param]:
+        return self.init.params if self.init else []
+
+    @property
+    def attributes(self) -> list[Attribute]:
+        return self.init.attributes if self.init else []
 
     @property
     def dim_names(self) -> set[str]:
@@ -476,6 +514,16 @@ def _is_type_checking(node: ast.If) -> bool:
     return _base_name(test).split(".")[-1] == "TYPE_CHECKING"
 
 
+def _def_keyword(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """The keyword the header opens with, which `col_offset` points at.
+
+    An `async def` header starts six characters earlier than a plain one, so
+    measuring the span with `def ` would underline `async def fo` instead of
+    the name.
+    """
+    return "async def " if isinstance(fn, ast.AsyncFunctionDef) else "def "
+
+
 def _def_line(node: ast.stmt) -> int:
     """The 0-based first line of a `def` or `class`, decorators included."""
     lines = [node.lineno]
@@ -570,7 +618,7 @@ def scan_source(source: str, path: str) -> FileScan:
                 fn.lineno - 1,
                 fn.col_offset,
                 fn.lineno - 1,
-                fn.col_offset + len("def ") + len(fn.name),
+                fn.col_offset + len(_def_keyword(fn)) + len(fn.name),
             ),
             params=_params_of(fn),
             returns=returns,
@@ -611,13 +659,20 @@ def scan_source(source: str, path: str) -> FileScan:
         classes.append(info)
         # __init__ first, so every method sees the constructor parameters and
         # the annotated attributes they may refer to.
-        for child, _ in _statements(node.body):
+        for child, guarded in _statements(node.body):
             if (
                 isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and child.name == "__init__"
             ):
-                info.init_params = _params_of(child)[1:]  # drop self
-                info.attributes = _attributes_of(child)
+                info.inits.append(
+                    InitDef(
+                        params=_params_of(child)[1:],  # drop self
+                        attributes=_attributes_of(child),
+                        def_line=_def_line(child),
+                        end_line=(child.end_lineno or child.lineno) - 1,
+                        conditional=guarded,
+                    )
+                )
         visit_body(node.body, info, qualname, conditional, enclosing)
 
     def visit_body(
