@@ -109,6 +109,11 @@ class DimBinder:
             self.variadics[name] = tuple(self.fresh() for _ in range(self.variadic_rank))
         return self.variadics[name]
 
+    @property
+    def anonymous_variadic(self) -> tuple[int, ...] | None:
+        """The axes every bare `...` in this trace shares, once one has bound."""
+        return self._anonymous_variadic
+
     def bind_anonymous(self) -> int:
         value = self.fresh()
         self.anonymous_dims.add(value)
@@ -336,11 +341,36 @@ def check_shape(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> N
         _check_dim(dim, size, binder, spec, shape)
 
 
+def _render_batch(sizes: tuple[int, ...], known: tuple[int, ...], binder: DimBinder) -> str:
+    """Render batch axes by their position in the shared `...`.
+
+    `render_shape` collapses a run of anonymous axes into one `...`, which is
+    right for a shape a reader is meant to skim but useless here: both sides of
+    a batch mismatch would read `(...)`. Indexing each axis instead shows which
+    position went missing or moved.
+    """
+    parts = [f"...[{known.index(s)}]" if s in known else binder.describe(s) for s in sizes]
+    return f"({', '.join(parts)})"
+
+
 def _check_variadic(
     variadic: Dim, middle: tuple[int, ...], binder: DimBinder, spec: ArraySpec
 ) -> None:
     if variadic.name is None:
-        return
+        # Every bare `...` in one trace shares its axes, so the return's middle
+        # is checked against that binding exactly as a named variadic is.
+        # Skipping it would let a return that drops or reorders a batch axis
+        # pass, which is the mistake `... d` is usually written to catch.
+        known = binder.anonymous_variadic
+        if known is None or known == middle:
+            return
+        raise BindingError(
+            f"the batch `...` traced {_render_batch(middle, known, binder)} here "
+            f"but {_render_batch(known, known, binder)} earlier",
+            rule="dim-inconsistent",
+            expected=spec.shape_str(),
+            got=_render_batch(middle, known, binder),
+        )
     known = binder.variadics.get(variadic.name)
     if known is None:
         binder.variadics[variadic.name] = middle
@@ -372,10 +402,16 @@ def _check_dim(
         return
 
     if dim.kind == "symbolic":
-        expected = _eval_symbolic(dim, binder)
-        if size != expected:
+        # The comparison runs over the binder's primes, but their sum or
+        # product is not a size any reader can place, so the message names the
+        # expression and the axis instead of quoting the arithmetic.
+        if size != _eval_symbolic(dim, binder):
+            traced = binder.describe(size)
+            named = traced != str(size)
             raise BindingError(
-                f"dimension {dim.expr} should be {expected}, traced {binder.describe(size)}",
+                f"annotated `{dim.expr}`, but the traced dimension is `{traced}`"
+                if named
+                else f"annotated `{dim.expr}`, but this axis traced {size}",
                 expected=spec.shape_str(),
                 got=binder.render_shape(shape),
             )

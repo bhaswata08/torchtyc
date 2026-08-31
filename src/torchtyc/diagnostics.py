@@ -8,7 +8,7 @@ a breaking change, so the table below is the single place they are defined.
 from __future__ import annotations
 
 import enum
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any
 
 
@@ -137,7 +137,6 @@ class Diagnostic:
     # axis involved, so a suggestion is never a guess.
     suggestion: str | None = None
     traceback: str | None = None
-    related: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)

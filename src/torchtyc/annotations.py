@@ -94,10 +94,6 @@ class ArraySpec:
     raw: str
 
     @property
-    def has_variadic(self) -> bool:
-        return any(d.kind == "variadic" for d in self.dims)
-
-    @property
     def named_dims(self) -> tuple[str, ...]:
         return tuple(d.name for d in self.dims if d.name is not None)
 

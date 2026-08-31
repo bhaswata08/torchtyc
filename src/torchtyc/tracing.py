@@ -289,20 +289,46 @@ class NotLive(Exception):
     """
 
 
+def _unwrap(obj: Any) -> list[Any]:
+    """The object and everything `functools.wraps` chained behind it."""
+    chain = [obj]
+    seen = {id(obj)}
+    inner = getattr(obj, "__wrapped__", None)
+    while inner is not None and id(inner) not in seen:
+        chain.append(inner)
+        seen.add(id(inner))
+        inner = getattr(inner, "__wrapped__", None)
+    return chain
+
+
 def _code_positions(obj: Any) -> list[tuple[str, int]]:
     """Where the code behind an object was written: (filename, 1-based line)."""
-    code = getattr(obj, "__code__", None)
-    if code is not None:
-        return [(code.co_filename, code.co_firstlineno)]
-    if isinstance(obj, type):
-        found = []
-        for value in vars(obj).values():
-            fn = value.__func__ if isinstance(value, (staticmethod, classmethod)) else value
-            code = getattr(fn, "__code__", None)
-            if code is not None:
-                found.append((code.co_filename, code.co_firstlineno))
-        return found
-    return []
+    found: list[tuple[str, int]] = []
+    for item in _unwrap(obj):
+        code = getattr(item, "__code__", None)
+        if code is not None:
+            found.append((code.co_filename, code.co_firstlineno))
+            continue
+        if isinstance(item, type):
+            for value in vars(item).values():
+                fn = value.__func__ if isinstance(value, (staticmethod, classmethod)) else value
+                code = getattr(fn, "__code__", None)
+                if code is not None:
+                    found.append((code.co_filename, code.co_firstlineno))
+    return found
+
+
+def _is_decorator_product(obj: Any) -> bool:
+    """Whether this object was built inside another function rather than written.
+
+    A decorator's wrapper carries a qualname like `deco.<locals>.wrapper`, so
+    its line says where the decorator lives, not where the decorated function
+    was written. That line is no evidence about which branch of a guard ran.
+    """
+    for item in _unwrap(obj):
+        if "<locals>" in getattr(item, "__qualname__", ""):
+            return True
+    return False
 
 
 def is_live_definition(obj: Any, module: Any, first_line: int, last_line: int) -> bool:
@@ -311,9 +337,14 @@ def is_live_definition(obj: Any, module: Any, first_line: int, last_line: int) -
     Two things disqualify it: coming from another module altogether, which is
     what a `try: from fast import Block / except ImportError: class Block`
     fallback leaves behind, and being written at other lines of this same file,
-    which is what the losing branch of a guard sees. An object whose code cannot
-    be placed at all counts as live, because a decorator returning a wrapper
-    from some other file is not evidence of shadowing.
+    which is what the losing branch of a guard sees.
+
+    Everything else counts as live, because a silent skip is invisible
+    non-coverage and a wrong trace is at least visible. So an object whose code
+    cannot be placed, and one a decorator replaced, both pass: the chain
+    `functools.wraps` leaves is followed back to the written function, and a
+    wrapper built inside another function is read as saying nothing about which
+    branch ran.
     """
     module_name = getattr(module, "__name__", None)
     if module_name is not None and getattr(obj, "__module__", module_name) != module_name:
@@ -328,7 +359,9 @@ def is_live_definition(obj: Any, module: Any, first_line: int, last_line: int) -
     ]
     if not same_file:
         return True
-    return any(first_line <= line - 1 <= last_line for line in same_file)
+    if any(first_line <= line - 1 <= last_line for line in same_file):
+        return True
+    return _is_decorator_product(obj)
 
 
 def resolve_qualname(

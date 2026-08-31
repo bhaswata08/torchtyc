@@ -76,7 +76,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     files = collect_files(args.paths, config)
     if not files:
         print("no python files found", file=sys.stderr)
-        return 1
+        return 2
 
     report = check_paths(files, config)
     print(render(report, args.format, config.root))

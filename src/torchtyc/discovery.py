@@ -107,27 +107,6 @@ class ClassInfo:
     method_dim_names: set[str] = field(default_factory=set)
 
     @property
-    def init(self) -> InitDef | None:
-        """The constructor to assume without an imported class to ask.
-
-        An unguarded `__init__` always runs, so the last one wins the way
-        Python's own class body does. With only guarded ones to choose from,
-        the last is as good a guess as any until the tracer narrows it.
-        """
-        for candidate in reversed(self.inits):
-            if not candidate.conditional:
-                return candidate
-        return self.inits[-1] if self.inits else None
-
-    @property
-    def init_params(self) -> list[Param]:
-        return self.init.params if self.init else []
-
-    @property
-    def attributes(self) -> list[Attribute]:
-        return self.init.attributes if self.init else []
-
-    @property
     def all_attributes(self) -> list[Attribute]:
         """Annotated attributes across every constructor written in the body.
 
@@ -157,10 +136,6 @@ class ClassInfo:
             for array in iter_arrays(attribute.spec):
                 names.update(array.named_dims)
         return names
-
-    @property
-    def is_module(self) -> bool:
-        return any(base.split(".")[-1] == "Module" for base in self.bases)
 
 
 @dataclass
@@ -428,35 +403,34 @@ def _plain_type(node: ast.expr) -> str | None:
     return None
 
 
-def _signature_end_line(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
+def _signature_end_line(fn: ast.FunctionDef | ast.AsyncFunctionDef, lines: list[str]) -> int:
     """The 0-based line the `def` header finishes on.
 
-    Found from the last thing the header can hold: the return annotation when
-    there is one, otherwise the last argument, annotation or default. The
-    body's first statement bounds it, so a one-line `def f(): return x` gives
-    that same line rather than running past it.
+    The header ends at the colon that opens the body, so a hint anchored there
+    sits after the whole signature however that signature wraps. Deriving the
+    line from the return annotation or the last argument instead would miss a
+    wrapped signature whose `):` sits on a line of its own. The colon is the
+    first one written outside brackets: the name, the parameters and any
+    annotation that holds a colon of its own are all bracketed, so nothing
+    earlier can be mistaken for it.
     """
-    args = fn.args
-    ends = [fn.lineno]
-
-    if fn.returns is not None:
-        ends.append(fn.returns.end_lineno or fn.returns.lineno)
-
-    every_arg = [*args.posonlyargs, *args.args, *args.kwonlyargs]
-    if args.vararg is not None:
-        every_arg.append(args.vararg)
-    if args.kwarg is not None:
-        every_arg.append(args.kwarg)
-    for arg in every_arg:
-        ends.append(arg.end_lineno or arg.lineno)
-        if arg.annotation is not None:
-            ends.append(arg.annotation.end_lineno or arg.annotation.lineno)
-
-    for default in [*args.defaults, *(d for d in args.kw_defaults or [] if d is not None)]:
-        ends.append(default.end_lineno or default.lineno)
-
+    start = fn.lineno - 1
     body_start = fn.body[0].lineno if fn.body else fn.lineno
-    return min(max(ends), body_start) - 1
+    fragment = lines[start : min(body_start, len(lines))]
+    depth = 0
+    try:
+        for token in tokenize.generate_tokens(iter(fragment).__next__):
+            if token.type != tokenize.OP:
+                continue
+            if token.string in "([{":
+                depth += 1
+            elif token.string in ")]}":
+                depth -= 1
+            elif token.string == ":" and depth == 0:
+                return start + token.start[0] - 1
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        pass
+    return start
 
 
 def _attributes_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Attribute]:
@@ -597,6 +571,7 @@ def scan_source(source: str, path: str) -> FileScan:
             syntax_error=(exc.msg, Position(line, column, line, column + 1)),
         )
 
+    lines = source.splitlines(keepends=True)
     targets: list[Target] = []
     classes: list[ClassInfo] = []
     einops_names = _einops_names(tree)
@@ -647,7 +622,7 @@ def scan_source(source: str, path: str) -> FileScan:
             end_line=(fn.end_lineno or fn.lineno) - 1,
             conditional=conditional or (owner.conditional if owner else False),
             enclosing_dim_names=enclosing,
-            signature_end_line=_signature_end_line(fn),
+            signature_end_line=_signature_end_line(fn, lines),
             owner=owner,
             annotation_error=error,
             einops_calls=_find_einops(fn, einops_names),

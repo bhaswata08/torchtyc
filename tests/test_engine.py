@@ -1099,3 +1099,65 @@ def test_a_class_whose_only_init_did_not_run_is_left_alone(project):
     report = check_paths(paths, config)
     assert report.diagnostics == []
     assert report.worker_error is None
+
+
+def test_a_guarded_definition_behind_a_same_file_decorator_is_still_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    import functools
+    import sys
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    if sys.version_info >= (3, 0):
+
+        @deco
+        def flip(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x.T
+    """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+
+
+def test_a_guarded_definition_behind_a_bare_decorator_is_still_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    import sys
+
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    if sys.version_info >= (3, 0):
+
+        @deco
+        def flip(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x.T
+    """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+
+
+def test_a_path_with_no_python_files_exits_as_a_tool_failure(tmp_path, monkeypatch, capsys):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    code = cli.main(["check", "empty"])
+    err = capsys.readouterr().err
+
+    # 2 is "torchtyc could not do the job", which is what a mistyped path is.
+    # Exit 1 would read as findings and let a misconfigured CI step pass quietly.
+    assert code == 2
+    assert "no python files found" in err

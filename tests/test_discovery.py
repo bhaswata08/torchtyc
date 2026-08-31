@@ -39,13 +39,13 @@ def test_dunder_init_is_not_a_target():
 def test_init_params_and_attributes():
     scan = scan_source(SOURCE, "net.py")
     info = next(c for c in scan.classes if c.name == "Net")
-    assert [p.name for p in info.init_params] == ["d_in", "d_out", "bias"]
-    assert info.init_params[2].has_default is True
-    assert [a.name for a in info.attributes] == ["W"]
+    assert [p.name for p in info.all_init_params] == ["d_in", "d_out", "bias"]
+    assert info.all_init_params[2].has_default is True
+    assert [a.name for a in info.all_attributes] == ["W"]
     # Class-wide: the attribute names two axes and `forward` adds `b`, and a
     # constructor parameter is matched against all of them.
     assert info.dim_names == {"d_out", "d_in", "b"}
-    assert info.is_module is True
+    assert info.bases == ["nn.Module"]
 
 
 def test_param_specs_and_plain_types():
@@ -326,3 +326,21 @@ def test_every_init_in_a_guarded_class_body_is_kept():
         ["d_model", "extra"],
     ]
     assert all(init.conditional for init in info.inits)
+
+
+def test_a_wrapped_signature_without_a_return_annotation_ends_at_its_closing_line():
+    source = 'def forward(\n    x: Float[Tensor, "a b"],\n    y: Float[Tensor, "b c"],\n):\n    return x @ y\n'
+    target = scan_source(source, "wrapped.py").targets[0]
+    assert source.splitlines()[target.signature_end_line] == "):"
+
+
+def test_a_one_line_def_ends_on_its_own_line():
+    source = "def f(x: int) -> int: return x\n"
+    target = scan_source(source, "one.py").targets[0]
+    assert target.signature_end_line == 0
+
+
+def test_a_colon_inside_a_default_does_not_end_the_signature():
+    source = "def f(\n    x: dict[str, int] = {1: 2},\n):\n    return x\n"
+    target = scan_source(source, "default.py").targets[0]
+    assert source.splitlines()[target.signature_end_line] == "):"

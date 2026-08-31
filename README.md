@@ -213,8 +213,9 @@ the shape that was actually traced.
 ```
 
 `--format github` emits workflow commands, so each finding becomes an inline
-annotation on the pull request diff. `check` exits 1 when there are errors and 2
-when the worker itself failed.
+annotation on the pull request diff. `check` exits 1 when there are errors, and
+2 when torchtyc itself could not do the job: the worker failed, or the paths
+matched no python file.
 
 ## Rules
 

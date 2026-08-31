@@ -206,8 +206,19 @@ def main() -> int:
     parser.add_argument("--target", action="append", default=[])
     args = parser.parse_args()
 
-    scratch = Path(tempfile.mkdtemp(prefix="torchtyc-bench-"))
+    with tempfile.TemporaryDirectory(prefix="torchtyc-bench-") as tmp:
+        results = measure(args, Path(tmp))
 
+    text = json.dumps(results, indent=2)
+    if args.out == "-":
+        print(text)
+    else:
+        Path(args.out).write_text(text)
+    return 0
+
+
+def measure(args: argparse.Namespace, scratch: Path) -> dict:
+    """Every measurement, written into `scratch`, which the caller removes."""
     results: dict = {"python": args.python}
 
     # Scaling with the number of annotated modules in one file.
@@ -231,13 +242,7 @@ def main() -> int:
             "lint": bench_lint(files, args.repeats * 2),
             "check": bench_trace(files, args.python, args.repeats),
         }
-
-    text = json.dumps(results, indent=2)
-    if args.out == "-":
-        print(text)
-    else:
-        Path(args.out).write_text(text)
-    return 0
+    return results
 
 
 if __name__ == "__main__":

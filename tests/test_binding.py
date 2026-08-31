@@ -284,3 +284,30 @@ def test_a_flattened_axis_is_never_suggested_as_a_dim_string():
     binder = DimBinder()
     rows, columns = shape_for(spec("s d"), binder)
     assert binder.suggest_dims((rows * columns,)) is None
+
+
+def test_a_return_that_drops_a_batch_axis_is_caught():
+    binder = DimBinder(variadic_rank=2)
+    shape_for(spec("... d"), binder)
+    batch = binder.anonymous_variadic
+    assert batch is not None
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("... d"), (batch[1], binder.bind("d")), binder)
+    assert "...[0]" in str(caught.value)
+    assert str(batch[0]) not in str(caught.value)
+
+
+def test_a_return_that_keeps_the_batch_shape_passes():
+    binder = DimBinder(variadic_rank=2)
+    shape = shape_for(spec("... d"), binder)
+    check_shape(spec("... d"), shape, binder)
+
+
+def test_a_symbolic_dimension_never_reports_prime_arithmetic():
+    binder = DimBinder()
+    shape_for(spec("d_in d_out"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("d_in+d_out"), (binder.bind("d_in"),), binder)
+    message = str(caught.value)
+    assert "d_in+d_out" in message
+    assert not re.search(r"\d", message)
