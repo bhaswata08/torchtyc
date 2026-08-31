@@ -311,3 +311,25 @@ def test_a_symbolic_dimension_never_reports_prime_arithmetic():
     message = str(caught.value)
     assert "d_in+d_out" in message
     assert not re.search(r"\d", message)
+
+
+def test_a_device_parameter_is_meta_even_with_a_default():
+    from torchtyc.discovery import Param, Position
+    from torchtyc.tracing import build_value
+
+    param = Param(
+        name="device",
+        spec=None,
+        position=Position(0, 0, 0, 6),
+        has_default=True,
+        plain_type="torch.device | None",
+    )
+    assert str(build_value(param, DimBinder(), set())) == "meta"
+
+
+def test_a_flattened_axis_gets_no_swap_hint():
+    binder = DimBinder()
+    rows, columns = shape_for(spec("s d"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("s d"), (rows * columns, columns), binder)
+    assert "names the wrong axis" not in (caught.value.hint or "")

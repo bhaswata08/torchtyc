@@ -438,6 +438,10 @@ def _check_dim(
 
 def _swap_hint(name: str, size: int, binder: DimBinder) -> str:
     """When the traced size is another known dimension, say which one."""
+    if binder.is_flattened(size):
+        # Two axes multiplied into one is not a misnamed axis, and `_rank_hint`
+        # already says so in the words that fit it.
+        return ""
     other = binder.describe(size)
     if other in ("_", "..."):
         return ""

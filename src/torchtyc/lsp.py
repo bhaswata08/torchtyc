@@ -180,6 +180,8 @@ _TRACE_RULES = frozenset(
         "import-error",
         "uninstantiable",
         "unresolved-arg",
+        "local-definition",
+        "suppression-unused",
     }
 )
 

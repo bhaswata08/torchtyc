@@ -1200,3 +1200,38 @@ def test_a_dimension_name_still_outranks_its_own_default(project):
     )
     report = check_paths(paths, config)
     assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]
+
+
+def test_a_device_default_does_not_pull_the_trace_off_meta(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model: int, device: torch.device | None = None) -> None:
+            super().__init__()
+            # Resolving `None` to a concrete device would allocate for real,
+            # which is what tracing on meta exists to avoid.
+            self.dev = device if device is not None else torch.device("cpu")
+            self.W = nn.Parameter(torch.empty((d_model, d_model), device=self.dev))
+
+        def forward(self, x: Float[Tensor, "b d_model"]) -> Float[Tensor, "b d_model"]:
+            return x @ self.W
+    """
+    )
+    report = check_paths(paths, config)
+    assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]
+
+
+def test_a_tuple_parameter_keeps_its_non_array_members(project):
+    paths, config = project(
+        HEADER
+        + """
+    def unpack(pair: tuple[Float[Tensor, "a b"], int]) -> Float[Tensor, "a b"]:
+        x, n = pair
+        return x * n
+    """
+    )
+    report = check_paths(paths, config)
+    # Dropping the `int` would build a 1-tuple and raise "not enough values to
+    # unpack" against code that is correct.
+    assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]

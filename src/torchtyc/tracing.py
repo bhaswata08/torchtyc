@@ -97,6 +97,61 @@ def build_tensor(spec: ArraySpec, binder: DimBinder) -> torch.Tensor:
     return tensor
 
 
+_MISSING = object()
+
+# A device or dtype parameter is synthesised even when it has a default. The
+# default is nearly always `None`, and a constructor that resolves `None` to a
+# concrete device allocates for real, which is exactly what tracing on `meta`
+# exists to avoid, and fails outright when that device is not present.
+_DEVICE_TYPES = ("torch.device", "device")
+_DTYPE_TYPES = ("torch.dtype", "dtype")
+
+
+def _from_plain_type(plain: str | None, name: str, binder: DimBinder) -> Any:
+    """A stand-in value for a parameter annotated with an ordinary type.
+
+    `_MISSING` when the type is not one torchtyc models, which the caller turns
+    into a default or a skip.
+    """
+    if plain == "int":
+        # Record it under its own name even though no annotation mentions it.
+        # `Linear(in_features, out_features)` with a forward that only names
+        # `in_features` still lets a message say "this dimension is
+        # out_features" rather than "this dimension is 103".
+        return binder.bind(name)
+    if plain == "float":
+        return 1.0
+    if plain == "bool":
+        return False
+    if plain == "str":
+        return ""
+    if plain in _DEVICE_TYPES:
+        return torch.device("meta")
+    if plain in _DTYPE_TYPES:
+        return torch.float32
+    if plain == "Tensor" or (plain or "").endswith(".Tensor"):
+        # An unannotated tensor: one dimension is the least constraining guess.
+        # The axis carries no name the user wrote, so it binds as anonymous and
+        # renders as `_` instead of leaking the synthetic prime.
+        return torch.empty((binder.bind_anonymous(),), device="meta")
+    return _MISSING
+
+
+def _unresolved(name: str, plain: str | None) -> TraceSkipped:
+    return TraceSkipped(
+        "unresolved-arg",
+        f"cannot build a value for `{name}`"
+        + (f" of type `{plain}`" if plain else " because it has no annotation"),
+        hint="give it a default, or annotate it with a jaxtyping array type",
+    )
+
+
+def _mentions(plain: str | None, types: tuple[str, ...]) -> bool:
+    """Whether an annotation names one of these types, `X | None` included."""
+    parts = [part.strip() for part in (plain or "").split("|")]
+    return any(part in types for part in parts)
+
+
 def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
     """Produce an argument for one parameter.
 
@@ -109,9 +164,20 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
         return build_tensor(param.spec, binder)
 
     if isinstance(param.spec, TupleSpec):
-        return tuple(
-            build_tensor(item, binder) for item in param.spec.items if isinstance(item, ArraySpec)
-        )
+        # Every member is built, not only the array ones. Dropping the others
+        # would hand the function a shorter tuple than it declares, and a body
+        # that unpacks it raises against code that is correct.
+        built = []
+        for item in param.spec.items:
+            if isinstance(item, ArraySpec):
+                built.append(build_tensor(item, binder))
+                continue
+            raw = str(item)
+            value = _from_plain_type(raw, param.name, binder)
+            if value is _MISSING:
+                raise _unresolved(param.name, raw)
+            built.append(value)
+        return tuple(built)
 
     # Only an integer parameter can stand for a dimension. Without this guard a
     # constructor parameter called `device` would be handed a prime whenever a
@@ -119,43 +185,24 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
     if param.name in dim_names and param.plain_type in (None, "int"):
         return binder.bind(param.name)
 
+    plain = param.plain_type
+    if _mentions(plain, _DEVICE_TYPES):
+        return torch.device("meta")
+    if _mentions(plain, _DTYPE_TYPES):
+        return torch.float32
+
     # A written default is what the constructor actually runs with, so it wins
-    # over any value synthesised from the type. Only a dimension name outranks
-    # it, above: there the prime is the whole point. Synthesising first would
-    # bind `n_heads: int = 8` to a prime and make `d_model // n_heads` zero,
+    # over any value synthesised from the type. Only a dimension name and the
+    # two types above outrank it. Synthesising first would bind
+    # `n_heads: int = 8` to a prime and make `d_model // n_heads` zero,
     # reporting correct multi-head attention as a shape error.
     if param.has_default:
         raise _UseDefault()
 
-    plain = param.plain_type
-    if plain == "int":
-        # Record it under its own name even though no annotation mentions it.
-        # `Linear(in_features, out_features)` with a forward that only names
-        # `in_features` still lets a message say "this dimension is
-        # out_features" rather than "this dimension is 103".
-        return binder.bind(param.name)
-    if plain == "float":
-        return 1.0
-    if plain == "bool":
-        return False
-    if plain == "str":
-        return ""
-    if plain in ("torch.device", "device"):
-        return torch.device("meta")
-    if plain in ("torch.dtype", "dtype"):
-        return torch.float32
-    if plain == "Tensor" or (plain or "").endswith(".Tensor"):
-        # An unannotated tensor: one dimension is the least constraining guess.
-        # The axis carries no name the user wrote, so it binds as anonymous and
-        # renders as `_` instead of leaking the synthetic prime.
-        return torch.empty((binder.bind_anonymous(),), device="meta")
-
-    raise TraceSkipped(
-        "unresolved-arg",
-        f"cannot build a value for `{param.name}`"
-        + (f" of type `{plain}`" if plain else " because it has no annotation"),
-        hint="give it a default, or annotate it with a jaxtyping array type",
-    )
+    value = _from_plain_type(plain, param.name, binder)
+    if value is _MISSING:
+        raise _unresolved(param.name, plain)
+    return value
 
 
 class _UseDefault(Exception):
