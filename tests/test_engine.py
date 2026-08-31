@@ -1161,3 +1161,42 @@ def test_a_path_with_no_python_files_exits_as_a_tool_failure(tmp_path, monkeypat
     # Exit 1 would read as findings and let a misconfigured CI step pass quietly.
     assert code == 2
     assert "no python files found" in err
+
+
+def test_a_constructor_default_is_used_rather_than_synthesised(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model: int, scale: float = 2.0, wide: bool = True) -> None:
+            super().__init__()
+            self.out = d_model * 2 if wide else d_model
+            self.scale = scale
+            self.W = nn.Parameter(torch.empty((self.out, d_model)))
+
+        def forward(self, x: Float[Tensor, "b d_model"]) -> Float[Tensor, "b d_model"]:
+            return x @ self.W.T * self.scale
+    """
+    )
+    report = check_paths(paths, config)
+    # `wide` defaults to True, so `self.out` is `d_model * 2` and the return
+    # names the wrong axis. Synthesising `False` for the bool instead would
+    # take the other branch and report nothing.
+    assert "shape-mismatch" in rules(report)
+
+
+def test_a_dimension_name_still_outranks_its_own_default(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model: int = 4) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((d_model, d_model)))
+
+        def forward(self, x: Float[Tensor, "b d_model"]) -> Float[Tensor, "b d_model"]:
+            return x @ self.W
+    """
+    )
+    report = check_paths(paths, config)
+    assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]

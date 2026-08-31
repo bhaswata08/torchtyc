@@ -119,6 +119,14 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
     if param.name in dim_names and param.plain_type in (None, "int"):
         return binder.bind(param.name)
 
+    # A written default is what the constructor actually runs with, so it wins
+    # over any value synthesised from the type. Only a dimension name outranks
+    # it, above: there the prime is the whole point. Synthesising first would
+    # bind `n_heads: int = 8` to a prime and make `d_model // n_heads` zero,
+    # reporting correct multi-head attention as a shape error.
+    if param.has_default:
+        raise _UseDefault()
+
     plain = param.plain_type
     if plain == "int":
         # Record it under its own name even though no annotation mentions it.
@@ -141,9 +149,6 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
         # The axis carries no name the user wrote, so it binds as anonymous and
         # renders as `_` instead of leaking the synthetic prime.
         return torch.empty((binder.bind_anonymous(),), device="meta")
-
-    if param.has_default:
-        raise _UseDefault()
 
     raise TraceSkipped(
         "unresolved-arg",
