@@ -75,8 +75,8 @@ flat.py:6:55: error[rank-mismatch]
   hint: d_model*seq looks like two annotated axes flattened into one
 ```
 
-An axis you did not name renders as `...`, and a raw number appears only when
-an axis has no name at all.
+An axis you did not name renders as `...`, a single `_` axis renders as `_`,
+and a raw number appears only for a size the annotation never bound.
 
 Because it runs your function rather than reasoning about it symbolically,
 torchtyc also catches anything that raises on the way: a bad `einsum`, a
@@ -183,6 +183,7 @@ exclude = [".venv", "build", "experiments"]
 variadic-rank = 2             # how many axes `...` stands for
 einops = true
 timeout = 60.0
+extra-paths = ["stubs"]       # prepended to the worker's PYTHONPATH
 ```
 
 ## Editors
@@ -203,7 +204,8 @@ after the buffer has been quiet for 0.7s, on open, and on save. It never imports
 your code on a keystroke.
 
 Hover over a function to see the traced shapes. Inlay hints show the traced
-return next to each signature. Code actions offer to silence a rule or to adopt
+return next to each signature, and a code lens above it reports the traced
+return or the error count. Code actions offer to silence a rule or to adopt
 the shape that was actually traced.
 
 ## CI

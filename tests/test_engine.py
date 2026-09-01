@@ -1258,3 +1258,39 @@ def test_a_cached_property_is_not_traced(project):
     )
     report = check_paths(paths, config)
     assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]
+
+
+def test_a_traceback_keeps_a_frame_line_that_looks_like_a_prime(tmp_path):
+    """`line 101` is a source position, not a size, so renaming leaves it alone.
+
+    The failing statement is put on line `FIRST_PRIME` on purpose: renaming the
+    whole traceback would turn that frame's line number into an axis name.
+    """
+    head = [
+        "import torch",
+        "from jaxtyping import Float",
+        "from torch import Tensor",
+        "",
+    ]
+    tail = [
+        'def boom(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:',
+        "    return helper(x)",
+        "",
+        "def helper(x):",
+    ]
+    failing = "    return x.reshape(3, 5, 7)"
+    padding = ["# pad"] * (FIRST_PRIME - 1 - len(head) - len(tail))
+    lines = head + padding + tail + [failing]
+    assert lines.index(failing) + 1 == FIRST_PRIME
+
+    path = tmp_path / "model.py"
+    path.write_text("\n".join(lines) + "\n")
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths([str(path)], config)
+
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert diagnostic.line + 1 == FIRST_PRIME
+    assert f"line {FIRST_PRIME}" in (diagnostic.traceback or "")
+    # The message beside it still has the primes taken back out.
+    assert str(FIRST_PRIME) not in diagnostic.message
+    assert "b" in diagnostic.message and "d" in diagnostic.message
