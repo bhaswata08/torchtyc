@@ -104,7 +104,9 @@ torchtyc check <paths>...        Shape-check files or directories
 torchtyc trace <file.py::func>   Show the shapes flowing through one function
 torchtyc watch <paths>...        Re-check on change
 torchtyc lsp                     Language server on stdio
+torchtyc lsp --tcp PORT          Language server on a TCP port
 torchtyc rules                   List the diagnostic rules
+torchtyc version                 Print the version
 ```
 
 `check` takes `--format full` (default), `concise`, `json`, or `github`.
