@@ -1,10 +1,10 @@
-"""torchtyc: static array shape checking for PyTorch, powered by meta tensors."""
+"""torchtyc: shape checking for PyTorch, from your jaxtyping annotations."""
 
 from .config import Config, load
 from .diagnostics import RULES, Diagnostic, Rule, Severity
 from .engine import Report, check_paths, collect_files
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "RULES",
