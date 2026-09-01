@@ -120,9 +120,13 @@ class DimBinder:
         A trace that only meets `...` in return positions has no argument to
         take the batch shape from, so the first return sets it and the rest are
         checked against that.
+
+        These sizes came out of the trace rather than out of `fresh`, so they
+        are not added to `anonymous`. A flattened `b*s` arriving here is still
+        `b*s`, and relabelling it `...` would corrupt every later message about
+        that size.
         """
         self._anonymous_variadic = sizes
-        self.anonymous.update(sizes)
 
     def bind_anonymous(self) -> int:
         value = self.fresh()

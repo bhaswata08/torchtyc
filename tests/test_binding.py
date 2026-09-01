@@ -341,3 +341,14 @@ def test_two_bare_variadic_returns_are_checked_against_each_other():
     with pytest.raises(BindingError) as caught:
         check_shape(spec("... a"), (5, 6, 4), binder)
     assert "batch" in str(caught.value)
+
+
+def test_a_traced_batch_shape_does_not_relabel_a_flattened_axis():
+    binder = DimBinder(variadic_rank=2)
+    rows, columns, depth = shape_for(spec("b s d"), binder)
+    flat = rows * columns
+    # A return `... d` whose middle is the flattened `b*s`. Recording those
+    # sizes as anonymous would make every later message call `b*s` `...`.
+    check_shape(spec("... d"), (flat, depth), binder)
+    assert binder.describe(flat) in ("b*s", "s*b")
+    assert binder.is_flattened(flat)
