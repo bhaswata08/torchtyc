@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install ${{ matrix.python }}
+      - run: uv sync --all-extras --dev
+      - run: uv run ruff check src tests bench
+      - run: uv run pytest -q
+
+  self-check:
+    # torchtyc checking its own fixtures, which is also the smoke test for the
+    # github output format.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras --dev
+      # The fixtures are deliberately wrong, so exit 1 (findings) is the
+      # expected result. Anything else is torchtyc itself failing.
+      - run: |
+          status=0
+          uv run torchtyc check tests/fixtures --format github > annotations.txt || status=$?
+          cat annotations.txt
+          if [ "$status" -gt 1 ]; then
+            echo "torchtyc exited $status, which is a torchtyc failure" >&2
+            exit "$status"
+          fi
+          if ! grep -q "^::error " annotations.txt; then
+            echo "the fixtures produced no github annotation" >&2
+            exit 1
+          fi
