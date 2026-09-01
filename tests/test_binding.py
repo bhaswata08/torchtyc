@@ -4,7 +4,14 @@ import threading
 import pytest
 
 from torchtyc.annotations import ArraySpec, parse_dim_string
-from torchtyc.binding import BindingError, DimBinder, check_shape, shape_for
+from torchtyc.binding import (
+    FIRST_PRIME,
+    BindingError,
+    DimBinder,
+    check_shape,
+    distant_prime,
+    shape_for,
+)
 
 
 def spec(dims: str) -> ArraySpec:
@@ -352,3 +359,32 @@ def test_a_traced_batch_shape_does_not_relabel_a_flattened_axis():
     check_shape(spec("... d"), (flat, depth), binder)
     assert binder.describe(flat) in ("b*s", "s*b")
     assert binder.is_flattened(flat)
+
+
+def test_suggest_dims_refuses_a_width_computed_in_init():
+    binder = DimBinder()
+    d_model = binder.bind("d_model")
+    d_ff = 256
+    binder.derived[d_ff] = ("d_model",)
+    # `<from d_model>` names what a width follows. It is not a dimension name,
+    # so it is not something to paste back over an annotation.
+    assert binder.describe(d_ff) == "<from d_model>"
+    assert binder.suggest_dims((d_model, d_ff)) is None
+
+
+def test_a_width_computed_in_init_replaces_its_number_in_a_torch_message():
+    binder = DimBinder()
+    binder.bind("d_model")
+    binder.derived[256] = ("d_model",)
+    message = "size 256 does not broadcast with previously seen size 101"
+    assert binder.rename_primes(message) == (
+        "size <from d_model> does not broadcast with previously seen size d_model"
+    )
+
+
+def test_a_second_probe_moves_a_dimension_far_enough_to_show():
+    # Rounding to a multiple of 64 swallows a small move: 101 and 103 both give
+    # 256, which would make a derived width look like a constant.
+    assert round(((8 / 3) * FIRST_PRIME) / 64) * 64 == round(((8 / 3) * 103) / 64) * 64
+    moved = distant_prime(0)
+    assert round(((8 / 3) * FIRST_PRIME) / 64) * 64 != round(((8 / 3) * moved) / 64) * 64

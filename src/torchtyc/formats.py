@@ -81,6 +81,8 @@ def _full(report: Report, root: Path, color: bool) -> str:
             body.append(f"  try:  {d.suggestion}")
         if d.hint:
             body.append(_paint(f"  hint: {d.hint}", _DIM, color))
+        if d.note:
+            body.append(_paint(f"  note: {d.note}", _DIM, color))
         blocks.append("\n".join(body))
 
     blocks.append(_summary(report, color))
@@ -144,6 +146,8 @@ def _github(report: Report, root: Path) -> str:
             message += f"%0Atry: {_escape_workflow(d.suggestion)}"
         if d.hint:
             message += f"%0Ahint: {_escape_workflow(d.hint)}"
+        if d.note:
+            message += f"%0Anote: {_escape_workflow(d.note)}"
         lines.append(
             f"::{levels[d.severity]} file={_escape_property(_relative(d.path, root))},"
             f"line={d.line + 1},col={d.column + 1},"
