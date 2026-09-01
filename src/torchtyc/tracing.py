@@ -749,7 +749,7 @@ def check_return(spec: Spec | None, value: Any, binder: DimBinder) -> list[dict[
                 "expected": spec.dtype,
                 "got": _dtype_name(value.dtype),
                 "suggestion": (
-                    f'{suggested}[{spec.array_type}, "{" ".join(str(d) for d in spec.dims)}"]'
+                    _annotation(suggested, spec, " ".join(str(d) for d in spec.dims))
                     if suggested
                     else None
                 ),
@@ -778,14 +778,25 @@ def check_return(spec: Spec | None, value: Any, binder: DimBinder) -> list[dict[
                 "got": exc.got or binder.render_shape(tuple(value.shape)),
                 "hint": exc.hint,
                 "suggestion": (
-                    f'{spec.dtype}[{spec.array_type}, "{exc.suggestion}"]'
-                    if exc.suggestion
-                    else None
+                    _annotation(spec.dtype, spec, exc.suggestion) if exc.suggestion else None
                 ),
             }
         )
 
     return problems
+
+
+def _annotation(dtype: str, spec: ArraySpec, dims: str) -> str:
+    """An annotation to paste, keeping the leading space when the file uses one.
+
+    `Float[Tensor, "d_model"]` reads to ruff as a forward reference (UP037), and
+    a leading space is the usual way to say it is not one without turning the
+    rule off. jaxtyping strips surrounding whitespace, so the two annotations
+    mean the same thing, and a suggestion that dropped the space would be one
+    the reader has to correct before it lints.
+    """
+    lead = " " if spec.dim_text.startswith(" ") else ""
+    return f'{dtype}[{spec.array_type}, "{lead}{dims}"]'
 
 
 def _dtype_class(dtype: torch.dtype) -> str | None:

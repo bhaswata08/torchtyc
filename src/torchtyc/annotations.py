@@ -92,6 +92,11 @@ class ArraySpec:
     array_type: str
     dims: tuple[Dim, ...]
     raw: str
+    # The dim string exactly as written, whitespace included. jaxtyping strips
+    # it, so it changes no meaning, but `Float[Tensor, " d_model"]` is how a
+    # single-axis annotation is written to keep ruff from reading it as a
+    # forward reference (UP037). A suggestion has to write it back the same way.
+    dim_text: str = ""
 
     @property
     def named_dims(self) -> tuple[str, ...]:
@@ -212,4 +217,5 @@ def _parse_array(node: ast.Subscript, dtype: str) -> Spec:
         array_type=array_type,
         dims=parse_dim_string(dims_node.value),
         raw=ast.unparse(node),
+        dim_text=dims_node.value,
     )

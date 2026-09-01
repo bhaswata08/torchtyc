@@ -1409,3 +1409,43 @@ def test_a_size_written_in_the_code_keeps_its_number(project):
     # code writes down, and the reader can go and find them.
     assert diagnostic.hint == "h is (..., 64), self.down is (d_model, 512)"
     assert diagnostic.note is None
+
+
+def test_a_suggestion_keeps_the_leading_space_the_file_writes(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, d_in: int, d_out: int) -> None:
+            super().__init__()
+            self.w: Float[nn.Parameter, " d_out d_in"] = nn.Parameter(torch.empty((d_out, d_in)))
+
+        def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_in"]:
+            return einsum(x, self.w, "... d_in, d_out d_in -> ... d_out")
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    # Pasting a suggestion that dropped the space would hand the reader a UP037
+    # to fix, so the annotation goes back the way the file writes them.
+    assert diagnostic.suggestion == 'Float[Tensor, " ... d_out"]'
+
+
+def test_a_leading_space_annotation_traces_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, d_in: int, d_out: int) -> None:
+            super().__init__()
+            self.w: Float[nn.Parameter, " d_out d_in"] = nn.Parameter(torch.empty((d_out, d_in)))
+
+        def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
+            return einsum(x, self.w, "... d_in, d_out d_in -> ... d_out")
+
+    def tokens(ids: Int[Tensor, " ..."]) -> Int[Tensor, " ..."]:
+        return ids
+    """
+    )
+    report = check_paths(paths, config)
+    assert rules(report) == []

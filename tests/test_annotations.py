@@ -69,3 +69,32 @@ def test_bad_dim_string_raises():
 def test_roundtrip_str():
     spec = annotate('Float[Tensor, "... d_model"]')
     assert str(spec) == 'Float[Tensor, "... d_model"]'
+
+
+def test_a_leading_space_reads_the_same_as_no_leading_space():
+    # jaxtyping strips surrounding whitespace, and a leading space is how a
+    # single-axis annotation is written so ruff does not read it as a forward
+    # reference (UP037). The two spellings have to mean one thing here too.
+    spaced = annotate('Float[nn.Parameter, " d_model"]')
+    plain = annotate('Float[nn.Parameter, "d_model"]')
+    assert isinstance(spaced, ArraySpec) and isinstance(plain, ArraySpec)
+    assert spaced.dims == plain.dims
+    assert spaced.named_dims == ("d_model",)
+    # The space is kept as written, so a suggestion can write it back.
+    assert spaced.dim_text == " d_model"
+    assert plain.dim_text == "d_model"
+
+
+@pytest.mark.parametrize(
+    ("text", "names"),
+    [
+        (" d_out d_in", ("d_out", "d_in")),
+        ("  batch  seq  ", ("batch", "seq")),
+        (" ...", ()),
+        (" *shape", ("shape",)),
+    ],
+)
+def test_surrounding_whitespace_never_changes_a_dim_string(text, names):
+    dims = parse_dim_string(text)
+    assert tuple(d.name for d in dims if d.name is not None) == names
+    assert dims == parse_dim_string(text.strip())
