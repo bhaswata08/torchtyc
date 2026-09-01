@@ -333,3 +333,11 @@ def test_a_flattened_axis_gets_no_swap_hint():
     with pytest.raises(BindingError) as caught:
         check_shape(spec("s d"), (rows * columns, columns), binder)
     assert "names the wrong axis" not in (caught.value.hint or "")
+
+
+def test_two_bare_variadic_returns_are_checked_against_each_other():
+    binder = DimBinder(variadic_rank=2)
+    check_shape(spec("... a"), (2, 3, 4), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("... a"), (5, 6, 4), binder)
+    assert "batch" in str(caught.value)

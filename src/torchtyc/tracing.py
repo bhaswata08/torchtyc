@@ -472,7 +472,9 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
         span=(owner.def_line, owner.end_line),
     )
 
-    if "property" in target.decorators:
+    # `property`, `cached_property` and `functools.cached_property` all name a
+    # value reached by attribute access, not a call, so none of them is traced.
+    if any(d.split(".")[-1] in ("property", "cached_property") for d in target.decorators):
         raise TraceSkipped("uninstantiable", "properties are not traced")
 
     if "staticmethod" in target.decorators:

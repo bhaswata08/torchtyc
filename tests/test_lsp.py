@@ -401,3 +401,38 @@ def test_inlay_hint_follows_a_wrapped_signature_to_its_last_line():
     text = SOURCE_WRAPPED.splitlines()[line]
     assert text.strip() == ') -> Float[Tensor, "a c"]:'
     assert character == len(text)
+
+
+def test_only_one_trace_runs_at_a_time_per_file():
+    """A queued trace is dropped rather than starting a second worker.
+
+    Cancelling the task that awaits a trace does not stop the subprocess
+    already running in its thread, so overlapping traces would each import
+    torch and run to completion.
+    """
+    import asyncio
+
+    server = TorchtycServer()
+    running = 0
+    peak = 0
+    traced = 0
+
+    async def fake_trace_once(uri: str) -> None:
+        nonlocal running, peak, traced
+        running += 1
+        peak = max(peak, running)
+        traced += 1
+        await asyncio.sleep(0.05)
+        running -= 1
+
+    server._trace_once = fake_trace_once
+
+    async def drive() -> None:
+        await asyncio.gather(*(server.trace_now("file:///a.py") for _ in range(5)))
+
+    asyncio.run(drive())
+
+    assert peak == 1
+    # The first runs, the last wins, and the three superseded in between are
+    # skipped instead of each starting a worker.
+    assert traced == 2

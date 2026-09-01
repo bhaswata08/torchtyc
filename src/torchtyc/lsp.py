@@ -86,6 +86,12 @@ class TorchtycServer(LanguageServer):
         super().__init__(name="torchtyc", version=__version__)
         self.overrides: Overrides = Overrides()
         self.pending: dict[str, asyncio.Task] = {}
+        # One trace at a time per file. Cancelling the task that awaits a trace
+        # does not stop the worker subprocess already running in its thread, so
+        # without this a fast typist stacks up torch-importing processes that
+        # each run to completion or to the timeout.
+        self.tracing: dict[str, asyncio.Lock] = {}
+        self.wanted: dict[str, int] = {}
         self.reports: dict[str, Report] = {}
         self.scans: dict[str, Any] = {}
 
@@ -143,6 +149,17 @@ class TorchtycServer(LanguageServer):
         self.pending[uri] = asyncio.create_task(run())
 
     async def trace_now(self, uri: str) -> None:
+        generation = self.wanted.get(uri, 0) + 1
+        self.wanted[uri] = generation
+        lock = self.tracing.setdefault(uri, asyncio.Lock())
+        async with lock:
+            if self.wanted.get(uri) != generation:
+                # A newer trace was asked for while this one queued. Its result
+                # would be the one published anyway, so skip the subprocess.
+                return
+            await self._trace_once(uri)
+
+    async def _trace_once(self, uri: str) -> None:
         path = uri_to_path(uri)
         source = self.source_of(uri)
         config = self.config_for(path)

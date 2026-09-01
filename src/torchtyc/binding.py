@@ -114,6 +114,16 @@ class DimBinder:
         """The axes every bare `...` in this trace shares, once one has bound."""
         return self._anonymous_variadic
 
+    def bind_anonymous_variadic(self, sizes: tuple[int, ...]) -> None:
+        """Record traced axes as the shared `...`, when nothing bound it first.
+
+        A trace that only meets `...` in return positions has no argument to
+        take the batch shape from, so the first return sets it and the rest are
+        checked against that.
+        """
+        self._anonymous_variadic = sizes
+        self.anonymous.update(sizes)
+
     def bind_anonymous(self) -> int:
         value = self.fresh()
         self.anonymous_dims.add(value)
@@ -362,7 +372,13 @@ def _check_variadic(
         # Skipping it would let a return that drops or reorders a batch axis
         # pass, which is the mistake `... d` is usually written to catch.
         known = binder.anonymous_variadic
-        if known is None or known == middle:
+        if known is None:
+            # First sight binds it, exactly as a named variadic binds on first
+            # sight. Returning without recording would leave two returns in one
+            # trace unchecked against each other.
+            binder.bind_anonymous_variadic(middle)
+            return
+        if known == middle:
             return
         raise BindingError(
             f"the batch `...` traced {_render_batch(middle, known, binder)} here "

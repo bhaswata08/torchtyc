@@ -172,22 +172,6 @@ def check_target(
                 hint=exc.hint or None,
             )
         ], None
-    except Exception as exc:  # noqa: BLE001 - any user error is a finding
-        position, text = _anchor(exc, path, target.position, DimBinder())
-        return [
-            Diagnostic(
-                path=path,
-                line=position.line,
-                column=position.column,
-                end_line=position.end_line,
-                end_column=position.end_column,
-                rule="trace-error",
-                severity=Severity.ERROR,
-                message=f"{type(exc).__name__}: {exc}",
-                function=target.qualname,
-                traceback=text,
-            )
-        ], None
 
     for problem in check_return(target.returns, result.returned, result.binder):
         out.append(

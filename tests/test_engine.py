@@ -1235,3 +1235,26 @@ def test_a_tuple_parameter_keeps_its_non_array_members(project):
     # Dropping the `int` would build a 1-tuple and raise "not enough values to
     # unpack" against code that is correct.
     assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]
+
+
+def test_a_cached_property_is_not_traced(project):
+    paths, config = project(
+        HEADER
+        + """
+    from functools import cached_property
+
+    class Block(nn.Module):
+        def __init__(self, n: int) -> None:
+            super().__init__()
+            self.n = n
+
+        @cached_property
+        def mask(self) -> Float[Tensor, "n n"]:
+            return torch.ones(self.n, self.n)
+
+        def forward(self, x: Float[Tensor, "b n"]) -> Float[Tensor, "b n"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert not [d for d in report.diagnostics if d.severity.name == "ERROR"]
