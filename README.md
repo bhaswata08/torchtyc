@@ -1,6 +1,6 @@
 # torchtyc
 
-Static array shape checking for PyTorch, powered by meta tensors.
+Shape checking for PyTorch, from your jaxtyping annotations.
 
 torchtyc reads [jaxtyping](https://docs.kidger.site/jaxtyping/) annotations and
 verifies the shapes your code actually produces, before you run it on a GPU. It
