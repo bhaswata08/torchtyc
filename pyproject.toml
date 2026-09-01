@@ -1,7 +1,7 @@
 [project]
 name = "torchtyc"
 version = "0.1.0"
-description = "Static array shape checking for PyTorch powered by meta tensors"
+description = "Shape checking for PyTorch, from your jaxtyping annotations"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
