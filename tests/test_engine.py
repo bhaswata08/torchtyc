@@ -1299,7 +1299,7 @@ def test_a_traceback_keeps_a_frame_line_that_looks_like_a_prime(tmp_path):
 def test_trace_error_anchors_to_the_caller_not_the_shared_layer(project):
     paths, config = project(
         HEADER
-        + '''
+        + """
     class Linear(nn.Module):
         def __init__(self, in_features: int, out_features: int) -> None:
             super().__init__()
@@ -1317,7 +1317,7 @@ def test_trace_error_anchors_to_the_caller_not_the_shared_layer(project):
 
         def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
             return self.w1(x)
-    '''
+    """
     )
     report = check_paths(paths, config)
     diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
@@ -1326,4 +1326,29 @@ def test_trace_error_anchors_to_the_caller_not_the_shared_layer(project):
     assert diagnostic.function == "Block.forward"
     assert diagnostic.line == 22
     assert diagnostic.hint is not None
-    assert diagnostic.hint == "raised further down, in `Linear.forward` at line 13"
+    # The shapes on the failing line say which side carries the wrong width: the
+    # weight was built as (d_model, 64), so its input axis is 64, not d_model.
+    assert diagnostic.hint == (
+        "raised further down, in `Linear.forward` at line 13, "
+        "where x is (..., d_model), self.weight is (d_model, 64)"
+    )
+
+
+def test_a_trace_error_reports_the_shapes_on_the_line_that_raised(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty((64, 32)))
+
+        def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+            return einsum(x, self.weight, "... d, out d -> ... out")
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    # Nothing was raised further down, so the hint is the shapes alone. `d` and
+    # `out` are einops axis names inside a string, not locals, and stay out of it.
+    assert diagnostic.hint == "x is (..., d_model), self.weight is (64, 32)"

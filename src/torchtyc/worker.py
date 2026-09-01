@@ -15,10 +15,14 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import linecache
+import re
 import sys
 import traceback
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
@@ -120,25 +124,125 @@ def _anchor(
     because `FrameSummary.line` is stripped of leading indentation: measuring it
     would start the underline inside the indent and stop short of the statement.
     """
-    frames = traceback.extract_tb(exc.__traceback__)
-    mine = [f for f in frames if f.filename and Path(f.filename).resolve() == Path(path).resolve()]
+    summaries = traceback.extract_tb(exc.__traceback__)
+    here = Path(path).resolve()
+    mine = [
+        (summary, frame)
+        for summary, frame in zip(summaries, _live_frames(exc))
+        if summary.filename and Path(summary.filename).resolve() == here
+    ]
     spans = others or []
-    outside = [f for f in mine if not _within(f.lineno, spans)]
-    chosen = (outside or mine)[-1] if mine else None
+    outside = [pair for pair in mine if not _within(pair[0].lineno, spans)]
+    picked = (outside or mine)[-1] if mine else None
     text = _format_traceback(exc, binder)
-    hint = None
-    if chosen is not None and mine[-1] is not chosen and mine[-1].lineno:
-        deepest = mine[-1]
-        owner = _owner_of(deepest.lineno, spans) or deepest.name
-        hint = f"raised further down, in `{owner}` at line {deepest.lineno}"
-    if chosen is None:
-        return fallback, text, None
+    hint = _hint(mine, picked, spans, binder)
+    if picked is None:
+        return fallback, text, hint
+    chosen = picked[0]
     line = chosen.lineno - 1 if chosen.lineno else fallback.line
     end_line = chosen.end_lineno - 1 if chosen.end_lineno else line
     if chosen.colno is not None and chosen.end_colno is not None:
         return Position(line, chosen.colno, end_line, chosen.end_colno), text, hint
     # No column information: fall back to underlining the whole line.
     return Position(line, 0, line, len(chosen.line or "") or 1), text, hint
+
+
+def _live_frames(exc: BaseException) -> list[Any]:
+    """The frame objects behind a traceback, still holding their locals."""
+    frames: list[Any] = []
+    tb = exc.__traceback__
+    while tb is not None:
+        frames.append(tb.tb_frame)
+        tb = tb.tb_next
+    return frames
+
+
+def _hint(
+    mine: list[tuple[traceback.FrameSummary, Any]],
+    picked: tuple[traceback.FrameSummary, Any] | None,
+    spans: list[tuple[int, int, str]],
+    binder: DimBinder,
+) -> str | None:
+    """What to say under a trace error, beyond torch's own words.
+
+    Two things the reader cannot see from the underlined line: where the error
+    was actually raised, when that is somewhere further down, and what shapes
+    the tensors on that line were carrying.
+    """
+    if not mine:
+        return None
+    deepest, frame = mine[-1]
+    shapes = _shapes_on_line(frame, _statement(deepest), binder)
+    if picked is None or picked is mine[-1] or not deepest.lineno:
+        return shapes or None
+    owner = _owner_of(deepest.lineno, spans) or deepest.name
+    where = f"raised further down, in `{owner}` at line {deepest.lineno}"
+    return f"{where}, where {shapes}" if shapes else where
+
+
+# A name, or a dotted path such as `self.weight`, as it appears in source.
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_STRING = re.compile(r"(\"\"\"|\'\'\'|\"|\').*?\1", re.DOTALL)
+_MAX_SHAPES = 4
+
+
+def _statement(summary: traceback.FrameSummary) -> str:
+    """The whole statement that raised, not just its first line.
+
+    An einsum call is usually written across several lines, and the tensors go
+    on the ones after the first. `FrameSummary.line` carries only the line at
+    `lineno`, so the source is read again across the statement's own span.
+    """
+    end = summary.end_lineno or summary.lineno
+    if not summary.filename or not summary.lineno:
+        return summary.line or ""
+    lines = linecache.getlines(summary.filename)[summary.lineno - 1 : end]
+    return "".join(lines) if lines else (summary.line or "")
+
+
+def _shapes_on_line(frame: Any, text: str | None, binder: DimBinder) -> str:
+    """The shapes of the tensors named on the line that raised, in the user's axis names.
+
+    torch describes a shape bug in its own terms: an operand index and a
+    subscript letter. Neither is anything the reader wrote. The names on that
+    line are, so every one of them holding a tensor is rendered beside it, and
+    a size that came out of the model's construction rather than an annotation
+    shows up as the plain number it is.
+    """
+    found: dict[str, str] = {}
+    # An einops pattern is a string of axis names. They are not locals, and a
+    # local that happens to share one of their names is not what the line reads.
+    for match in _NAME.finditer(_STRING.sub('""', text or "")):
+        name = match.group(0)
+        if name in found:
+            continue
+        value = _value_of(frame, name)
+        if isinstance(value, torch.Tensor):
+            found[name] = binder.render_shape(tuple(value.shape))
+        if len(found) == _MAX_SHAPES:
+            break
+    return ", ".join(f"{name} is {shape}" for name, shape in found.items())
+
+
+def _value_of(frame: Any, dotted: str) -> Any:
+    """What a name on the failing line refers to, or None if it refers to nothing.
+
+    Attribute reads can run user code through a property, so a raising getattr
+    means the name is simply not reportable.
+    """
+    root, *rest = dotted.split(".")
+    if root in frame.f_locals:
+        value = frame.f_locals[root]
+    elif root in frame.f_globals:
+        value = frame.f_globals[root]
+    else:
+        return None
+    for attr in rest:
+        try:
+            value = getattr(value, attr)
+        except Exception:  # noqa: BLE001
+            return None
+    return value
 
 
 def _owner_of(lineno: int | None, spans: list[tuple[int, int, str]]) -> str | None:
