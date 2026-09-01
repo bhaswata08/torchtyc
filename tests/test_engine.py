@@ -1294,3 +1294,36 @@ def test_a_traceback_keeps_a_frame_line_that_looks_like_a_prime(tmp_path):
     # The message beside it still has the primes taken back out.
     assert str(FIRST_PRIME) not in diagnostic.message
     assert "b" in diagnostic.message and "d" in diagnostic.message
+
+
+def test_trace_error_anchors_to_the_caller_not_the_shared_layer(project):
+    paths, config = project(
+        HEADER
+        + '''
+    class Linear(nn.Module):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty((out_features, in_features)))
+
+        def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
+            return einsum(
+                x, self.weight, "... in_features, out_features in_features -> ... out_features"
+            )
+
+    class Block(nn.Module):
+        def __init__(self, d_model: int) -> None:
+            super().__init__()
+            self.w1 = Linear(64, d_model)
+
+        def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+            return self.w1(x)
+    '''
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    # `Linear.forward` is correct and shared. The wrong shape is passed by
+    # `Block.forward`, so that is the line worth underlining.
+    assert diagnostic.function == "Block.forward"
+    assert diagnostic.line == 22
+    assert diagnostic.hint is not None
+    assert diagnostic.hint == "raised further down, in `Linear.forward` at line 13"

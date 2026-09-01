@@ -96,12 +96,25 @@ def _format_traceback(exc: BaseException, binder: DimBinder) -> str:
 
 
 def _anchor(
-    exc: BaseException, path: str, fallback: Position, binder: DimBinder
-) -> tuple[Position, str]:
-    """Point at the deepest frame inside the file being checked.
+    exc: BaseException,
+    path: str,
+    fallback: Position,
+    binder: DimBinder,
+    others: list[tuple[int, int, str]] | None = None,
+) -> tuple[Position, str, str | None]:
+    """Point at the deepest frame inside the file that torchtyc is not already checking.
 
     A shape error usually surfaces several frames down, inside einsum or matmul.
-    The line the user needs to see is the last one they wrote, not torch's.
+    The line the user needs to see is the last one they wrote, not torch's, so
+    the deepest frame in the file normally wins. An unannotated helper is part
+    of the caller's own code that way, which is what the reader wants.
+
+    A module that calls another annotated module in the same file is different.
+    That callee is checked in its own right and its code is shared by every
+    caller, so its failing line says nothing about which caller passed the wrong
+    shape. `others` carries the body spans of the file's other traced targets,
+    and frames inside them are stepped over until a line the checked function
+    actually owns is reached.
 
     The span comes from the frame's column offsets rather than its source text,
     because `FrameSummary.line` is stripped of leading indentation: measuring it
@@ -109,16 +122,43 @@ def _anchor(
     """
     frames = traceback.extract_tb(exc.__traceback__)
     mine = [f for f in frames if f.filename and Path(f.filename).resolve() == Path(path).resolve()]
-    chosen = mine[-1] if mine else None
+    spans = others or []
+    outside = [f for f in mine if not _within(f.lineno, spans)]
+    chosen = (outside or mine)[-1] if mine else None
     text = _format_traceback(exc, binder)
+    hint = None
+    if chosen is not None and mine[-1] is not chosen and mine[-1].lineno:
+        deepest = mine[-1]
+        owner = _owner_of(deepest.lineno, spans) or deepest.name
+        hint = f"raised further down, in `{owner}` at line {deepest.lineno}"
     if chosen is None:
-        return fallback, text
+        return fallback, text, None
     line = chosen.lineno - 1 if chosen.lineno else fallback.line
     end_line = chosen.end_lineno - 1 if chosen.end_lineno else line
     if chosen.colno is not None and chosen.end_colno is not None:
-        return Position(line, chosen.colno, end_line, chosen.end_colno), text
+        return Position(line, chosen.colno, end_line, chosen.end_colno), text, hint
     # No column information: fall back to underlining the whole line.
-    return Position(line, 0, line, len(chosen.line or "") or 1), text
+    return Position(line, 0, line, len(chosen.line or "") or 1), text, hint
+
+
+def _owner_of(lineno: int | None, spans: list[tuple[int, int, str]]) -> str | None:
+    """The qualname of the target whose body holds a 1-based traceback line."""
+    if lineno is None:
+        return None
+    return next((name for first, last, name in spans if first <= lineno - 1 <= last), None)
+
+
+def _within(lineno: int | None, spans: list[tuple[int, int, str]]) -> bool:
+    return _owner_of(lineno, spans) is not None
+
+
+def _body_spans(targets: list[Target], skip: Target) -> list[tuple[int, int, str]]:
+    """Body line ranges of every traced target in the file except the one being checked."""
+    return [
+        (t.signature_end_line, t.end_line, t.qualname)
+        for t in targets
+        if t is not skip and t.end_line > 0 and t.end_line >= t.signature_end_line
+    ]
 
 
 def _severity(rule: str) -> Severity:
@@ -127,7 +167,11 @@ def _severity(rule: str) -> Severity:
 
 
 def check_target(
-    module: Any, target: Target, path: str, variadic_rank: int
+    module: Any,
+    target: Target,
+    path: str,
+    variadic_rank: int,
+    siblings: list[Target] | None = None,
 ) -> tuple[list[Diagnostic], TraceResult | None]:
     """Trace one target once, returning its diagnostics and the trace itself.
 
@@ -142,7 +186,9 @@ def check_target(
     except NotLive:
         return [], None
     except TraceFailed as exc:
-        position, text = _anchor(exc.error, path, target.position, exc.binder)
+        position, text, hint = _anchor(
+            exc.error, path, target.position, exc.binder, _body_spans(siblings or [], target)
+        )
         return [
             Diagnostic(
                 path=path,
@@ -154,6 +200,7 @@ def check_target(
                 severity=Severity.ERROR,
                 message=exc.binder.rename_primes(f"{type(exc.error).__name__}: {exc.error}"),
                 function=target.qualname,
+                hint=hint,
                 traceback=text,
             )
         ], None
@@ -232,7 +279,7 @@ def check_attributes(
             )
         ]
     except Exception as exc:  # noqa: BLE001
-        position, text = _anchor(exc, path, info.position, binder)
+        position, text, _ = _anchor(exc, path, info.position, binder)
         return [
             Diagnostic(
                 path=path,
@@ -328,7 +375,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
         try:
             module = import_from_path(Path(path), buffer)
         except Exception as exc:  # noqa: BLE001
-            position, text = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
+            position, text, _ = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
             diagnostics.append(
                 Diagnostic(
                     path=path,
@@ -349,7 +396,7 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                 diagnostics.append(diagnostic.to_json())
 
         for target in targets:
-            found, result = check_target(module, target, path, variadic_rank)
+            found, result = check_target(module, target, path, variadic_rank, targets)
             for diagnostic in found:
                 diagnostics.append(diagnostic.to_json())
             if want_hover:
