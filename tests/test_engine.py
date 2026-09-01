@@ -1352,3 +1352,60 @@ def test_a_trace_error_reports_the_shapes_on_the_line_that_raised(project):
     # Nothing was raised further down, so the hint is the shapes alone. `d` and
     # `out` are einops axis names inside a string, not locals, and stay out of it.
     assert diagnostic.hint == "x is (..., d_model), self.weight is (64, 32)"
+
+
+def test_a_width_computed_in_init_is_named_by_what_it_follows(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty((out_features, in_features)))
+
+        def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
+            return einsum(x, self.weight, "... a, b a -> ... b")
+
+    class SwiGLU(nn.Module):
+        def __init__(self, d_model: int) -> None:
+            super().__init__()
+            d_ff = round(((8 / 3) * d_model) / 64) * 64
+            self.w1 = Linear(d_ff, d_model)
+
+        def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+            return self.w1(x)
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    # `d_ff` is 256 only because the trace ran with a stand-in `d_model`. At any
+    # real width it is a different number, so the number is not what to print.
+    assert "256" not in diagnostic.message
+    assert "<from d_model>" in diagnostic.message
+    assert diagnostic.hint is not None
+    assert "self.weight is (d_model, <from d_model>)" in diagnostic.hint
+    assert diagnostic.note is not None
+    assert "your __init__ computed from d_model" in diagnostic.note
+
+
+def test_a_size_written_in_the_code_keeps_its_number(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model: int) -> None:
+            super().__init__()
+            self.up = nn.Parameter(torch.empty((64, d_model)))
+            self.down = nn.Parameter(torch.empty((d_model, 512)))
+
+        def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+            h = einsum(x, self.up, "... d, up d -> ... up")
+            return einsum(h, self.down, "... up, d up -> ... d")
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    # 64 and 512 do not move when d_model moves, so they are real widths the
+    # code writes down, and the reader can go and find them.
+    assert diagnostic.hint == "h is (..., 64), self.down is (d_model, 512)"
+    assert diagnostic.note is None

@@ -132,6 +132,9 @@ class Diagnostic:
     expected: str | None = None
     got: str | None = None
     hint: str | None = None
+    # A sentence explaining torchtyc's own vocabulary, when a message uses it.
+    # Distinct from `hint`, which is about the user's code.
+    note: str | None = None
     # A concrete replacement the user can apply, such as the dim string the
     # annotation should have carried. Only set when torchtyc can name every
     # axis involved, so a suggestion is never a guess.

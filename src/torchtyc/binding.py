@@ -40,6 +40,31 @@ def _primes_from(start: int, count: int) -> list[int]:
 _PRIME_POOL = _primes_from(FIRST_PRIME, 512)
 
 
+def distant_prime(index: int) -> int:
+    """A prime far from the ones a trace hands out, for a second probe.
+
+    Re-building a model with a dimension moved only a little tells you nothing:
+    `round(8 / 3 * d_model / 64) * 64` gives the same width for 101 and 103, so
+    a size derived from `d_model` would look like a constant. Taking these from
+    the far end of the pool moves the arithmetic far enough to show.
+    """
+    return _PRIME_POOL[-(index % len(_PRIME_POOL) + 1)]
+
+
+def derived_name(names: tuple[str, ...]) -> str:
+    """How a size computed by the user's `__init__` is written in a message.
+
+    The number such a size comes out as is an artifact of the width torchtyc
+    traced with, so printing it sends the reader looking for something their
+    model does not contain. What it follows is the part that stays true.
+    """
+    return f"<from {' and '.join(names)}>"
+
+
+def is_derived_name(rendered: str) -> bool:
+    return rendered.startswith("<from ")
+
+
 class BindingError(ValueError):
     """A shape could not be matched against a spec."""
 
@@ -77,6 +102,11 @@ class DimBinder:
     # Sizes standing in for a single unnamed `_` axis. Same reasoning as above,
     # but they render as `_` so the shape mirrors what the annotation wrote.
     anonymous_dims: set[int] = field(default_factory=set)
+    # Sizes the user's own `__init__` computed, mapped to the dimensions they
+    # follow. `d_ff = 8 / 3 * d_model` lands here as `(d_model,)`, and a literal
+    # width written in the code lands as `()`. Filled in by a second probe, and
+    # only on the failure path, where a size is about to be shown to someone.
+    derived: dict[int, tuple[str, ...]] = field(default_factory=dict)
     _next: int = 0
     _anonymous_variadic: tuple[int, ...] | None = None
 
@@ -152,6 +182,8 @@ class DimBinder:
         factors = self._factor_names(size)
         if factors:
             return "*".join(factors)
+        if self.derived.get(size):
+            return derived_name(self.derived[size])
         return str(size)
 
     def _factor_names(self, size: int) -> list[str]:
@@ -214,7 +246,7 @@ class DimBinder:
         just as plainly as a single axis does.
         """
         table = self.issued()
-        if not table:
+        if not table and not self.derived:
             return text
 
         def replace(match: re.Match[str]) -> str:
@@ -222,7 +254,11 @@ class DimBinder:
             if value in table:
                 return table[value]
             factors = self._factor_names(value)
-            return "*".join(factors) if factors else match.group()
+            if factors:
+                return "*".join(factors)
+            if self.derived.get(value):
+                return derived_name(self.derived[value])
+            return match.group()
 
         return re.sub(r"\d+", replace, text)
 
@@ -254,7 +290,13 @@ class DimBinder:
                 continue
             # A product, an axis with no name, or a bare size is not something
             # to paste back over an annotation.
-            if "*" in rendered or "[" in rendered or rendered == "_" or rendered == str(size):
+            if (
+                "*" in rendered
+                or "[" in rendered
+                or rendered == "_"
+                or rendered == str(size)
+                or is_derived_name(rendered)
+            ):
                 return None
             parts.append(rendered)
         # jaxtyping allows at most one variadic, and so does the binder. Two

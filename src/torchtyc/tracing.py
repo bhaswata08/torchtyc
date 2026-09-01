@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from typing import Any
 import torch
 
 from .annotations import ArraySpec, OpaqueSpec, Spec, TupleSpec
-from .binding import BindingError, DimBinder, check_shape, shape_for
+from .binding import BindingError, DimBinder, check_shape, distant_prime, shape_for
 from .discovery import ClassInfo, InitDef, Param, Target
 
 # jaxtyping dtype name -> (dtype used to build an argument, dtypes accepted on
@@ -452,7 +453,23 @@ def resolve_qualname(
     return found
 
 
-def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[Any, list[Param]]:
+@dataclass
+class Construction:
+    """The class a trace built, kept so the same class can be built again.
+
+    Only `explain_derived_sizes` uses it, and only after something has already
+    gone wrong, so an ordinary trace fills this in and never reads it.
+    """
+
+    owner: ClassInfo | None = None
+    cls: type | None = None
+    module: Any = None
+    instance: Any = None
+
+
+def resolve_callable(
+    module: Any, target: Target, binder: DimBinder, built: Construction | None = None
+) -> tuple[Any, list[Param]]:
     """Find the function to call, constructing an instance when it is a method."""
     params = list(target.params)
 
@@ -483,6 +500,8 @@ def resolve_callable(module: Any, target: Target, binder: DimBinder) -> tuple[An
         return _live_method(module, cls, target), params[1:]
 
     instance = instantiate(owner, cls, binder, owner.dim_names, module)
+    if built is not None:
+        built.owner, built.cls, built.module, built.instance = owner, cls, module, instance
     return _live_method(module, instance, target), params[1:]  # drop self
 
 
@@ -516,16 +535,93 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     user's axis names instead of the primes torch actually saw.
     """
     binder = DimBinder(variadic_rank=variadic_rank)
+    built = Construction()
     try:
-        return _trace(module, target, binder)
+        return _trace(module, target, binder, built)
     except (TraceSkipped, NotLive, TraceFailed):
         raise
     except Exception as exc:
+        explain_derived_sizes(binder, built)
         raise TraceFailed(exc, binder) from exc
 
 
-def _trace(module: Any, target: Target, binder: DimBinder) -> TraceResult:
-    fn, params = resolve_callable(module, target, binder)
+def explain_derived_sizes(binder: DimBinder, built: Construction) -> None:
+    """Say which sizes the model's own `__init__` computed, and from what.
+
+    A size that is none of the binder's primes was worked out by the user's
+    code: `d_ff = round(8 / 3 * d_model / 64) * 64` is one. The number it lands
+    on depends on the width torchtyc traced with, so quoting that number sends
+    the reader hunting for something their model does not contain. Building the
+    class again with one dimension moved far away separates the two cases: a
+    size that follows the move was computed from that dimension, and one that
+    stays put is a constant the code writes down.
+
+    One extra construction per dimension, on meta tensors, and only once a trace
+    has already failed. A probe that raises is simply dropped: the class refused
+    that width, which says nothing about any size.
+    """
+    if built.instance is None or built.owner is None or built.cls is None:
+        return
+    base = _stored_shapes(built.instance)
+    unnamed = {size for shape in base.values() for size in shape if size not in binder.issued()}
+    if not unnamed:
+        return
+
+    init = live_init(built.owner, built.cls, built.module)
+    dims = [p.name for p in (init.params if init else []) if p.name in binder.sizes]
+    for index, name in enumerate(dims):
+        moved = _shapes_with_dim_moved(built, binder, name, distant_prime(index))
+        if moved is None:
+            continue
+        for key, shape in base.items():
+            other = moved.get(key)
+            if other is None or len(other) != len(shape):
+                continue
+            for size, alternative in zip(shape, other):
+                # One width usually sits on several tensors. Following the same
+                # dimension on each of them is one fact, not several.
+                found = binder.derived.get(size, ())
+                if size in unnamed and size != alternative and name not in found:
+                    binder.derived[size] = found + (name,)
+    # Whatever no probe moved is a constant, which is worth recording as such:
+    # an empty tuple is the answer "your code writes this size down".
+    for size in unnamed:
+        binder.derived.setdefault(size, ())
+
+
+def _shapes_with_dim_moved(
+    built: Construction, binder: DimBinder, name: str, size: int
+) -> dict[str, tuple[int, ...]] | None:
+    """Build the class again with one dimension at a different width."""
+    assert built.owner is not None and built.cls is not None
+    probe = DimBinder(
+        variadic_rank=binder.variadic_rank,
+        sizes={**binder.sizes, name: size},
+        _next=binder._next,
+    )
+    try:
+        instance = instantiate(built.owner, built.cls, probe, built.owner.dim_names, built.module)
+    except Exception:  # noqa: BLE001
+        return None
+    return _stored_shapes(instance)
+
+
+def _stored_shapes(instance: Any) -> dict[str, tuple[int, ...]]:
+    """Every tensor the built object holds, by the name it holds it under."""
+    if isinstance(instance, torch.nn.Module):
+        held = itertools.chain(instance.named_parameters(), instance.named_buffers())
+        return {name: tuple(value.shape) for name, value in held}
+    return {
+        name: tuple(value.shape)
+        for name, value in vars(instance).items()
+        if isinstance(value, torch.Tensor)
+    }
+
+
+def _trace(
+    module: Any, target: Target, binder: DimBinder, built: Construction | None = None
+) -> TraceResult:
+    fn, params = resolve_callable(module, target, binder, built)
 
     shapes: dict[str, tuple[int, ...]] = {}
     # A parameter declared before `/` cannot be passed by name, so it goes in a

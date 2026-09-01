@@ -75,14 +75,28 @@ flat.py:6:55: error[rank-mismatch]
   hint: d_model*seq looks like two annotated axes flattened into one
 ```
 
-An axis you did not name renders as `...`, a single `_` axis renders as `_`,
-and a raw number appears only for a size the annotation never bound.
+An axis you did not name renders as `...`, and a single `_` axis renders as `_`.
+A width your own `__init__` worked out renders as what it follows, such as
+`<from d_model>`, because the number it lands on comes from the width torchtyc
+traced with and is not a width your model has. A plain number appears only for a
+size your code writes down, which is one you can go and find.
 
 Because it runs your function rather than reasoning about it symbolically,
 torchtyc also catches anything that raises on the way: a bad `einsum`, a
-`matmul` between incompatible operands, an `nn.Module` that cannot be built. The
-diagnostic anchors to the deepest frame inside your own file, not to a line in
-torch.
+`matmul` between incompatible operands, an `nn.Module` that cannot be built.
+
+```
+layers.py:129:45: error[trace-error]
+  RuntimeError: einsum(): subscript a has size <from d_model> for operand 1 which does not broadcast with previously seen size d_model
+    129 | w1_out: Float[Tensor, "... d_ff"] = self.w1(x)
+  hint: raised further down, in `Linear.forward` at line 40, where x is (..., d_model), self.weight is (d_model, <from d_model>)
+  note: <from d_model> is a width your __init__ computed from d_model, so it is not d_model
+```
+
+The diagnostic anchors to the line you wrote, not to a line in torch and not to
+the shared layer further down that every caller runs. The hint carries the
+shapes of the tensors on the line that raised, so both widths that disagree are
+on show: here `self.w1` was built with its two widths the wrong way round.
 
 ## Install
 

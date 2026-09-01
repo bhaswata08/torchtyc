@@ -58,6 +58,8 @@ def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
         message += f"\n  expected: {diagnostic.expected}\n  got:      {diagnostic.got}"
     if diagnostic.hint:
         message += f"\n  hint: {diagnostic.hint}"
+    if diagnostic.note:
+        message += f"\n  note: {diagnostic.note}"
     if diagnostic.suggestion:
         message += f"\n  try: {diagnostic.suggestion}"
 

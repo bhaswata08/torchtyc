@@ -180,6 +180,26 @@ def _hint(
     return f"{where}, where {shapes}" if shapes else where
 
 
+_DERIVED = re.compile(r"<from ([^>]+)>")
+
+
+def _derived_note(*texts: str | None) -> str | None:
+    """Explain a `<from ...>` width, when one reached the reader.
+
+    The marker stands where a number used to, and a number there was worse than
+    useless: it was computed from the width torchtyc traced with, so it named a
+    size the model does not have at any real width. What the width follows is
+    the part that holds, and this says so once, in one place.
+    """
+    shown = sorted({match.group(0) for text in texts if text for match in _DERIVED.finditer(text)})
+    if not shown:
+        return None
+    if len(shown) == 1:
+        dims = _DERIVED.match(shown[0]).group(1)  # type: ignore[union-attr]
+        return f"{shown[0]} is a width your __init__ computed from {dims}, so it is not {dims}"
+    return "a <from ...> width is one your __init__ computed, so it is not that dimension itself"
+
+
 # A name, or a dotted path such as `self.weight`, as it appears in source.
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _STRING = re.compile(r"(\"\"\"|\'\'\'|\"|\').*?\1", re.DOTALL)
@@ -293,6 +313,7 @@ def check_target(
         position, text, hint = _anchor(
             exc.error, path, target.position, exc.binder, _body_spans(siblings or [], target)
         )
+        message = exc.binder.rename_primes(f"{type(exc.error).__name__}: {exc.error}")
         return [
             Diagnostic(
                 path=path,
@@ -302,9 +323,10 @@ def check_target(
                 end_column=position.end_column,
                 rule="trace-error",
                 severity=Severity.ERROR,
-                message=exc.binder.rename_primes(f"{type(exc.error).__name__}: {exc.error}"),
+                message=message,
                 function=target.qualname,
                 hint=hint,
+                note=_derived_note(message, hint),
                 traceback=text,
             )
         ], None
