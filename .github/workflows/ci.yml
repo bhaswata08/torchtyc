@@ -22,6 +22,7 @@ jobs:
       - run: uv python install ${{ matrix.python }}
       - run: uv sync --all-extras --dev
       - run: uv run ruff check src tests bench
+      - run: uv run ruff format --check src tests bench
       - run: uv run pytest -q
 
   self-check:

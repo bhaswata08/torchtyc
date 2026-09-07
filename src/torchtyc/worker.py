@@ -34,6 +34,7 @@ from .tracing import (
     TraceSkipped,
     check_return,
     describe,
+    explain_derived_sizes,
     instantiate,
     live_init,
     resolve_qualname,
@@ -346,7 +347,19 @@ def check_target(
             )
         ], None
 
-    for problem in check_return(target.returns, result.returned, result.binder):
+    problems = check_return(target.returns, result.returned, result.binder)
+    if problems and result.built is not None:
+        # A mismatch against a width the model worked out for itself reads as a
+        # bare number, and that number only exists at the width torchtyc traced
+        # with. Working out what it follows costs a handful of constructions,
+        # so it waits until there is something to report, and then the check
+        # runs again to write the messages with the names in. Every name is
+        # already bound by now, so the second run compares the same sizes and
+        # reaches the same verdict.
+        explain_derived_sizes(result.binder, result.built)
+        problems = check_return(target.returns, result.returned, result.binder)
+
+    for problem in problems:
         out.append(
             Diagnostic(
                 path=path,
@@ -361,6 +374,7 @@ def check_target(
                 expected=problem.get("expected"),
                 got=problem.get("got"),
                 hint=problem.get("hint") or None,
+                note=_derived_note(problem["message"], problem.get("got")),
                 suggestion=problem.get("suggestion"),
             )
         )
@@ -386,7 +400,7 @@ def check_attributes(
         # a guarded `__init__` that this import skipped reports nothing.
         chosen = live_init(info, cls, module)
         attributes = chosen.attributes if chosen is not None else []
-        instance = instantiate(info, cls, binder, info.dim_names, module)
+        instance = instantiate(info, cls, binder, info.dim_names, module, init=chosen)
     except NotLive:
         return []
     except TraceSkipped as exc:

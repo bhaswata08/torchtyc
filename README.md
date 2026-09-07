@@ -279,13 +279,14 @@ wrapper. Every bare `...` in one signature also stands for the *same* axes,
 which is narrower than jaxtyping: a loss taking two `"... d"` arguments traces
 with one batch shape, because that is what the annotation almost always means.
 
-A dimension is a prime, and a prime does not divide. Code that splits an axis
-- `head_dim = d_model // n_heads`, then `view(b, s, n_heads, head_dim)` - gets a
-quotient that does not multiply back, so correct multi-head attention is
-reported as a `trace-error`. A default on the divided parameter does not help,
-because a name the annotations use is bound to its prime whatever it defaults
-to. Silence the line with `# torchtyc: ignore[trace-error]` until dimensions
-carry a divisible factor.
+A dimension is a prime, and a prime does not divide, so code that splits an
+axis - `head_dim = d_model // n_heads`, then `view(b, s, n_heads, head_dim)` -
+gets a quotient that does not multiply back. A trace that fails this way is run
+again on widths that do divide, taken from the numbers the model itself writes
+down: a parameter's default, or a literal in the body of the constructor or
+the traced method. Multi-head attention passes on the second attempt. A model
+that splits by a width written nowhere either of those can see, or by one above
+256, still needs `# torchtyc: ignore[trace-error]`.
 
 Runtime checking with `jaxtyping` and `beartype` remains worth having. torchtyc
 tells you the shapes are consistent for the sizes it chose; beartype tells you

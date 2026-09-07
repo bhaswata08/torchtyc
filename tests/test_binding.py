@@ -388,3 +388,67 @@ def test_a_second_probe_moves_a_dimension_far_enough_to_show():
     assert round(((8 / 3) * FIRST_PRIME) / 64) * 64 == round(((8 / 3) * 103) / 64) * 64
     moved = distant_prime(0)
     assert round(((8 / 3) * FIRST_PRIME) / 64) * 64 != round(((8 / 3) * moved) / 64) * 64
+
+
+def test_flattened_axes_render_in_binding_order():
+    binder = DimBinder()
+    b, s, _d = shape_for(spec("b s d"), binder)
+    # The hint names an axis order, so reversing it points at the wrong outer
+    # axis. Binding order is the order the names were first seen.
+    assert binder.describe(b * s) == "b*s"
+
+
+def test_three_way_flatten_renders_in_binding_order():
+    binder = DimBinder()
+    b, s, d = shape_for(spec("b s d"), binder)
+    assert binder.describe(b * s * d) == "b*s*d"
+
+
+def test_flattened_axes_render_in_binding_order_under_scale():
+    # Each size under a scale is the scale times a prime coprime to it, and the
+    # pool still grows monotonically, so pool index is still binding order and
+    # a true product still factors whichever order is tried.
+    binder = DimBinder(scale=8)
+    b, s, d = shape_for(spec("b s d"), binder)
+    assert binder.describe(b * s) == "b*s"
+    assert binder.describe(b * s * d) == "b*s*d"
+
+
+def test_rank_hint_names_flattened_axes_in_binding_order():
+    binder = DimBinder()
+    b, s, d = shape_for(spec("b s d"), binder)
+    with pytest.raises(BindingError) as caught:
+        check_shape(spec("b s d"), (b * s, d), binder)
+    assert "b*s" in (caught.value.hint or "")
+
+
+def test_suggest_dims_keeps_a_fixed_literal():
+    binder = DimBinder()
+    shape = shape_for(spec("b 3 h w"), binder)
+    # A literal is written as itself, so it is fit to paste back.
+    assert binder.suggest_dims(shape) == "b 3 h w"
+
+
+def test_suggested_literal_annotation_round_trips():
+    binder = DimBinder()
+    shape = shape_for(spec("b 3 h w"), binder)
+    suggested = binder.suggest_dims(shape)
+    assert suggested == "b 3 h w"
+    # Pasting the suggestion over the annotation must report no problems.
+    check_shape(spec(suggested), shape, binder)
+
+
+def test_suggest_dims_refuses_a_partial_product_with_a_literal():
+    binder = DimBinder()
+    shape_for(spec("b 3"), binder)
+    # 303 is b * 3, not a true product of bound axes. It renders as digits,
+    # but it is not a literal the user wrote, so nothing is suggested.
+    assert binder.suggest_dims((binder.sizes["b"] * 3,)) is None
+
+
+def test_suggest_dims_refuses_an_unbound_prime():
+    binder = DimBinder()
+    binder.bind("d")
+    # 103 is the next prime the binder would hand out, but nothing bound it.
+    # Suggesting fixed "103" would leak an implementation detail.
+    assert binder.suggest_dims((103,)) is None

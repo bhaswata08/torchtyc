@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -26,7 +28,14 @@ from . import config as config_module
 from .config import Config, Overrides
 from .diagnostics import Diagnostic, Severity
 from .discovery import Target, scan_source
-from .engine import Report, apply_suppressions, check_paths, lint_scan
+from .engine import (
+    Report,
+    WorkerCancelled,
+    apply_suppressions,
+    check_paths,
+    lint_scan,
+    terminate_worker,
+)
 
 try:  # pygls 2.x
     from pygls.lsp.server import LanguageServer
@@ -36,6 +45,12 @@ except ImportError:  # pygls 1.x
 log = logging.getLogger("torchtyc")
 
 DEBOUNCE_SECONDS = 0.7
+
+# How many worker subprocesses may run at once, across every open file. One
+# file never runs two (see `tracing` below), but a config change rechecks all
+# of them, and each worker imports torch. Four lets a few files recheck
+# together while bounding the import storm.
+MAX_CONCURRENT_WORKERS = 4
 
 _SEVERITY = {
     Severity.ERROR: lsp.DiagnosticSeverity.Error,
@@ -83,6 +98,24 @@ def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
     )
 
 
+class _TraceRun:
+    """The worker one trace started, and how to stop it.
+
+    The worker thread records `proc` once the child spawns. Either side can
+    then stop it: the event loop sets `cancel` and stops a recorded child
+    directly, the worker thread notices `cancel` on its next poll and stops
+    the child itself. Whichever reaches the child first wins. Both paths end
+    with the stale run publishing nothing.
+    """
+
+    __slots__ = ("cancel", "generation", "proc")
+
+    def __init__(self, generation: int | None) -> None:
+        self.generation = generation
+        self.cancel = threading.Event()
+        self.proc: subprocess.Popen[str] | None = None
+
+
 class TorchtycServer(LanguageServer):
     def __init__(self) -> None:
         super().__init__(name="torchtyc", version=__version__)
@@ -94,6 +127,18 @@ class TorchtycServer(LanguageServer):
         # each run to completion or to the timeout.
         self.tracing: dict[str, asyncio.Lock] = {}
         self.wanted: dict[str, int] = {}
+        # The worker currently running for each file, so a newer trace can
+        # stop it instead of letting it import torch to completion while the
+        # new trace waits and then spawns a second import behind it.
+        self.workers: dict[str, _TraceRun] = {}
+        # One torch import at a time would serialize every open file behind
+        # the active one; unbounded lets a config change fan out to all of
+        # them. A few slots splits the difference.
+        self.worker_slots = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+        # One counter for every file, so a generation is never handed out
+        # twice. A file closed and reopened while its old worker still runs
+        # must not give the stale result the same number as the fresh trace.
+        self._generation: int = 0
         self.reports: dict[str, Report] = {}
         self.scans: dict[str, Any] = {}
 
@@ -151,22 +196,87 @@ class TorchtycServer(LanguageServer):
         self.pending[uri] = asyncio.create_task(run())
 
     async def trace_now(self, uri: str) -> None:
-        generation = self.wanted.get(uri, 0) + 1
+        self._generation += 1
+        generation = self._generation
         self.wanted[uri] = generation
+        # The run still going for this file is stale now. Stop its worker
+        # instead of letting it run to completion while the new trace waits
+        # for the lock and then spawns a second torch import behind it.
+        self.supersede(uri)
         lock = self.tracing.setdefault(uri, asyncio.Lock())
         async with lock:
             if self.wanted.get(uri) != generation:
                 # A newer trace was asked for while this one queued. Its result
                 # would be the one published anyway, so skip the subprocess.
                 return
-            await self._trace_once(uri)
+            async with self.worker_slots:
+                if self.wanted.get(uri) != generation:
+                    # Same, but for a trace that queued behind another file's
+                    # worker. Starting it now would only overwrite the newer
+                    # result that made it wait.
+                    return
+                await self._trace_once(uri, generation)
 
-    async def _trace_once(self, uri: str) -> None:
+    def supersede(self, uri: str) -> None:
+        """Stop the worker still running for this file, if there is one.
+
+        A newer trace, or a close, made its result unwanted. Setting the flag
+        lets the worker thread stop the child on its next poll; stopping a
+        recorded child directly covers a thread that has not scheduled yet.
+        Either way the stale run publishes nothing: _trace_once drops a
+        result whose generation is no longer wanted, and a stopped worker
+        raises instead of returning one.
+        """
+        run = self.workers.pop(uri, None)
+        if run is None:
+            return
+        run.cancel.set()
+        if run.proc is not None:
+            terminate_worker(run.proc)
+
+    async def _trace_once(self, uri: str, generation: int | None = None) -> None:
         path = uri_to_path(uri)
         source = self.source_of(uri)
         config = self.config_for(path)
 
-        report = await asyncio.to_thread(check_paths, [path], config, {path: source}, True)
+        run = _TraceRun(generation)
+        self.workers[uri] = run
+
+        def note_child(proc: subprocess.Popen[str]) -> None:
+            run.proc = proc
+
+        try:
+            try:
+                report = await asyncio.to_thread(
+                    check_paths,
+                    [path],
+                    config,
+                    {path: source},
+                    True,
+                    cancel=run.cancel,
+                    on_proc=note_child,
+                )
+            except WorkerCancelled:
+                # A newer trace or a close stopped this worker. Its output, if
+                # any, ends mid-write and is already discarded. Publish
+                # nothing; the newer trace, if any, speaks for the file.
+                return
+            except asyncio.CancelledError:
+                # The task awaiting this trace died while the worker ran. The
+                # thread it left behind cannot be cancelled, so the flag stops
+                # its child instead of letting it run to the timeout.
+                run.cancel.set()
+                if run.proc is not None:
+                    terminate_worker(run.proc)
+                raise
+        finally:
+            if self.workers.get(uri) is run:
+                del self.workers[uri]
+        if generation is not None and self.wanted.get(uri) != generation:
+            # The file was closed, or a newer trace was asked for, while the
+            # worker ran. Publishing now would revive diagnostics for a closed
+            # file or overwrite a fresher result, so drop this one.
+            return
         self.reports[uri] = report
 
         diagnostics = list(report.diagnostics)
@@ -231,6 +341,19 @@ def did_close(ls: TorchtycServer, params: lsp.DidCloseTextDocumentParams) -> Non
     task = ls.pending.pop(uri, None)
     if task is not None:
         task.cancel()
+    # Stop a worker still running for this file. Its result is unwanted now,
+    # and without the flag its thread would run to completion or the timeout
+    # while holding nothing, then drop the result anyway.
+    ls.supersede(uri)
+    # Drop the trace state too, or every file ever opened leaves a lock and a
+    # generation behind for the life of the server. Popping `wanted` also
+    # invalidates a worker still running for this file: when it finishes it
+    # finds no generation and drops its result instead of publishing for a
+    # closed file. Generations come from one server-wide counter, so a file
+    # reopened while its old worker still runs gets a larger number and the
+    # stale result still reads as stale.
+    ls.tracing.pop(uri, None)
+    ls.wanted.pop(uri, None)
     ls.reports.pop(uri, None)
     ls.scans.pop(uri, None)
     ls.publish(uri, [])

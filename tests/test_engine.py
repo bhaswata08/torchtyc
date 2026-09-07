@@ -6,12 +6,14 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
-from torchtyc import cli
+from torchtyc import cli, tracing, worker
 from torchtyc.binding import FIRST_PRIME
 from torchtyc.config import Config
+from torchtyc.discovery import scan_source
 from torchtyc.engine import check_paths, collect_files
 
 
@@ -893,9 +895,25 @@ def test_json_output_carries_no_synthetic_primes(project, capsys):
     print(render(report, "json", config.root))
     payload = json_module.loads(capsys.readouterr().out)
 
-    text = json_module.dumps(payload)
+    # Only the fields that carry torchtyc's own rendering are checked. Paths
+    # live under the pytest session directory, so a prime session number is a
+    # position the test was given and not a shape it let through. Frame lines
+    # in a traceback are positions for the same reason, while the message
+    # lines beside them went through the binder and stay in the check.
+    rendered: list[str] = []
+    for entry in payload["diagnostics"]:
+        for key in ("message", "expected", "got", "hint", "note", "suggestion"):
+            value = entry.get(key)
+            if value:
+                rendered.append(value)
+        lines = (entry.get("traceback") or "").splitlines()
+        rendered.extend(line for line in lines if line and not line[0].isspace())
+    for per_file in payload.get("hovers", {}).values():
+        for shapes in per_file.values():
+            rendered.extend(shapes.values())
+
     primes = {str(p) for p in _PRIME_POOL[:8]}
-    numbers = set(re.findall(r"\d+", text))
+    numbers = set(re.findall(r"\d+", "\n".join(rendered)))
     assert not (numbers & primes), f"a synthetic prime reached the json output: {numbers & primes}"
 
     # The traceback still names the real source lines it points at, which are
@@ -1449,3 +1467,285 @@ def test_a_leading_space_annotation_traces_clean(project):
     )
     report = check_paths(paths, config)
     assert rules(report) == []
+
+
+def test_multi_head_attention_splitting_a_width_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    class MHA(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+            self.qkv = nn.Parameter(torch.empty((3 * d_model, d_model)))
+            self.out = nn.Parameter(torch.empty((d_model, d_model)))
+
+        def forward(
+            self, x: Float[Tensor, "batch seq d_model"]
+        ) -> Float[Tensor, "batch seq d_model"]:
+            b, s, _ = x.shape
+            qkv = (x @ self.qkv.T).view(b, s, 3, self.n_heads, self.head_dim)
+            q, k, v = qkv.unbind(2)
+            scores = q.transpose(1, 2) @ k.transpose(1, 2).transpose(-2, -1)
+            h = torch.softmax(scores, dim=-1) @ v.transpose(1, 2)
+            return h.transpose(1, 2).reshape(b, s, -1) @ self.out.T
+    """
+    )
+    report = check_paths(paths, config)
+    # `d_model // n_heads` loses a remainder at any prime width, so tracing on
+    # primes alone reports this correct block as a shape error. The retry runs
+    # it at a width the eight the constructor writes down divides.
+    assert report.diagnostics == []
+
+
+def test_a_dimension_named_by_a_defaulted_parameter_takes_the_default(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Heads(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+
+        def forward(
+            self, x: Float[Tensor, "batch seq d_model"]
+        ) -> Float[Tensor, "batch n_heads seq head_dim"]:
+            b, s, _ = x.shape
+            return x.view(b, s, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+    """
+    )
+    report = check_paths(paths, config)
+    # `n_heads` names an axis and states a width. On the retry the width wins,
+    # so the split comes out whole and the axis binds to eight.
+    assert rules(report) == ["unused-dim"]
+
+
+def test_a_width_split_twice_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Rotary(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+
+        def forward(
+            self, x: Float[Tensor, "batch seq d_model"]
+        ) -> Float[Tensor, "batch seq d_model"]:
+            b, s, _ = x.shape
+            pairs = x.view(b, s, self.n_heads, self.head_dim // 2, 2)
+            return pairs.reshape(b, s, -1)
+    """
+    )
+    report = check_paths(paths, config)
+    # The head width is split again, so a factor that survives one division is
+    # not enough. The second retry multiplies the written widths instead.
+    assert report.diagnostics == []
+
+
+def test_a_wrong_width_beside_a_split_is_still_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    class MHA(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+            self.out = nn.Parameter(torch.empty((d_model, self.head_dim)))
+
+        def forward(
+            self, x: Float[Tensor, "batch seq d_model"]
+        ) -> Float[Tensor, "batch seq d_model"]:
+            b, s, _ = x.shape
+            h = x.view(b, s, self.n_heads, self.head_dim).reshape(b, s, -1)
+            return h @ self.out.T
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    # The `view` above is correct and only failed while widths did not divide.
+    # The projection built at the head width is the real mistake, so that is
+    # the line to underline.
+    assert diagnostic.line == 18
+    assert diagnostic.hint == "h is (batch, seq, d_model), self.out.T is (<from d_model>, d_model)"
+
+
+def test_a_split_that_no_written_width_repairs_is_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Split(nn.Module):
+        def forward(self, x: Float[Tensor, "batch d"]) -> Float[Tensor, "batch d"]:
+            b, d = x.shape
+            return x.reshape(b, d // 7, 7)
+    """
+    )
+    report = check_paths(paths, config)
+    # Seven is written down, so it is tried, and the reshape still adds an axis
+    # the annotation does not have.
+    assert rules(report) == ["rank-mismatch"]
+
+
+def test_a_returned_width_the_init_computed_is_named_not_numbered(project):
+    paths, config = project(
+        HEADER
+        + """
+    class FF(nn.Module):
+        def __init__(self, d_model: int) -> None:
+            super().__init__()
+            self.up = nn.Parameter(torch.empty((4 * d_model, d_model)))
+
+        def forward(self, x: Float[Tensor, "batch d_model"]) -> Float[Tensor, "batch d_model"]:
+            return x @ self.up.T
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    # The return traces four times d_model, and that number exists only at the
+    # width torchtyc traced with, so the message says what it follows instead.
+    assert "<from d_model>" in diagnostic.message
+    assert diagnostic.got == "(batch, <from d_model>)"
+    assert diagnostic.note is not None
+    assert "your __init__ computed from d_model" in diagnostic.note
+    # It is a computed width, not another axis the annotation could have named,
+    # so there is no swap to point at.
+    assert diagnostic.hint is None
+
+
+def test_a_width_kept_only_as_an_integer_is_named_by_what_it_follows(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Heads(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+
+        def forward(
+            self, x: Float[Tensor, "batch seq d_model"]
+        ) -> Float[Tensor, "batch seq d_model"]:
+            b, s, _ = x.shape
+            return x.view(b, s, self.n_heads, self.head_dim).sum(2)
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    # `head_dim` is an integer attribute and no weight is ever built at that
+    # width, so following the tensors alone would leave the message quoting a
+    # number the model does not contain.
+    assert "<from d_model>" in diagnostic.message
+    assert diagnostic.got == "(batch, seq, <from d_model>)"
+
+
+def test_a_parity_guard_beside_a_keyword_call_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    def check_positive(**kwargs):
+        for key, value in kwargs.items():
+            if value <= 0:
+                raise ValueError(f"{key} must be positive")
+
+
+    class RoPE(nn.Module):
+        def __init__(self, theta: float, d_k: int, max_seq_len: int) -> None:
+            super().__init__()
+            check_positive(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
+            if d_k % 2 != 0:
+                raise ValueError("RoPE dimension d_k should be divisible by 2")
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The `2` in the guard compiles to an inline instruction and never reaches
+    # the constants beside the keyword call, so reading the constants alone
+    # finds no divisor and the retry never runs. Reading the bytecode sees it.
+    assert report.diagnostics == []
+
+
+def test_a_guarded_constructor_after_a_dead_one_is_used(project):
+    paths, config = project(
+        HEADER
+        + """
+    FAST = True
+
+    class Block(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            self.W = nn.Parameter(torch.empty((d, d)))
+
+        if FAST:
+
+            def __init__(self, d: int, out: int) -> None:
+                super().__init__()
+                self.W = nn.Parameter(torch.empty((out, d)))
+
+        def forward(self, x: Float[Tensor, "... d"]) -> Float[Tensor, "... out"]:
+            return einsum(x, self.W, "... d, out d -> ... out")
+    """
+    )
+    # The unconditional `__init__` never ran: the guard's arm reassigned the
+    # name after it. Building with its parameters reports a missing `out`
+    # against code that is correct.
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_a_dead_unconditional_constructor_contributes_no_attributes(project):
+    paths, config = project(
+        HEADER
+        + """
+    FAST = True
+
+    class Block(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            self.W: Float[nn.Parameter, "d d"] = nn.Parameter(torch.empty((d, 3)))
+
+        if FAST:
+
+            def __init__(self, d: int, out: int) -> None:
+                super().__init__()
+                self.W: Float[nn.Parameter, "out d"] = nn.Parameter(torch.empty((out, d)))
+
+        def forward(self, x: Float[Tensor, "... d"]) -> Float[Tensor, "... out"]:
+            return einsum(x, self.W, "... d, out d -> ... out")
+    """
+    )
+    # Neither the dead constructor's parameters nor its annotated attributes
+    # take part in the check, so the wrong shape it writes down stays silent.
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_check_attributes_resolves_the_live_constructor_once(tmp_path):
+    source = textwrap.dedent(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            self.W: Float[nn.Parameter, "d d"] = nn.Parameter(torch.empty((d, d)))
+    """
+    )
+    path = tmp_path / "model.py"
+    path.write_text(source)
+    module = worker.import_from_path(path)
+    info = next(c for c in scan_source(source, str(path)).classes if c.qualname == "Block")
+    with (
+        patch.object(worker, "live_init", wraps=tracing.live_init) as worker_init,
+        patch.object(tracing, "live_init", wraps=tracing.live_init) as tracing_init,
+    ):
+        worker.check_attributes(module, info, str(path), 2)
+    # `check_attributes` picks the constructor and hands it to `instantiate`,
+    # so the resolution happens here and is not repeated inside.
+    assert worker_init.call_count + tracing_init.call_count == 1
