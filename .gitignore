@@ -9,3 +9,4 @@ build/
 result
 uv.lock
 .env
+.geminiignore
