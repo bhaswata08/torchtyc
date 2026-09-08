@@ -644,7 +644,9 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
             wider = DimBinder(variadic_rank=variadic_rank, scale=scale, defaults_first=True)
             again = Construction()
             try:
-                return _trace(module, target, wider, again)
+                result = _trace(module, target, wider, again)
+                close_instance(built.instance)
+                return result
             except (TraceSkipped, NotLive, BindingError):
                 # This attempt never reached the user's code, so it says
                 # nothing the one before it has not already said.
@@ -779,7 +781,7 @@ def explain_derived_sizes(binder: DimBinder, built: Construction) -> None:
     init = live_init(built.owner, built.cls, built.module)
     dims = [p.name for p in (init.params if init else []) if p.name in binder.sizes]
     for index, name in enumerate(dims):
-        moved = _shapes_with_dim_moved(built, binder, name, distant_prime(index))
+        moved = _shapes_with_dim_moved(built, binder, name, distant_prime(index) * binder.scale)
         if moved is None:
             continue
         for key, shape in base.items():
@@ -831,7 +833,7 @@ def _stored_shapes(instance: Any) -> dict[str, tuple[int, ...]]:
     if isinstance(instance, torch.nn.Module):
         held = itertools.chain(instance.named_parameters(), instance.named_buffers())
         found.update((name, tuple(value.shape)) for name, value in held)
-    for name, value in vars(instance).items():
+    for name, value in getattr(instance, "__dict__", {}).items():
         if isinstance(value, torch.Tensor):
             found[name] = tuple(value.shape)
         elif type(value) is int:

@@ -1917,3 +1917,116 @@ def test_trace_retry_construction_count_is_capped(tmp_path):
     # Verify that retries occurred and that total constructions are bounded.
     assert mock_instantiate.call_count > 1
     assert mock_instantiate.call_count == 4
+
+
+def test_stored_shapes_on_plain_class_with_slots():
+    import torch
+
+    class PlainWithSlots:
+        __slots__ = ("weight",)
+
+        def __init__(self) -> None:
+            self.weight = torch.empty((3, 4))
+
+    instance = PlainWithSlots()
+    shapes = tracing._stored_shapes(instance)
+    assert shapes == {}
+
+
+def test_plain_class_with_slots_trace_error_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    class PlainSlots:
+        __slots__ = ("weight",)
+
+        def __init__(self, d_in: int, d_out: int) -> None:
+            self.weight = torch.empty((d_out, d_in))
+
+        def forward(self, x: Float[Tensor, "... d_in"]) -> Float[Tensor, "... d_out"]:
+            return x @ self.weight
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.worker_error is None
+    assert any(d.rule == "trace-error" for d in report.diagnostics)
+
+
+def test_module_with_slots_stored_shapes():
+    from torch import nn
+
+    class ModuleWithSlots(nn.Module):
+        __slots__ = ("extra",)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(4, 8)
+            self.extra = 42
+
+    instance = ModuleWithSlots()
+    shapes = tracing._stored_shapes(instance)
+    assert "linear.weight" in shapes
+    assert shapes["linear.weight"] == (8, 4)
+
+
+def test_failed_instance_is_closed_when_retry_succeeds(tmp_path):
+    source = textwrap.dedent(
+        HEADER
+        + """
+    closed_ids = []
+
+    class DivisibleModel(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            self.id = len(closed_ids)
+            closed_ids.append(False)
+            self.n_heads = n_heads
+            self.W = nn.Parameter(torch.empty((d_model, d_model)))
+
+        def close(self) -> None:
+            closed_ids[self.id] = True
+
+        def forward(self, x: Float[Tensor, "batch d_model"]) -> Float[Tensor, "batch d_model"]:
+            h = x.view(-1, self.n_heads, x.shape[-1] // self.n_heads)
+            return x @ self.W
+    """
+    )
+    path = tmp_path / "model.py"
+    path.write_text(source)
+    module = worker.import_from_path(path)
+    scan = scan_source(source, str(path))
+    target = next(t for t in scan.targets if t.has_array_annotation)
+    diags, result = worker.check_target(module, target, str(path), 2, scan.targets)
+    assert diags == []
+    assert result is not None
+    assert len(module.closed_ids) == 2
+    assert module.closed_ids[0] is True
+    assert module.closed_ids[1] is False
+
+
+def test_derived_sizes_explained_when_scale_greater_than_one(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Linear(nn.Module):
+        def __init__(self, in_features: int, out_features: int) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty((out_features, in_features)))
+
+        def forward(self, x: Float[Tensor, "... in_features"]) -> Float[Tensor, "... out_features"]:
+            return einsum(x, self.weight, "... a, b a -> ... b")
+
+    class SwiGLUDivisible(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8) -> None:
+            super().__init__()
+            assert d_model % n_heads == 0
+            d_ff = round(((8 / 3) * d_model) / 64) * 64
+            self.w1 = Linear(d_ff, d_model)
+
+        def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
+            return self.w1(x)
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert "<from d_model>" in diagnostic.message

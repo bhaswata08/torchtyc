@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 import socket
 import sys
 import textwrap
@@ -10,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from torchtyc.config import Config
-from torchtyc.effects import BlockedEffect, active_guard
+from torchtyc.effects import BlockedEffect, active_guard, unwrap_blocked
 from torchtyc.engine import check_paths
 
 
@@ -430,3 +431,30 @@ def test_attribute_check_write_blocked(project, tmp_path: Path):
     assert "BlockedEffect" in diag.message
     lines = Path(paths[0]).read_text().splitlines()
     assert "write_text" in lines[diag.line]
+
+
+def test_unwrap_blocked_breaks_cyclic_cause():
+    first = ValueError("first")
+    second = ValueError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+
+    def timeout_handler(signum, frame):
+        raise TimeoutError("unwrap_blocked did not return within timeout")
+
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(2)
+    try:
+        assert unwrap_blocked(first) is None
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def test_unwrap_blocked_finds_blocked_in_cyclic_cause():
+    blocked = BlockedEffect("blocked effect")
+    first = ValueError("first")
+    first.__cause__ = blocked
+    blocked.__cause__ = first
+
+    assert unwrap_blocked(first) is blocked

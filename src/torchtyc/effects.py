@@ -46,10 +46,12 @@ class BlockedEffect(PermissionError):
 
 def unwrap_blocked(exc: BaseException) -> BlockedEffect | None:
     """Find a BlockedEffect inside an exception's cause or context chain."""
+    seen: set[int] = set()
     cur: BaseException | None = exc
-    while cur is not None:
+    while cur is not None and id(cur) not in seen:
         if isinstance(cur, BlockedEffect):
             return cur
+        seen.add(id(cur))
         cur = cur.__cause__ or cur.__context__
     return None
 
