@@ -394,6 +394,7 @@ def run_worker(
         "variadic_rank": config.variadic_rank,
         "sources": {str(Path(p).resolve()): text for p, text in (sources or {}).items()},
         "hover": hover,
+        "allow_effects": config.allow_effects,
     }
 
     env = dict(os.environ)

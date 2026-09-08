@@ -200,6 +200,7 @@ variadic-rank = 2             # how many axes `...` stands for
 einops = true
 timeout = 60.0
 extra-paths = ["stubs"]       # prepended to the worker's PYTHONPATH
+allow-effects = false         # let imported code write files and open sockets
 ```
 
 ## Editors
@@ -291,6 +292,20 @@ that splits by a width written nowhere either of those can see, or by one above
 Runtime checking with `jaxtyping` and `beartype` remains worth having. torchtyc
 tells you the shapes are consistent for the sizes it chose; beartype tells you
 they were right for the batch you actually ran.
+
+## Security
+
+torchtyc imports your modules in a worker subprocess that runs with your full
+privileges.
+
+While it imports and traces your code, a guard blocks filesystem writes and
+outbound network calls. It catches accidental effects such as telemetry setup,
+dataset downloads and checkpoint writes. It is not a security boundary: Python
+cannot enforce one in-process, and code written to get around it can. Set
+`allow-effects = true` if a model you trust needs to write or connect.
+
+Untrusted code still needs a real sandbox or a disposable container. Only enable
+`torchtyc lsp` in workspaces you trust.
 
 ## Licence
 

@@ -402,7 +402,9 @@ def test_a_package_init_is_imported_once(tmp_path):
             """
         )
     )
-    config = Config(root=tmp_path, python=sys.executable)
+    # The count is kept in a file the imported body writes, so the guard has to
+    # be off for this one check.
+    config = Config(root=tmp_path, python=sys.executable, allow_effects=True)
     report = check_paths([str(package / "__init__.py")], config)
 
     assert report.worker_error is None
@@ -1749,3 +1751,169 @@ def test_check_attributes_resolves_the_live_constructor_once(tmp_path):
     # `check_attributes` picks the constructor and hands it to `instantiate`,
     # so the resolution happens here and is not repeated inside.
     assert worker_init.call_count + tracing_init.call_count == 1
+
+
+def test_constructor_thread_does_not_survive_trace(tmp_path):
+    source = textwrap.dedent(
+        HEADER
+        + """
+    import threading
+
+    spawned = None
+
+    class CooperativeWatcher(threading.Thread):
+        def __init__(self) -> None:
+            super().__init__(daemon=True)
+            self._stopped = threading.Event()
+
+        def run(self) -> None:
+            self._stopped.wait(10.0)
+
+        def stop(self) -> None:
+            self._stopped.set()
+
+    class Block(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            global spawned
+            spawned = CooperativeWatcher()
+            spawned.start()
+            self.W = nn.Parameter(torch.empty((d, d)))
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x @ self.W
+    """
+    )
+    path = tmp_path / "model.py"
+    path.write_text(source)
+    module = worker.import_from_path(path)
+    scan = scan_source(source, str(path))
+    target = next(t for t in scan.targets if t.has_array_annotation)
+    diags, _ = worker.check_target(module, target, str(path), 2, scan.targets)
+    assert diags == []
+    assert module.spawned is not None
+    # The worker thread was started in construction, but was stopped cooperatively
+    # and joined before the trace returned, so it does not outlive the check.
+    assert not module.spawned.is_alive()
+
+
+def test_unstoppable_constructor_thread_is_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    import threading
+    import time
+
+    class Stubborn(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            def loop():
+                while True:
+                    try:
+                        time.sleep(0.01)
+                    except BaseException:
+                        pass
+
+            t = threading.Thread(target=loop, name="StubbornWatcher", daemon=True)
+            t.start()
+            self.W = nn.Parameter(torch.empty((d, d)))
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x @ self.W
+    """
+    )
+    report = check_paths(paths, config)
+    # A thread that ignores shutdown cannot be stopped cleanly, so it is reported
+    # as uninstantiable rather than left running silently in the background.
+    assert "uninstantiable" in rules(report)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "uninstantiable")
+    assert "StubbornWatcher" in diagnostic.message
+
+
+def test_constructor_error_wins_over_thread_check(project):
+    paths, config = project(
+        HEADER
+        + """
+    import threading
+    import time
+
+    class Broken(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            def loop():
+                time.sleep(5.0)
+            t = threading.Thread(target=loop, name="Watcher", daemon=True)
+            t.start()
+            raise ValueError("d must be even, this is the real error")
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "trace-error"
+    assert "ValueError: d must be even, this is the real error" in diag.message
+
+
+def test_constructor_thread_blocked_in_c_does_not_deadlock(project):
+    paths, config = project(
+        HEADER
+        + """
+    import threading
+
+    lock = threading.Lock()
+    lock.acquire()
+
+    class BlockedInLock(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            def wait_for_lock():
+                lock.acquire()
+            t = threading.Thread(target=wait_for_lock, name="LockWaiter", daemon=True)
+            t.start()
+            self.W = nn.Parameter(torch.empty((d, d)))
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x @ self.W
+    """
+    )
+    report = check_paths(paths, config)
+    assert "uninstantiable" in rules(report)
+    diag = next(d for d in report.diagnostics if d.rule == "uninstantiable")
+    assert "LockWaiter" in diag.message
+
+
+def test_trace_retry_construction_count_is_capped(tmp_path):
+    source = textwrap.dedent(
+        HEADER
+        + """
+    class MultiFail(nn.Module):
+        def __init__(self, d_model: int, n_heads: int = 8, d_k: int = 2, d_v: int = 4) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+            self.head_dim = d_model // n_heads
+            self.out = nn.Parameter(torch.empty((d_model, self.head_dim)))
+
+        def forward(
+            self, x: Float[Tensor, "batch seq d_model"]
+        ) -> Float[Tensor, "batch seq d_model"]:
+            b, s, _ = x.shape
+            h = x.view(b, s, self.n_heads, self.head_dim).reshape(b, s, -1)
+            return h @ self.out.T
+    """
+    )
+    path = tmp_path / "model.py"
+    path.write_text(source)
+    module = worker.import_from_path(path)
+    scan = scan_source(source, str(path))
+    target = next(t for t in scan.targets if t.has_array_annotation)
+
+    with patch.object(tracing, "instantiate", wraps=tracing.instantiate) as mock_instantiate:
+        worker.check_target(module, target, str(path), 2, scan.targets)
+
+    # One initial trace, two divisible scale retries, and one derived size probe.
+    # Verify that retries occurred and that total constructions are bounded.
+    assert mock_instantiate.call_count > 1
+    assert mock_instantiate.call_count == 4

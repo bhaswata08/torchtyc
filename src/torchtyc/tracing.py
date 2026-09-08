@@ -17,6 +17,7 @@ import dis
 import inspect
 import itertools
 import math
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ import torch
 from .annotations import ArraySpec, OpaqueSpec, Spec, TupleSpec
 from .binding import BindingError, DimBinder, check_shape, distant_prime, shape_for
 from .discovery import ClassInfo, InitDef, Param, Target
+from .effects import unwrap_blocked
 
 # jaxtyping dtype name -> (dtype used to build an argument, dtypes accepted on
 # the way out). Building picks one representative; checking accepts the family.
@@ -319,13 +321,72 @@ def instantiate(
         else:
             kwargs[param.name] = value
 
-    with torch.device("meta"), _quiet_init():
+    before_threads = set(threading.enumerate())
+    instance = None
+    failed = False
+    try:
+        with torch.device("meta"), _quiet_init():
+            try:
+                instance = cls(*args, **kwargs)
+            except TypeError as exc:
+                raise TraceSkipped(
+                    "uninstantiable", f"cannot construct `{owner.qualname or owner.name}`: {exc}"
+                ) from exc
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        after_threads = set(threading.enumerate())
+        spawned = [t for t in after_threads if t not in before_threads and t.is_alive()]
+        for thread in spawned:
+            _attempt_cooperative_stop(thread)
+        if not failed:
+            surviving = [t for t in spawned if t.is_alive()]
+            if surviving:
+                close_instance(instance)
+                names = ", ".join(f"`{t.name}`" for t in surviving)
+                raise TraceSkipped(
+                    "uninstantiable",
+                    f"cannot construct `{owner.qualname or owner.name}`: constructor left background thread {names} running",
+                    hint="shut down background threads in `__init__` or start them lazily",
+                )
+    return instance
+
+
+def _attempt_cooperative_stop(thread: threading.Thread) -> None:
+    """Attempt cooperative shutdown on a thread spawned during construction.
+
+    Only cooperative hooks such as `cancel` or `stop` are safe to call.
+    Asynchronous exception injection can interrupt a thread holding internal
+    locks or blocked in C calls, which risks deadlocking or corrupting the
+    process. Unstoppable threads are left alone and reported as uninstantiable.
+    """
+    if not thread.is_alive():
+        return
+    if hasattr(thread, "cancel") and callable(thread.cancel):
         try:
-            return cls(*args, **kwargs)
-        except TypeError as exc:
-            raise TraceSkipped(
-                "uninstantiable", f"cannot construct `{owner.qualname or owner.name}`: {exc}"
-            ) from exc
+            thread.cancel()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    if hasattr(thread, "stop") and callable(thread.stop):
+        try:
+            thread.stop()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    thread.join(timeout=0.05)
+
+
+def close_instance(instance: Any) -> None:
+    """Shut down connections and watchers held by an instance."""
+    if instance is None:
+        return
+    for method_name in ("close", "stop", "shutdown"):
+        method = getattr(instance, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
 
 @contextlib.contextmanager
@@ -555,6 +616,11 @@ def _live_method(module: Any, owner: Any, target: Target) -> Any:
     return found
 
 
+# At most two retries: one for the least common multiple of written divisors
+# to resolve single splits, and one for their product to resolve nested splits.
+_MAX_RETRIES = 2
+
+
 def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     """Call one target on meta tensors and hand back what came out.
 
@@ -569,9 +635,12 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
         return _trace(module, target, binder, built)
     except (TraceSkipped, NotLive, TraceFailed):
         raise
-    except Exception as first:  # noqa: BLE001
+    except Exception as first:
+        if unwrap_blocked(first) is not None:
+            close_instance(built.instance)
+            raise TraceFailed(first, binder) from first
         failure: BaseException = first
-        for scale in _divisible_scales(module, target):
+        for scale in _divisible_scales(module, target)[:_MAX_RETRIES]:
             wider = DimBinder(variadic_rank=variadic_rank, scale=scale, defaults_first=True)
             again = Construction()
             try:
@@ -579,13 +648,16 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
             except (TraceSkipped, NotLive, BindingError):
                 # This attempt never reached the user's code, so it says
                 # nothing the one before it has not already said.
+                close_instance(again.instance)
                 continue
             except Exception as later:  # noqa: BLE001
                 # It ran on widths that divide, so whatever it hit is more
                 # likely the real mistake than a split losing a remainder on
                 # the way to it.
+                close_instance(built.instance)
                 failure, binder, built = later, wider, again
         explain_derived_sizes(binder, built)
+        close_instance(built.instance)
         raise TraceFailed(failure, binder) from failure
 
 
@@ -741,7 +813,10 @@ def _shapes_with_dim_moved(
         instance = instantiate(built.owner, built.cls, probe, built.owner.dim_names, built.module)
     except Exception:  # noqa: BLE001
         return None
-    return _stored_shapes(instance)
+    try:
+        return _stored_shapes(instance)
+    finally:
+        close_instance(instance)
 
 
 def _stored_shapes(instance: Any) -> dict[str, tuple[int, ...]]:

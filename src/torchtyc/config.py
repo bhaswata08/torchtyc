@@ -23,6 +23,7 @@ class Config:
     einops: bool = True
     timeout: float = 60.0
     extra_paths: tuple[str, ...] = field(default_factory=tuple)
+    allow_effects: bool = False
 
     @property
     def interpreter(self) -> str:
@@ -52,6 +53,7 @@ class Overrides:
     ignore: frozenset[str] = frozenset()
     severity: Severity | None = None
     timeout: float | None = None
+    allow_effects: bool | None = None
 
     def apply(self, config: Config) -> Config:
         if self.python is not None:
@@ -64,6 +66,8 @@ class Overrides:
             config.severity = self.severity
         if self.timeout is not None:
             config.timeout = self.timeout
+        if self.allow_effects is not None:
+            config.allow_effects = self.allow_effects
         return config
 
 
@@ -130,5 +134,6 @@ def load(start: Path | str = ".") -> Config:
     read("einops", "einops", bool)
     read("timeout", "timeout", lambda v: _positive(float(v)))
     read("extra-paths", "extra_paths", lambda v: tuple(_strings(v)))
+    read("allow-effects", "allow_effects", bool)
 
     return config
