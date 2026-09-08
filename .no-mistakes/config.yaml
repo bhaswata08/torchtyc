@@ -1,0 +1,11 @@
+# no-mistakes repository configuration.
+#
+# Without these, the test and lint steps hand control to the pipeline agent and
+# let it work out how to run the suite, which makes each run non-deterministic
+# and lets the agent improvise shell commands. Naming the commands here keeps
+# the pipeline running exactly what CI runs.
+
+commands:
+  test: uv run pytest -q -p no:cacheprovider
+  lint: uv run ruff check src tests bench
+  format: uv run ruff format src tests bench
