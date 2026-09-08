@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -231,11 +235,144 @@ def _lint_target(
     return out
 
 
+class WorkerCancelled(Exception):
+    """The worker was stopped because nobody wants its result anymore.
+
+    The language server raises this through run_worker when a newer trace
+    supersedes the run, or the file closes underneath it. It says nothing
+    about the checked code, so it never becomes a diagnostic. The stale run
+    just ends and publishes nothing.
+    """
+
+
+# How often a running worker checks whether it is still wanted. Short enough
+# that a superseded trace dies before the user notices, long enough that the
+# wait costs nothing next to a torch import.
+_WORKER_POLL_SECONDS = 0.05
+# How long a terminate request gets before it becomes a kill. A worker in the
+# middle of importing torch can take a moment to unwind.
+_WORKER_TERMINATE_GRACE_SECONDS = 2.0
+
+
+def terminate_worker(proc: subprocess.Popen[str]) -> None:
+    """Send SIGTERM to the worker's process group and return at once.
+
+    This is the event-loop side of stopping a worker: it never blocks and
+    never raises, so a keystroke is never held up by a dying child. The
+    worker thread follows up with a grace period, a kill, and the wait that
+    reaps the child (see _finish). A missing process just means the child
+    already exited.
+    """
+    try:
+        if os.name == "posix" and proc.pid is not None:
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
+def _kill_worker(proc: subprocess.Popen[str]) -> None:
+    """Send SIGKILL to the worker's process group and return at once."""
+    try:
+        if os.name == "posix" and proc.pid is not None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _finish(proc: subprocess.Popen[str]) -> None:
+    """Stop a worker the caller no longer wants, leaving no zombie behind.
+
+    Runs on the worker thread, which may block: terminate first so a
+    cooperative worker exits cleanly, kill after a short grace so a stuck one
+    still dies, then wait so the child is reaped either way.
+    """
+    try:
+        terminate_worker(proc)
+        try:
+            proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError:
+            return
+        _kill_worker(proc)
+        try:
+            proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    finally:
+        for name in ("stdin", "stdout", "stderr"):
+            pipe = getattr(proc, name, None)
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+
+def _communicate(
+    proc: subprocess.Popen[str],
+    payload: str,
+    timeout: float | None,
+    cancel: threading.Event | None,
+) -> tuple[str | None, str | None]:
+    """Collect the worker's output, stopping early when asked.
+
+    Returns the two pipes, or (None, None) when the timeout runs out first.
+    Raises WorkerCancelled when `cancel` is set, discarding whatever the
+    child wrote: a kill mid-write leaves half a JSON document on the pipe,
+    and parsing that would report a result that never happened.
+
+    The payload goes in on the first wait only. Retrying the wait after a
+    timeout keeps what the child wrote so far, so later waits pass no input.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    pending: str | None = payload
+    while True:
+        if cancel is not None and cancel.is_set():
+            _finish(proc)
+            raise WorkerCancelled()
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            _finish(proc)
+            return None, None
+        quantum = (
+            _WORKER_POLL_SECONDS if remaining is None else min(_WORKER_POLL_SECONDS, remaining)
+        )
+        try:
+            if pending is not None:
+                stdout, stderr = proc.communicate(input=pending, timeout=quantum)
+            else:
+                stdout, stderr = proc.communicate(timeout=quantum)
+        except subprocess.TimeoutExpired:
+            pending = None
+            continue
+        if cancel is not None and cancel.is_set():
+            # Stopped from another thread while the wait returned. The output
+            # ends wherever the kill landed, so it is not a result either.
+            _finish(proc)
+            raise WorkerCancelled()
+        return stdout, stderr
+
+
 def run_worker(
     paths: list[str],
     config: Config,
     sources: dict[str, str] | None = None,
     hover: bool = False,
+    *,
+    cancel: threading.Event | None = None,
+    on_proc: Callable[[subprocess.Popen[str]], None] | None = None,
 ) -> tuple[list[Diagnostic], dict[str, dict[str, dict[str, str]]], str | None]:
     """Trace the files in a subprocess and bring back what it found.
 
@@ -244,6 +381,12 @@ def run_worker(
     directory there. Paths go over as absolute and come back mapped to the
     strings the caller passed, since those are what the rest of the report is
     keyed by.
+
+    `cancel` lets the language server stop a worker a newer trace no longer
+    needs. The plain check never passes it, so it runs exactly as before,
+    including the timeout. `on_proc` receives the child right after it
+    spawns, so the server can also stop it directly while the worker thread
+    is still starting up.
     """
     absolute = {str(Path(p).resolve()): p for p in paths}
     job = {
@@ -251,6 +394,7 @@ def run_worker(
         "variadic_rank": config.variadic_rank,
         "sources": {str(Path(p).resolve()): text for p, text in (sources or {}).items()},
         "hover": hover,
+        "allow_effects": config.allow_effects,
     }
 
     env = dict(os.environ)
@@ -261,28 +405,34 @@ def run_worker(
     env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             [config.interpreter, "-c", _BOOTSTRAP, str(_PACKAGE_ROOT)],
-            input=json.dumps(job),
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=config.timeout,
             cwd=str(config.root),
             env=env,
+            # The worker imports project code, which can spawn children of its
+            # own. Its own group means stopping it stops those too.
+            start_new_session=(os.name == "posix"),
         )
-    except subprocess.TimeoutExpired:
-        return [], {}, f"the trace timed out after {config.timeout:g}s"
     except OSError as exc:
         return [], {}, f"could not start {config.interpreter}: {exc}"
+    if on_proc is not None:
+        on_proc(proc)
 
-    if not completed.stdout.strip():
-        detail = completed.stderr.strip().splitlines()
-        tail = detail[-1] if detail else f"exit code {completed.returncode}"
+    stdout, stderr = _communicate(proc, json.dumps(job), config.timeout, cancel)
+    if stdout is None:
+        return [], {}, f"the trace timed out after {config.timeout:g}s"
+
+    if not stdout.strip():
+        detail = (stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else f"exit code {proc.returncode}"
         return [], {}, f"the worker produced no output ({tail})"
 
     try:
-        result = json.loads(completed.stdout)
+        result = json.loads(stdout)
     except json.JSONDecodeError:
         return [], {}, "the worker produced output that was not JSON"
 
@@ -319,7 +469,13 @@ def apply_suppressions(
 
 
 def check_paths(
-    paths: list[str], config: Config, sources: dict[str, str] | None = None, hover: bool = False
+    paths: list[str],
+    config: Config,
+    sources: dict[str, str] | None = None,
+    hover: bool = False,
+    *,
+    cancel: threading.Event | None = None,
+    on_proc: Callable[[subprocess.Popen[str]], None] | None = None,
 ) -> Report:
     report = Report()
     sources = sources or {}
@@ -356,7 +512,9 @@ def check_paths(
             traceable.append(path)
 
     if traceable:
-        traced, hovers, error = run_worker(traceable, config, sources, hover)
+        traced, hovers, error = run_worker(
+            traceable, config, sources, hover, cancel=cancel, on_proc=on_proc
+        )
         report.diagnostics.extend(traced)
         report.hovers = hovers
         report.worker_error = error

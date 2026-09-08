@@ -6,7 +6,7 @@ from lsprotocol import types as lsp
 
 from torchtyc.config import Overrides
 from torchtyc.diagnostics import Diagnostic, Severity
-from torchtyc.lsp import TorchtycServer, _target_at, path_to_uri, to_lsp, uri_to_path
+from torchtyc.lsp import TorchtycServer, _target_at, did_close, path_to_uri, to_lsp, uri_to_path
 
 
 def test_uri_roundtrip(tmp_path):
@@ -417,7 +417,7 @@ def test_only_one_trace_runs_at_a_time_per_file():
     peak = 0
     traced = 0
 
-    async def fake_trace_once(uri: str) -> None:
+    async def fake_trace_once(uri: str, generation: int | None = None) -> None:
         nonlocal running, peak, traced
         running += 1
         peak = max(peak, running)
@@ -436,3 +436,495 @@ def test_only_one_trace_runs_at_a_time_per_file():
     # The first runs, the last wins, and the three superseded in between are
     # skipped instead of each starting a worker.
     assert traced == 2
+
+
+def close_params(uri: str) -> lsp.DidCloseTextDocumentParams:
+    return lsp.DidCloseTextDocumentParams(text_document=lsp.TextDocumentIdentifier(uri=uri))
+
+
+def test_close_drops_per_file_trace_state():
+    """Closing a file releases its lock and generation, not just its report.
+
+    `did_close` used to pop only pending, reports and scans, so each distinct
+    URI ever opened left a lock and an int behind for the life of the server.
+    """
+    import asyncio
+
+    server = TorchtycServer()
+    server.publish = lambda _uri, _diagnostics: None
+
+    async def fake_trace_once(uri: str, generation: int | None = None) -> None:
+        return None
+
+    server._trace_once = fake_trace_once
+
+    async def drive() -> None:
+        for i in range(5):
+            await server.trace_now(f"file:///{i}.py")
+
+    asyncio.run(drive())
+    assert len(server.tracing) == 5
+    assert len(server.wanted) == 5
+
+    for i in range(5):
+        did_close(server, close_params(f"file:///{i}.py"))
+
+    assert server.tracing == {}
+    assert server.wanted == {}
+    assert server.reports == {}
+    assert server.scans == {}
+    assert server.pending == {}
+
+
+def test_close_mid_trace_publishes_nothing_afterwards(monkeypatch):
+    """A worker that finishes after close must not revive the file's state.
+
+    Cancelling the debounce task does not stop a worker already running in
+    its thread, so the trace has to notice the close when it finishes and
+    drop its result instead of storing a report and publishing diagnostics.
+    """
+    import asyncio
+    import threading
+
+    from torchtyc import lsp as lsp_module
+    from torchtyc.engine import Report
+
+    server = TorchtycServer()
+    published: list = []
+    server.publish = lambda uri, diagnostics: published.append((uri, diagnostics))
+    server.source_of = lambda _uri: "x = 1\n"
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_check(paths, config, sources=None, hover=False, **kwargs):
+        entered.set()
+        assert release.wait(timeout=10)
+        return Report()
+
+    monkeypatch.setattr(lsp_module, "check_paths", slow_check)
+
+    uri = "file:///a.py"
+
+    async def drive() -> None:
+        task = asyncio.create_task(server.trace_now(uri))
+        assert await asyncio.to_thread(entered.wait, 10)
+        did_close(server, close_params(uri))
+        assert uri not in server.tracing
+        assert uri not in server.wanted
+        # The close itself clears the editor. Nothing may follow it.
+        assert published[-1] == (uri, [])
+        seen = len(published)
+        release.set()
+        await task
+        assert len(published) == seen
+        assert uri not in server.reports
+
+    asyncio.run(drive())
+
+
+def test_stale_worker_does_not_overwrite_a_fresh_trace_after_reopen(monkeypatch):
+    """A close must not let the old worker masquerade as the new trace.
+
+    Generations restart from zero per file, so without a server-wide counter
+    the reopened file would get the same number the stale worker holds and
+    the stale result, finishing last, would overwrite the fresh one.
+    """
+    import asyncio
+    import threading
+
+    from torchtyc import lsp as lsp_module
+    from torchtyc.engine import Report
+
+    server = TorchtycServer()
+    published: list = []
+    server.publish = lambda uri, diagnostics: published.append((uri, list(diagnostics)))
+    server.source_of = lambda _uri: "x = 1\n"
+
+    entered = threading.Event()
+    release_stale = threading.Event()
+    calls = 0
+
+    def flaky_check(paths, config, sources=None, hover=False, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release_stale.wait(timeout=10)
+            return Report(
+                diagnostics=[Diagnostic(path=paths[0], line=9, column=0, rule="r", message="stale")]
+            )
+        return Report(
+            diagnostics=[Diagnostic(path=paths[0], line=1, column=0, rule="r", message="fresh")]
+        )
+
+    monkeypatch.setattr(lsp_module, "check_paths", flaky_check)
+
+    uri = "file:///a.py"
+
+    async def drive() -> None:
+        stale = asyncio.create_task(server.trace_now(uri))
+        assert await asyncio.to_thread(entered.wait, 10)
+        did_close(server, close_params(uri))
+        await server.trace_now(uri)
+        assert server.reports[uri].diagnostics[0].message == "fresh"
+        release_stale.set()
+        await stale
+        assert server.reports[uri].diagnostics[0].message == "fresh"
+        assert [d.message for d in published[-1][1]] == ["fresh"]
+
+    asyncio.run(drive())
+
+
+def test_reopen_traces_again_after_close():
+    """Closing a file must not break tracing it again afterwards."""
+    import asyncio
+
+    server = TorchtycServer()
+    server.publish = lambda _uri, _diagnostics: None
+
+    runs = 0
+
+    async def fake_trace_once(uri: str, generation: int | None = None) -> None:
+        nonlocal runs
+        runs += 1
+
+    server._trace_once = fake_trace_once
+
+    uri = "file:///a.py"
+
+    async def drive() -> None:
+        await server.trace_now(uri)
+
+    asyncio.run(drive())
+    assert runs == 1
+    did_close(server, close_params(uri))
+    assert uri not in server.tracing
+    assert uri not in server.wanted
+    asyncio.run(drive())
+    assert runs == 2
+    assert uri in server.tracing
+    assert uri in server.wanted
+
+
+def cancelling_check_factory(entered, fresh):
+    """A stand-in worker that blocks like a torch import but honours cancel.
+
+    It behaves the way engine.run_worker does with a cancel flag: the first
+    call blocks until the flag is set, then raises instead of returning a
+    result. Later calls finish at once with the `fresh` report.
+    """
+    import threading
+
+    from torchtyc.engine import WorkerCancelled
+
+    calls = 0
+    lock = threading.Lock()
+
+    def check(paths, config, sources=None, hover=False, **kwargs):
+        nonlocal calls
+        with lock:
+            calls += 1
+            first = calls == 1
+        cancel = kwargs.get("cancel")
+        if first:
+            entered.set()
+            assert cancel is not None
+            assert cancel.wait(timeout=10)
+            raise WorkerCancelled()
+        return fresh()
+
+    return check
+
+
+def test_superseded_trace_stops_its_worker(monkeypatch):
+    """A newer trace kills the running worker instead of waiting behind it.
+
+    The per-file lock alone only serializes traces: the stale run would still
+    import torch to completion while the new trace waits, then spawn a second
+    import. Here the first run must die as soon as the second is asked for,
+    publish nothing, and leave the final result to the second.
+    """
+    import asyncio
+    import threading
+    import time
+
+    from torchtyc import lsp as lsp_module
+    from torchtyc.engine import Report
+
+    server = TorchtycServer()
+    published: list = []
+    server.publish = lambda uri, diagnostics: published.append((uri, list(diagnostics)))
+    server.source_of = lambda _uri: "x = 1\n"
+
+    entered = threading.Event()
+    fresh = Report(
+        diagnostics=[Diagnostic(path="a.py", line=1, column=0, rule="r", message="fresh")]
+    )
+    monkeypatch.setattr(lsp_module, "check_paths", cancelling_check_factory(entered, lambda: fresh))
+
+    uri = "file:///a.py"
+
+    async def drive() -> None:
+        stale = asyncio.create_task(server.trace_now(uri))
+        assert await asyncio.to_thread(entered.wait, 10)
+        started = time.monotonic()
+        # The stale run never finishes on its own. If the new trace does not
+        # stop it, this waits out the whole block below.
+        await asyncio.wait_for(server.trace_now(uri), timeout=10)
+        await stale
+        return time.monotonic() - started
+
+    elapsed = asyncio.run(drive())
+    assert elapsed < 10
+    assert server.reports[uri] is fresh
+    assert [d.message for d in published[-1][1]] == ["fresh"]
+    assert all(messages != ["stale"] for _, messages in published)
+
+
+def test_save_mid_trace_does_not_stack_workers(monkeypatch):
+    """Saving mid-trace is the guaranteed overlap: delay=0 skips the debounce.
+
+    The save cancels the task awaiting the running worker. That cancel used
+    to free the lock while the orphaned worker ran on, so the new trace
+    spawned a second torch import beside it. Now the orphan dies first, so
+    only one worker runs at a time and the save's trace still publishes.
+    """
+    import asyncio
+    import threading
+
+    from torchtyc import lsp as lsp_module
+    from torchtyc.engine import Report
+
+    server = TorchtycServer()
+    published: list = []
+    server.publish = lambda uri, diagnostics: published.append((uri, list(diagnostics)))
+    server.source_of = lambda _uri: "x = 1\n"
+
+    entered = threading.Event()
+    lock = threading.Lock()
+    saw_cancel: list = []
+    events: list = []
+
+    def check(paths, config, sources=None, hover=False, **kwargs):
+        from torchtyc.engine import WorkerCancelled
+
+        with lock:
+            first = not entered.is_set()
+            events.append(("start", "stale" if first else "fresh"))
+        if not first:
+            with lock:
+                events.append(("complete", "fresh"))
+            return Report(
+                diagnostics=[Diagnostic(path=paths[0], line=1, column=0, rule="r", message="saved")]
+            )
+        entered.set()
+        saw_cancel.append(kwargs["cancel"].wait(timeout=10))
+        with lock:
+            events.append(("stop", "stale"))
+        raise WorkerCancelled()
+
+    monkeypatch.setattr(lsp_module, "check_paths", check)
+
+    uri = "file:///a.py"
+
+    async def drive() -> None:
+        await server.trace_soon(uri, delay=0.0)
+        assert await asyncio.to_thread(entered.wait, 10)
+        first = server.pending[uri]
+        # What did_save does: no debounce, straight to a new trace.
+        await server.trace_soon(uri, delay=0.0)
+        second = server.pending[uri]
+        await asyncio.gather(first, second, return_exceptions=True)
+
+    asyncio.run(drive())
+    assert saw_cancel == [True]
+    # The stale run died instead of running to term, and only the save's
+    # trace ran to completion and published.
+    assert ("stop", "stale") in events
+    assert ("complete", "stale") not in events
+    assert ("complete", "fresh") in events
+    assert server.reports[uri] is not None
+    assert [d.message for d in published[-1][1]] == ["saved"]
+
+
+def test_close_stops_the_running_worker(monkeypatch):
+    """Closing mid-trace kills the worker, not just its result.
+
+    Dropping the result keeps a stale publish away, but the orphaned worker
+    would still run to completion or the timeout. The close must stop it.
+    """
+    import asyncio
+    import threading
+    import time
+
+    from torchtyc import lsp as lsp_module
+
+    server = TorchtycServer()
+    published: list = []
+    server.publish = lambda uri, diagnostics: published.append((uri, diagnostics))
+    server.source_of = lambda _uri: "x = 1\n"
+
+    entered = threading.Event()
+    stopped = threading.Event()
+
+    def check(paths, config, sources=None, hover=False, **kwargs):
+        from torchtyc.engine import WorkerCancelled
+
+        entered.set()
+        assert kwargs["cancel"].wait(timeout=10)
+        stopped.set()
+        raise WorkerCancelled()
+
+    monkeypatch.setattr(lsp_module, "check_paths", check)
+
+    uri = "file:///a.py"
+
+    async def drive() -> None:
+        task = asyncio.create_task(server.trace_now(uri))
+        assert await asyncio.to_thread(entered.wait, 10)
+        started = time.monotonic()
+        did_close(server, close_params(uri))
+        await asyncio.wait_for(task, timeout=10)
+        return time.monotonic() - started
+
+    elapsed = asyncio.run(drive())
+    assert elapsed < 10
+    assert stopped.is_set()
+    assert uri not in server.reports
+    assert uri not in server.workers
+    # The close itself clears the editor. Nothing may follow it.
+    assert published == [(uri, [])]
+
+
+def test_concurrent_traces_are_bounded_across_files(monkeypatch):
+    """Each file has its own lock, so without a cap N open files run N workers.
+
+    A config change rechecks every open file at once. The server-wide slots
+    bound that fan-out while letting a few files recheck together.
+    """
+    import asyncio
+    import threading
+    import time
+
+    from torchtyc import lsp as lsp_module
+    from torchtyc.engine import Report
+    from torchtyc.lsp import MAX_CONCURRENT_WORKERS
+
+    server = TorchtycServer()
+    server.publish = lambda _uri, _diagnostics: None
+    server.source_of = lambda _uri: "x = 1\n"
+
+    running = 0
+    peak = 0
+    entered = 0
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def check(paths, config, sources=None, hover=False, **kwargs):
+        nonlocal running, peak, entered
+        with lock:
+            running += 1
+            peak = max(peak, running)
+            entered += 1
+        try:
+            assert release.wait(timeout=10)
+            return Report()
+        finally:
+            with lock:
+                running -= 1
+
+    monkeypatch.setattr(lsp_module, "check_paths", check)
+
+    uris = [f"file:///{i}.py" for i in range(MAX_CONCURRENT_WORKERS + 2)]
+
+    async def drive() -> None:
+        tasks = [asyncio.create_task(server.trace_now(uri)) for uri in uris]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with lock:
+                if entered >= MAX_CONCURRENT_WORKERS:
+                    break
+            await asyncio.sleep(0.01)
+        # Let any extra worker start if the cap is broken.
+        await asyncio.sleep(0.3)
+        with lock:
+            assert entered == MAX_CONCURRENT_WORKERS
+            assert peak == MAX_CONCURRENT_WORKERS
+        release.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(drive())
+
+
+def test_cancelled_run_worker_terminates_and_discards_output(monkeypatch):
+    """A stopped worker's half-written stdout is never parsed as a result.
+
+    Killing a child mid-write leaves half a JSON document on the pipe. The
+    run must raise instead of parsing it, and the child must be reaped.
+    """
+    import threading
+
+    from torchtyc import engine as engine_module
+    from torchtyc.config import Config
+    from torchtyc.engine import WorkerCancelled, run_worker
+
+    calls: list = []
+
+    class FakeProc:
+        pid = None
+
+        def communicate(self, input=None, timeout=None):
+            calls.append("communicate")
+            raise AssertionError("a cancelled run must not read the pipes")
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def kill(self):
+            calls.append("kill")
+
+        def wait(self, timeout=None):
+            calls.append("wait")
+            return 0
+
+    spawned: list = []
+
+    def fake_popen(*args, **kwargs):
+        proc = FakeProc()
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(engine_module.subprocess, "Popen", fake_popen)
+
+    cancel = threading.Event()
+    cancel.set()
+    config = Config(root="/tmp", python="/nonexistent/python")
+    with pytest.raises(WorkerCancelled):
+        run_worker(["a.py"], config, cancel=cancel)
+    assert spawned != []
+    assert "terminate" in calls
+    assert "wait" in calls
+    assert "communicate" not in calls
+
+
+def test_worker_timeout_reports_as_before(monkeypatch, tmp_path):
+    """The plain path keeps its timeout message and reaps the child.
+
+    run_worker is shared with the CLI, which never cancels. A slow worker
+    must still report the same message and leave no process behind.
+    """
+    import sys
+
+    from torchtyc import engine as engine_module
+    from torchtyc.config import Config
+    from torchtyc.engine import run_worker
+
+    monkeypatch.setattr(engine_module, "_BOOTSTRAP", "import time; time.sleep(30)")
+    config = Config(root=tmp_path, python=sys.executable)
+    config.timeout = 0.5
+    procs: list = []
+    _, _, error = run_worker([str(tmp_path / "model.py")], config, on_proc=procs.append)
+    assert error == "the trace timed out after 0.5s"
+    assert len(procs) == 1
+    assert procs[0].poll() is not None

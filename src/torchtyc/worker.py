@@ -27,6 +27,7 @@ import torch
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import Attribute, ClassInfo, Position, Target, scan_source
+from .effects import active_guard, unwrap_blocked
 from .tracing import (
     NotLive,
     TraceFailed,
@@ -34,6 +35,7 @@ from .tracing import (
     TraceSkipped,
     check_return,
     describe,
+    explain_derived_sizes,
     instantiate,
     live_init,
     resolve_qualname,
@@ -290,12 +292,45 @@ def _severity(rule: str) -> Severity:
     return entry.severity if entry else Severity.ERROR
 
 
+def _blocked_diagnostic(
+    exc: BaseException,
+    path: str,
+    fallback: Position,
+    binder: DimBinder,
+    rule: str,
+    function: str | None = None,
+    others: list[tuple[int, int, str]] | None = None,
+) -> Diagnostic | None:
+    blocked = unwrap_blocked(exc)
+    if blocked is None:
+        return None
+    position, _, _ = _anchor(exc, path, fallback, binder, others)
+    culprit_msg = str(blocked)
+    if blocked.culprit is not None and Path(blocked.culprit[0]).resolve() != Path(path).resolve():
+        culprit_file = Path(blocked.culprit[0]).name
+        culprit_msg = f"{blocked} (in {culprit_file} at line {blocked.culprit[1]})"
+    return Diagnostic(
+        path=path,
+        line=position.line,
+        column=position.column,
+        end_line=position.end_line,
+        end_column=position.end_column,
+        rule=rule,
+        severity=_severity(rule),
+        message=f"BlockedEffect: {culprit_msg}",
+        function=function,
+        traceback=None,
+    )
+
+
 def check_target(
     module: Any,
     target: Target,
     path: str,
     variadic_rank: int,
     siblings: list[Target] | None = None,
+    *,
+    allow_effects: bool = False,
 ) -> tuple[list[Diagnostic], TraceResult | None]:
     """Trace one target once, returning its diagnostics and the trace itself.
 
@@ -306,10 +341,22 @@ def check_target(
     anchor = target.returns_position or target.position
 
     try:
-        result = trace(module, target, variadic_rank)
+        with active_guard(enabled=not allow_effects, phase="trace"):
+            result = trace(module, target, variadic_rank)
     except NotLive:
         return [], None
     except TraceFailed as exc:
+        diag = _blocked_diagnostic(
+            exc.error,
+            path,
+            target.position,
+            exc.binder,
+            rule="trace-error",
+            function=target.qualname,
+            others=_body_spans(siblings or [], target),
+        )
+        if diag is not None:
+            return [diag], None
         position, text, hint = _anchor(
             exc.error, path, target.position, exc.binder, _body_spans(siblings or [], target)
         )
@@ -346,7 +393,19 @@ def check_target(
             )
         ], None
 
-    for problem in check_return(target.returns, result.returned, result.binder):
+    problems = check_return(target.returns, result.returned, result.binder)
+    if problems and result.built is not None:
+        # A mismatch against a width the model worked out for itself reads as a
+        # bare number, and that number only exists at the width torchtyc traced
+        # with. Working out what it follows costs a handful of constructions,
+        # so it waits until there is something to report, and then the check
+        # runs again to write the messages with the names in. Every name is
+        # already bound by now, so the second run compares the same sizes and
+        # reaches the same verdict.
+        explain_derived_sizes(result.binder, result.built)
+        problems = check_return(target.returns, result.returned, result.binder)
+
+    for problem in problems:
         out.append(
             Diagnostic(
                 path=path,
@@ -361,6 +420,7 @@ def check_target(
                 expected=problem.get("expected"),
                 got=problem.get("got"),
                 hint=problem.get("hint") or None,
+                note=_derived_note(problem["message"], problem.get("got")),
                 suggestion=problem.get("suggestion"),
             )
         )
@@ -369,24 +429,30 @@ def check_target(
 
 
 def check_attributes(
-    module: Any, info: ClassInfo, path: str, variadic_rank: int
+    module: Any,
+    info: ClassInfo,
+    path: str,
+    variadic_rank: int,
+    *,
+    allow_effects: bool = False,
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
     binder = DimBinder(variadic_rank=variadic_rank)
     attributes: list[Attribute] = []
 
     try:
-        cls = resolve_qualname(
-            module,
-            info.qualname,
-            conditional=info.conditional,
-            span=(info.def_line, info.end_line),
-        )
-        # The annotations to check are the ones the live constructor wrote, so
-        # a guarded `__init__` that this import skipped reports nothing.
-        chosen = live_init(info, cls, module)
-        attributes = chosen.attributes if chosen is not None else []
-        instance = instantiate(info, cls, binder, info.dim_names, module)
+        with active_guard(enabled=not allow_effects, phase="trace"):
+            cls = resolve_qualname(
+                module,
+                info.qualname,
+                conditional=info.conditional,
+                span=(info.def_line, info.end_line),
+            )
+            # The annotations to check are the ones the live constructor wrote, so
+            # a guarded `__init__` that this import skipped reports nothing.
+            chosen = live_init(info, cls, module)
+            attributes = chosen.attributes if chosen is not None else []
+            instance = instantiate(info, cls, binder, info.dim_names, module, init=chosen)
     except NotLive:
         return []
     except TraceSkipped as exc:
@@ -405,6 +471,16 @@ def check_attributes(
             )
         ]
     except Exception as exc:  # noqa: BLE001
+        diag = _blocked_diagnostic(
+            exc,
+            path,
+            info.position,
+            binder,
+            rule="trace-error",
+            function=info.qualname,
+        )
+        if diag is not None:
+            return [diag]
         position, text, _ = _anchor(exc, path, info.position, binder)
         return [
             Diagnostic(
@@ -470,6 +546,7 @@ def _is_local(qualname: str) -> bool:
 def run_job(job: dict[str, Any]) -> dict[str, Any]:
     variadic_rank = job.get("variadic_rank", 2)
     want_hover = job.get("hover", False)
+    allow_effects = job.get("allow_effects", False)
     diagnostics: list[dict[str, Any]] = []
     # path -> qualname -> shapes. Two files in one job can define the same
     # qualname, so the path has to be part of the key.
@@ -499,11 +576,15 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
             continue
 
         try:
-            module = import_from_path(Path(path), buffer)
+            with active_guard(enabled=not allow_effects, phase="import"):
+                module = import_from_path(Path(path), buffer)
         except Exception as exc:  # noqa: BLE001
-            position, text, _ = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
-            diagnostics.append(
-                Diagnostic(
+            diag = _blocked_diagnostic(
+                exc, path, Position(0, 0, 0, 1), DimBinder(), rule="import-error"
+            )
+            if diag is None:
+                position, text, _ = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
+                diag = Diagnostic(
                     path=path,
                     line=position.line,
                     column=position.column,
@@ -513,22 +594,27 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
                     severity=Severity.ERROR,
                     message=f"{type(exc).__name__}: {exc}",
                     traceback=text,
-                ).to_json()
-            )
+                )
+            diagnostics.append(diag.to_json())
             continue
 
-        for info in classes:
-            for diagnostic in check_attributes(module, info, path, variadic_rank):
-                diagnostics.append(diagnostic.to_json())
+        with active_guard(enabled=not allow_effects, phase="trace"):
+            for info in classes:
+                for diagnostic in check_attributes(
+                    module, info, path, variadic_rank, allow_effects=allow_effects
+                ):
+                    diagnostics.append(diagnostic.to_json())
 
-        for target in targets:
-            found, result = check_target(module, target, path, variadic_rank, targets)
-            for diagnostic in found:
-                diagnostics.append(diagnostic.to_json())
-            if want_hover:
-                hovers.setdefault(path, {})[target.qualname] = (
-                    shapes_for_hover(result) if result is not None else {}
+            for target in targets:
+                found, result = check_target(
+                    module, target, path, variadic_rank, targets, allow_effects=allow_effects
                 )
+                for diagnostic in found:
+                    diagnostics.append(diagnostic.to_json())
+                if want_hover:
+                    hovers.setdefault(path, {})[target.qualname] = (
+                        shapes_for_hover(result) if result is not None else {}
+                    )
 
     return {"diagnostics": diagnostics, "hovers": hovers}
 

@@ -15,6 +15,7 @@ the tracer runs on meta tensors.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 
@@ -38,6 +39,33 @@ def _primes_from(start: int, count: int) -> list[int]:
 
 
 _PRIME_POOL = _primes_from(FIRST_PRIME, 512)
+
+
+@functools.cache
+def coprime_pool(scale: int) -> list[int]:
+    """Sizes that are all multiples of `scale` and still factor apart.
+
+    A trace normally hands each name a prime, which keeps distinct names
+    distinct and lets a flattened axis be read back as the product it is. What
+    a prime cannot do is divide, so a model that splits a width - `head_dim =
+    d_model // n_heads` - gets a quotient that does not multiply back. Scaling
+    every size by one shared factor repairs the split and keeps both
+    properties: the primes are picked coprime to the factor, so a product of
+    sizes still factors back into exactly the sizes that went into it.
+
+    Small primes are used here rather than the pool above, because each size is
+    multiplied by the factor and several sizes multiply together again into a
+    tensor's element count, which has to stay inside int64.
+    """
+    if scale <= 1:
+        return _PRIME_POOL
+    found: list[int] = []
+    candidate = 2
+    while len(found) < len(_PRIME_POOL):
+        if all(candidate % p for p in range(2, int(candidate**0.5) + 1)) and scale % candidate:
+            found.append(candidate * scale)
+        candidate += 1
+    return found
 
 
 def distant_prime(index: int) -> int:
@@ -94,6 +122,16 @@ class DimBinder:
     """The name-to-size table for one function under trace."""
 
     variadic_rank: int = DEFAULT_VARIADIC_RANK
+    # A factor every size this binder issues is a multiple of. One means plain
+    # primes, which is what an ordinary trace runs with. A second trace raises
+    # it so that a width the model splits divides evenly. See `coprime_pool`.
+    scale: int = 1
+    # Take a constructor parameter's written default even when its name is one
+    # of the annotated dimensions, rather than binding the name to a size of
+    # this binder's own. Also only ever set on a second trace: `n_heads: int =
+    # 8` names an axis and states a width in the same breath, and the width is
+    # the half that has to hold for `d_model // n_heads` to come out whole.
+    defaults_first: bool = False
     sizes: dict[str, int] = field(default_factory=dict)
     variadics: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # Sizes standing in for an unnamed `...`. They have no name the user wrote,
@@ -107,13 +145,19 @@ class DimBinder:
     # width written in the code lands as `()`. Filled in by a second probe, and
     # only on the failure path, where a size is about to be shown to someone.
     derived: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    # Fixed sizes written in annotations, such as the 3 in "b 3 h w". A traced
+    # size that renders as its own digits is either such a literal, which is
+    # written as itself and so is fit to suggest, or a size with no name, which
+    # is not. Recording the literals tells the two apart.
+    literals: set[int] = field(default_factory=set)
     _next: int = 0
     _anonymous_variadic: tuple[int, ...] | None = None
 
     def fresh(self) -> int:
-        if self._next >= len(_PRIME_POOL):
+        pool = coprime_pool(self.scale)
+        if self._next >= len(pool):
             raise BindingError("ran out of distinct dimension primes")
-        value = _PRIME_POOL[self._next]
+        value = pool[self._next]
         self._next += 1
         return value
 
@@ -204,10 +248,36 @@ class DimBinder:
             if value > 1:
                 by_value.setdefault(value, "_")
 
+        # Binding order, not size order. A flatten of "b s" must read "b*s":
+        # the hint names an axis order, so reversing it points at the wrong
+        # outer axis. Fresh values come from a pool that grows monotonically,
+        # so pool index is binding order and interleaves named, variadic and
+        # anonymous axes issued between each other. Values bound directly to
+        # traced sizes, such as return-only names, never come from the pool;
+        # they were bound after, in sizes insertion order. Under a scale above
+        # 1 each size is the scale times a prime coprime to it, the pool still
+        # grows monotonically, and a true product still factors whichever order
+        # is tried, so the same ordering holds there.
+        pool = coprime_pool(self.scale)
+        pool_index = {value: pos for pos, value in enumerate(pool)}
+        size_pos = {name: pos for pos, name in enumerate(self.sizes)}
+        variadic_pos = {name: pos for pos, name in enumerate(self.variadics)}
+
+        def _key(item: tuple[int, str]) -> tuple[int, int]:
+            value, name = item
+            if value in pool_index:
+                return (0, pool_index[value])
+            if name in size_pos:
+                return (1, size_pos[name])
+            base = name.split("[")[0] if "[" in name else name
+            if base in variadic_pos:
+                return (1, len(size_pos) + variadic_pos[base])
+            return (1, len(pool) + value)
+
         names: list[str] = []
         found = 0
         remaining = size
-        for value, name in sorted(by_value.items(), reverse=True):
+        for value, name in sorted(by_value.items(), key=_key):
             while remaining % value == 0 and remaining > 1:
                 found += 1
                 # Two anonymous axes flattened together are still one unnamed
@@ -288,13 +358,19 @@ class DimBinder:
                     continue
                 parts.append("...")
                 continue
-            # A product, an axis with no name, or a bare size is not something
-            # to paste back over an annotation.
+            # A product, a variadic index, an anonymous axis, or a size with no
+            # name is not something to paste back. A fixed literal renders as
+            # its own digits too, but it is written as itself, so it is fit to
+            # suggest. is_flattened above already declines a true product, so
+            # what renders as digits here is either a recorded literal or an
+            # unbound size: a prime never bound, a derived width not yet
+            # explained, or a partial product with a literal such as 303 from
+            # 101 * 3. Only the first is pasteable.
             if (
                 "*" in rendered
                 or "[" in rendered
                 or rendered == "_"
-                or rendered == str(size)
+                or (rendered == str(size) and size not in self.literals)
                 or is_derived_name(rendered)
             ):
                 return None
@@ -319,6 +395,10 @@ def _split_variadic(spec: ArraySpec) -> tuple[list[Dim], Dim | None, list[Dim]]:
 def _size_of(dim: Dim, binder: DimBinder) -> int:
     if dim.kind == "fixed":
         assert dim.size is not None
+        # Remember the literal so suggest_dims can tell it apart from an
+        # unbound size. Both render as their own digits, but only the literal
+        # is written as itself and so is fit to paste back.
+        binder.literals.add(dim.size)
         return dim.size
     if dim.kind == "anonymous":
         return binder.bind_anonymous()
@@ -455,6 +535,8 @@ def _check_dim(
         return
 
     if dim.kind == "fixed":
+        assert dim.size is not None
+        binder.literals.add(dim.size)
         if size != dim.size:
             raise BindingError(
                 f"dimension is {binder.describe(size)}, annotated {dim.size}",
@@ -505,7 +587,10 @@ def _swap_hint(name: str, size: int, binder: DimBinder) -> str:
         # already says so in the words that fit it.
         return ""
     other = binder.describe(size)
-    if other in ("_", "..."):
+    if other in ("_", "...") or is_derived_name(other):
+        # A width the model computed is not an axis the annotation could have
+        # meant instead, so there is no swap to point at. The note beside the
+        # message already says where the width came from.
         return ""
     if other != str(size) and other != name:
         return f"this dimension is `{other}`, so the annotation likely names the wrong axis"

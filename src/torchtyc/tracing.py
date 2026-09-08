@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dis
 import inspect
 import itertools
+import math
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,7 @@ import torch
 from .annotations import ArraySpec, OpaqueSpec, Spec, TupleSpec
 from .binding import BindingError, DimBinder, check_shape, distant_prime, shape_for
 from .discovery import ClassInfo, InitDef, Param, Target
+from .effects import unwrap_blocked
 
 # jaxtyping dtype name -> (dtype used to build an argument, dtypes accepted on
 # the way out). Building picks one representative; checking accepts the family.
@@ -71,11 +75,29 @@ class TraceSkipped(Exception):
 
 
 @dataclass
+class Construction:
+    """The class a trace built, kept so the same class can be built again.
+
+    Only `explain_derived_sizes` uses it, and only once something has already
+    gone wrong, so an ordinary trace fills this in and never reads it.
+    """
+
+    owner: ClassInfo | None = None
+    cls: type | None = None
+    module: Any = None
+    instance: Any = None
+
+
+@dataclass
 class TraceResult:
     binder: DimBinder
     returned: Any
     # Shapes of every annotated argument, for hover and inlay hints.
     argument_shapes: dict[str, tuple[int, ...]]
+    # The class this trace built, kept so a width the model computed can be
+    # named once something is about to be reported. None when the target is a
+    # plain function, which builds nothing.
+    built: Construction | None = None
 
 
 def build_dtype(spec: ArraySpec) -> torch.dtype:
@@ -184,6 +206,12 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
     # constructor parameter called `device` would be handed a prime whenever a
     # dimension happened to share its name.
     if param.name in dim_names and param.plain_type in (None, "int"):
+        # A second trace prefers the written default here. `n_heads: int = 8`
+        # both names an axis and says how wide it is, and only the width lets
+        # `d_model // n_heads` come out whole. The axis is still checked: the
+        # first place an annotation mentions it binds it to 8.
+        if binder.defaults_first and param.has_default:
+            raise _UseDefault()
         return binder.bind(param.name)
 
     plain = param.plain_type
@@ -227,35 +255,52 @@ class TraceFailed(Exception):
 def live_init(owner: ClassInfo, cls: type, module: Any) -> InitDef | None:
     """Which of the `__init__` definitions in the body this import produced.
 
-    A guarded constructor has to prove it ran, exactly as a guarded class or
-    method does, and that holds whether the class writes one of them or several:
-    the single `__init__` of a branch the import never took is not the
-    constructor to build with. None means no written constructor is live, so the
-    class builds the way Python would build it, through whatever it inherits.
+    Every candidate has to prove it ran, guarded or not: a class body runs in
+    order, so an unconditional `__init__` above a guarded one is dead once the
+    guard's arm reassigns the name. The last live candidate in body order wins,
+    which is the assignment the import left behind. None means no written
+    constructor is live, so the class builds the way Python would build it,
+    through whatever it inherits.
     """
     found = getattr(cls, "__init__", None)
-    candidates = [
+    if found is None:
+        return None
+    live = [
         init
         for init in owner.inits
-        if not init.conditional
-        or (found is not None and is_live_definition(found, module, init.def_line, init.end_line))
+        if is_live_definition(found, module, init.def_line, init.end_line)
     ]
-    if not candidates:
+    if not live:
         return None
-    for candidate in reversed(candidates):
-        if not candidate.conditional:
-            return candidate
-    return candidates[-1]
+    return live[-1]
+
+
+# `instantiate` builds with a constructor its caller already picked, so the
+# attributes checked and the constructor run cannot come from different
+# definitions. The default is its own object because None is a real answer:
+# no written constructor is live, and re-resolving that would repeat the walk
+# for the same answer.
+_INIT_NOT_GIVEN: Any = object()
 
 
 def instantiate(
-    owner: ClassInfo, cls: type, binder: DimBinder, dim_names: set[str], module: Any
+    owner: ClassInfo,
+    cls: type,
+    binder: DimBinder,
+    dim_names: set[str],
+    module: Any,
+    init: InitDef | None = _INIT_NOT_GIVEN,  # type: ignore[assignment]
 ) -> Any:
-    """Construct a module on the meta device so its parameters cost nothing."""
+    """Construct a module on the meta device so its parameters cost nothing.
+
+    `init` is the constructor the caller already picked. Left out, it is
+    picked here.
+    """
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
     positional_open = True
-    init = live_init(owner, cls, module)
+    if init is _INIT_NOT_GIVEN:
+        init = live_init(owner, cls, module)
     for param in init.params if init else []:
         if param.positional_only and not positional_open:
             continue
@@ -276,13 +321,72 @@ def instantiate(
         else:
             kwargs[param.name] = value
 
-    with torch.device("meta"), _quiet_init():
+    before_threads = set(threading.enumerate())
+    instance = None
+    failed = False
+    try:
+        with torch.device("meta"), _quiet_init():
+            try:
+                instance = cls(*args, **kwargs)
+            except TypeError as exc:
+                raise TraceSkipped(
+                    "uninstantiable", f"cannot construct `{owner.qualname or owner.name}`: {exc}"
+                ) from exc
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        after_threads = set(threading.enumerate())
+        spawned = [t for t in after_threads if t not in before_threads and t.is_alive()]
+        for thread in spawned:
+            _attempt_cooperative_stop(thread)
+        if not failed:
+            surviving = [t for t in spawned if t.is_alive()]
+            if surviving:
+                close_instance(instance)
+                names = ", ".join(f"`{t.name}`" for t in surviving)
+                raise TraceSkipped(
+                    "uninstantiable",
+                    f"cannot construct `{owner.qualname or owner.name}`: constructor left background thread {names} running",
+                    hint="shut down background threads in `__init__` or start them lazily",
+                )
+    return instance
+
+
+def _attempt_cooperative_stop(thread: threading.Thread) -> None:
+    """Attempt cooperative shutdown on a thread spawned during construction.
+
+    Only cooperative hooks such as `cancel` or `stop` are safe to call.
+    Asynchronous exception injection can interrupt a thread holding internal
+    locks or blocked in C calls, which risks deadlocking or corrupting the
+    process. Unstoppable threads are left alone and reported as uninstantiable.
+    """
+    if not thread.is_alive():
+        return
+    if hasattr(thread, "cancel") and callable(thread.cancel):
         try:
-            return cls(*args, **kwargs)
-        except TypeError as exc:
-            raise TraceSkipped(
-                "uninstantiable", f"cannot construct `{owner.qualname or owner.name}`: {exc}"
-            ) from exc
+            thread.cancel()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    if hasattr(thread, "stop") and callable(thread.stop):
+        try:
+            thread.stop()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    thread.join(timeout=0.05)
+
+
+def close_instance(instance: Any) -> None:
+    """Shut down connections and watchers held by an instance."""
+    if instance is None:
+        return
+    for method_name in ("close", "stop", "shutdown"):
+        method = getattr(instance, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
 
 @contextlib.contextmanager
@@ -453,20 +557,6 @@ def resolve_qualname(
     return found
 
 
-@dataclass
-class Construction:
-    """The class a trace built, kept so the same class can be built again.
-
-    Only `explain_derived_sizes` uses it, and only after something has already
-    gone wrong, so an ordinary trace fills this in and never reads it.
-    """
-
-    owner: ClassInfo | None = None
-    cls: type | None = None
-    module: Any = None
-    instance: Any = None
-
-
 def resolve_callable(
     module: Any, target: Target, binder: DimBinder, built: Construction | None = None
 ) -> tuple[Any, list[Param]]:
@@ -526,6 +616,11 @@ def _live_method(module: Any, owner: Any, target: Target) -> Any:
     return found
 
 
+# At most two retries: one for the least common multiple of written divisors
+# to resolve single splits, and one for their product to resolve nested splits.
+_MAX_RETRIES = 2
+
+
 def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     """Call one target on meta tensors and hand back what came out.
 
@@ -540,9 +635,125 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
         return _trace(module, target, binder, built)
     except (TraceSkipped, NotLive, TraceFailed):
         raise
-    except Exception as exc:
+    except Exception as first:
+        if unwrap_blocked(first) is not None:
+            close_instance(built.instance)
+            raise TraceFailed(first, binder) from first
+        failure: BaseException = first
+        for scale in _divisible_scales(module, target)[:_MAX_RETRIES]:
+            wider = DimBinder(variadic_rank=variadic_rank, scale=scale, defaults_first=True)
+            again = Construction()
+            try:
+                result = _trace(module, target, wider, again)
+                close_instance(built.instance)
+                return result
+            except (TraceSkipped, NotLive, BindingError):
+                # This attempt never reached the user's code, so it says
+                # nothing the one before it has not already said.
+                close_instance(again.instance)
+                continue
+            except Exception as later:  # noqa: BLE001
+                # It ran on widths that divide, so whatever it hit is more
+                # likely the real mistake than a split losing a remainder on
+                # the way to it.
+                close_instance(built.instance)
+                failure, binder, built = later, wider, again
         explain_derived_sizes(binder, built)
-        raise TraceFailed(exc, binder) from exc
+        close_instance(built.instance)
+        raise TraceFailed(failure, binder) from failure
+
+
+# A written integer is taken as a divisor only inside this range. Below it there
+# is nothing to divide, and above it the number is far more likely a vocabulary
+# or a sequence limit than the number of heads a width is split into.
+_MAX_WRITTEN_DIVISOR = 256
+# How large the shared factor may grow. Every size is a multiple of it, and
+# several sizes multiply into an element count that has to stay inside int64.
+_MAX_SCALE = 1024
+
+
+def _divisible_scales(module: Any, target: Target) -> list[int]:
+    """Factors to retry a failed trace on, read off the integers the code writes.
+
+    A dimension is normally a prime, and a prime does not divide, so attention
+    splitting `d_model` across `n_heads` gets a `head_dim` that does not
+    multiply back, and correct code is reported as a shape error. What a model
+    splits a width by is written down in its own source, as a parameter's
+    default or as a literal in the body, so a failed trace can read those
+    numbers off the code and run again on widths they all divide.
+
+    Two factors come back, smaller first. Their least common multiple survives
+    one split by each number. Their product survives a second split of what the
+    first one left, which is what grouped-query attention does when it divides
+    a head count that was itself divided out of a width.
+
+    Empty means the code writes no number that could be a divisor, so any
+    retry would trace exactly what the first attempt did.
+    """
+    written: set[int] = set()
+    try:
+        if target.owner is None:
+            written |= _written_integers(resolve_qualname(module, target.qualname))
+        else:
+            cls = resolve_qualname(module, target.owner.qualname)
+            written |= _written_integers(getattr(cls, "__init__", None))
+            written |= _written_integers(getattr(cls, target.name, None))
+    except Exception:  # noqa: BLE001
+        return []
+
+    lowest, product = 1, 1
+    # Smallest first, so that a number too large to fit is the one left out.
+    for value in sorted(written):
+        if math.lcm(lowest, value) <= _MAX_SCALE:
+            lowest = math.lcm(lowest, value)
+        if product * value <= _MAX_SCALE:
+            product *= value
+    return [scale for scale in dict.fromkeys((lowest, product)) if scale > 1]
+
+
+def _written_integers(fn: Any) -> set[int]:
+    """Every integer a function writes down, as a default or as a literal.
+
+    `def __init__(self, d_model: int, n_heads: int = 8)` writing `8`, and a body
+    writing `d_model // 64`, are the same statement about widths, so both are
+    read. Booleans are not integers for this purpose, whatever Python says.
+
+    Body literals come from the bytecode, not from `co_consts`. Since 3.14 a
+    small literal compiles to an inline `LOAD_SMALL_INT` and may never appear
+    in the constants at all, and whether it does shifts with unrelated lines
+    elsewhere in the body. A guard like `d_k % 2` next to a keyword call is the
+    case that vanishes. Only the two opcodes that load a constant are read, by
+    name so numbering changes do not matter. Anything else carrying an integer
+    `argval`, a jump target or a comparison index, is not a number the code
+    writes down. Nested code objects count too: a literal inside a
+    comprehension or a helper in the same body is still the same function
+    writing the same number down. A body that cannot be disassembled reads as
+    no literals, so one odd function cannot break the whole check.
+    """
+    found: set[int] = set()
+    found.update(value for value in getattr(fn, "__defaults__", None) or () if type(value) is int)
+    kwonly = getattr(fn, "__kwdefaults__", None) or {}
+    found.update(value for value in kwonly.values() if type(value) is int)
+    code = getattr(fn, "__code__", None)
+    if code is not None:
+        try:
+            stack = [code]
+            seen: set[int] = set()
+            while stack:
+                current = stack.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                for instruction in dis.get_instructions(current):
+                    if (
+                        instruction.opname in ("LOAD_SMALL_INT", "LOAD_CONST")
+                        and type(instruction.argval) is int
+                    ):
+                        found.add(instruction.argval)
+                stack.extend(const for const in current.co_consts if isinstance(const, type(code)))
+        except Exception:  # noqa: BLE001, S110
+            pass
+    return {value for value in found if 2 <= value <= _MAX_WRITTEN_DIVISOR}
 
 
 def explain_derived_sizes(binder: DimBinder, built: Construction) -> None:
@@ -570,7 +781,7 @@ def explain_derived_sizes(binder: DimBinder, built: Construction) -> None:
     init = live_init(built.owner, built.cls, built.module)
     dims = [p.name for p in (init.params if init else []) if p.name in binder.sizes]
     for index, name in enumerate(dims):
-        moved = _shapes_with_dim_moved(built, binder, name, distant_prime(index))
+        moved = _shapes_with_dim_moved(built, binder, name, distant_prime(index) * binder.scale)
         if moved is None:
             continue
         for key, shape in base.items():
@@ -596,6 +807,7 @@ def _shapes_with_dim_moved(
     assert built.owner is not None and built.cls is not None
     probe = DimBinder(
         variadic_rank=binder.variadic_rank,
+        scale=binder.scale,
         sizes={**binder.sizes, name: size},
         _next=binder._next,
     )
@@ -603,19 +815,30 @@ def _shapes_with_dim_moved(
         instance = instantiate(built.owner, built.cls, probe, built.owner.dim_names, built.module)
     except Exception:  # noqa: BLE001
         return None
-    return _stored_shapes(instance)
+    try:
+        return _stored_shapes(instance)
+    finally:
+        close_instance(instance)
 
 
 def _stored_shapes(instance: Any) -> dict[str, tuple[int, ...]]:
-    """Every tensor the built object holds, by the name it holds it under."""
+    """Every width the built object holds, by the name it holds it under.
+
+    A tensor contributes its shape. A plain integer attribute counts too, and
+    it is the only record of a width the model worked out and then never put in
+    a tensor: `self.head_dim = d_model // n_heads` on a module that reshapes by
+    it rather than holding a weight of that width.
+    """
+    found: dict[str, tuple[int, ...]] = {}
     if isinstance(instance, torch.nn.Module):
         held = itertools.chain(instance.named_parameters(), instance.named_buffers())
-        return {name: tuple(value.shape) for name, value in held}
-    return {
-        name: tuple(value.shape)
-        for name, value in vars(instance).items()
-        if isinstance(value, torch.Tensor)
-    }
+        found.update((name, tuple(value.shape)) for name, value in held)
+    for name, value in getattr(instance, "__dict__", {}).items():
+        if isinstance(value, torch.Tensor):
+            found[name] = tuple(value.shape)
+        elif type(value) is int:
+            found[name] = (value,)
+    return found
 
 
 def _trace(
@@ -653,7 +876,7 @@ def _trace(
         if inspect.iscoroutine(returned):
             returned = _settle_coroutine(returned, awaited=target.is_async)
 
-    return TraceResult(binder=binder, returned=returned, argument_shapes=shapes)
+    return TraceResult(binder=binder, returned=returned, argument_shapes=shapes, built=built)
 
 
 def _settle_coroutine(coroutine: Any, *, awaited: bool) -> Any:
