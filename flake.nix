@@ -37,7 +37,7 @@
       packages = forAll (pkgs: {
         default = pkgs.python313Packages.buildPythonApplication {
           pname = "torchtyc";
-          version = "0.2.0";
+          version = "0.3.0";
           pyproject = true;
           src = self;
           build-system = [ pkgs.python313Packages.hatchling ];
