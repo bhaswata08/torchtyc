@@ -102,6 +102,10 @@ class ArraySpec:
     def named_dims(self) -> tuple[str, ...]:
         return tuple(d.name for d in self.dims if d.name is not None)
 
+    @property
+    def literal_dims(self) -> tuple[int, ...]:
+        return tuple(d.size for d in self.dims if d.kind == "fixed" and d.size is not None)
+
     def __str__(self) -> str:
         return f'{self.dtype}[{self.array_type}, "{" ".join(str(d) for d in self.dims)}"]'
 
@@ -144,6 +148,40 @@ def parse_dim_string(text: str) -> tuple[Dim, ...]:
     return tuple(dims)
 
 
+_ALLOWED_SYMBOLIC_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Name,
+    ast.Constant,
+    ast.Load,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.UAdd,
+    ast.USub,
+)
+
+
+def _is_valid_symbolic(expr: str) -> bool:
+    if "#" in expr:
+        return False
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_SYMBOLIC_NODES):
+            return False
+        if isinstance(node, ast.Constant) and type(node.value) is not int:
+            return False
+    return True
+
+
 def _parse_dim_token(token: str) -> Dim:
     broadcastable = token.startswith("#")
     if broadcastable:
@@ -160,6 +198,8 @@ def _parse_dim_token(token: str) -> Dim:
     if token.isdigit():
         return Dim("fixed", size=int(token), broadcastable=broadcastable)
     if _SYMBOLIC.search(token):
+        if not _is_valid_symbolic(token):
+            raise AnnotationError(f"bad dimension {token!r}")
         return Dim("symbolic", expr=token, broadcastable=broadcastable)
     if _IDENT.match(token):
         return Dim("named", name=token, broadcastable=broadcastable)

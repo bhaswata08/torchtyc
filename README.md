@@ -200,7 +200,7 @@ variadic-rank = 2             # how many axes `...` stands for
 einops = true
 timeout = 60.0
 extra-paths = ["stubs"]       # prepended to the worker's PYTHONPATH
-allow-effects = false         # let imported code write files and open sockets
+allow-effects = false         # let imported code write files, open sockets, and spawn processes
 ```
 
 ## Editors
@@ -298,11 +298,13 @@ they were right for the batch you actually ran.
 torchtyc imports your modules in a worker subprocess that runs with your full
 privileges.
 
-While it imports and traces your code, a guard blocks filesystem writes and
-outbound network calls. It catches accidental effects such as telemetry setup,
-dataset downloads and checkpoint writes. It is not a security boundary: Python
-cannot enforce one in-process, and code written to get around it can. Set
-`allow-effects = true` if a model you trust needs to write or connect.
+While it imports and traces your code, a guard blocks filesystem writes,
+outbound network calls (including DNS resolution), and process spawning. It
+catches accidental effects such as telemetry setup, dataset downloads (including
+those shelling out to `git` or `curl`), and checkpoint writes. It is not a
+security boundary: Python cannot enforce one in-process, and code written to get
+around it can. Set `allow-effects = true` if a model you trust needs to write,
+connect, or spawn processes.
 
 Untrusted code still needs a real sandbox or a disposable container. Only enable
 `torchtyc lsp` in workspaces you trust.

@@ -14,12 +14,23 @@ import ast
 import io
 import re
 import tokenize
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .annotations import AnnotationError, ArraySpec, Spec, TupleSpec, parse_annotation
 
 _IGNORE = re.compile(r"#\s*torchtyc:\s*ignore(?:\[([^\]]*)\])?")
+
+
+def _byte_to_codepoint(line: str, byte_offset: int) -> int:
+    """Convert a 0-based UTF-8 byte offset in `line` to a 0-based code point index."""
+    if byte_offset <= 0:
+        return 0
+    raw = line.encode("utf-8")
+    if byte_offset >= len(raw):
+        return len(line)
+    return len(raw[:byte_offset].decode("utf-8", errors="replace"))
 
 
 @dataclass
@@ -30,12 +41,25 @@ class Position:
     end_column: int
 
     @classmethod
-    def of(cls, node: ast.AST) -> Position:
+    def of(cls, node: ast.AST, lines: Sequence[str] | str | None = None) -> Position:
+        line = node.lineno - 1
+        end_line = (node.end_lineno or node.lineno) - 1
+        col = node.col_offset
+        end_col = node.end_col_offset if node.end_col_offset is not None else col
+
+        if lines is not None:
+            if isinstance(lines, str):
+                lines = lines.splitlines(keepends=True)
+            if 0 <= line < len(lines):
+                col = _byte_to_codepoint(lines[line], col)
+            if 0 <= end_line < len(lines):
+                end_col = _byte_to_codepoint(lines[end_line], end_col)
+
         return cls(
-            line=node.lineno - 1,
-            column=node.col_offset,
-            end_line=(node.end_lineno or node.lineno) - 1,
-            end_column=node.end_col_offset or node.col_offset,
+            line=line,
+            column=col,
+            end_line=end_line,
+            end_column=end_col,
         )
 
 
@@ -137,6 +161,15 @@ class ClassInfo:
                 names.update(array.named_dims)
         return names
 
+    @property
+    def literal_dims(self) -> set[int]:
+        literals: set[int] = set()
+        specs = [p.spec for p in self.all_init_params] + [a.spec for a in self.all_attributes]
+        for spec in specs:
+            for array in iter_arrays(spec):
+                literals.update(array.literal_dims)
+        return literals
+
 
 @dataclass
 class Target:
@@ -193,6 +226,17 @@ class Target:
             for array in iter_arrays(spec):
                 names.update(array.named_dims)
         return names
+
+    @property
+    def literal_dims(self) -> set[int]:
+        literals: set[int] = set()
+        specs = [p.spec for p in self.params] + [self.returns]
+        if self.owner is not None:
+            literals.update(self.owner.literal_dims)
+        for spec in specs:
+            for array in iter_arrays(spec):
+                literals.update(array.literal_dims)
+        return literals
 
     @property
     def visible_dim_names(self) -> set[str]:
@@ -324,7 +368,9 @@ def _own_nodes(node: ast.AST):
         yield from _own_nodes(child)
 
 
-def _find_einops(node: ast.AST, names: EinopsNames) -> list[EinopsCall]:
+def _find_einops(
+    node: ast.AST, names: EinopsNames, lines: Sequence[str] | None = None
+) -> list[EinopsCall]:
     calls: list[EinopsCall] = []
     for child in _own_nodes(node):
         if not isinstance(child, ast.Call):
@@ -349,7 +395,7 @@ def _find_einops(node: ast.AST, names: EinopsNames) -> list[EinopsCall]:
             EinopsCall(
                 func=name,
                 pattern=pattern,
-                position=Position.of(child),
+                position=Position.of(child, lines),
                 tensor_args=tensor_args,
                 starred_args=any(isinstance(arg, ast.Starred) for arg in child.args),
                 keywords=frozenset(k.arg for k in child.keywords if k.arg),
@@ -358,13 +404,18 @@ def _find_einops(node: ast.AST, names: EinopsNames) -> list[EinopsCall]:
     return calls
 
 
-def _parse_param(arg: ast.arg, has_default: bool, positional_only: bool = False) -> Param:
-    position = Position.of(arg)
+def _parse_param(
+    arg: ast.arg,
+    has_default: bool,
+    positional_only: bool = False,
+    lines: Sequence[str] | None = None,
+) -> Param:
+    position = Position.of(arg, lines)
     spec: Spec | None = None
     error: str | None = None
     plain: str | None = None
     if arg.annotation is not None:
-        position = Position.of(arg.annotation)
+        position = Position.of(arg.annotation, lines)
         try:
             spec = parse_annotation(arg.annotation)
         except AnnotationError as exc:
@@ -433,7 +484,10 @@ def _signature_end_line(fn: ast.FunctionDef | ast.AsyncFunctionDef, lines: list[
     return start
 
 
-def _attributes_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Attribute]:
+def _attributes_of(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    lines: Sequence[str] | None = None,
+) -> list[Attribute]:
     found: list[Attribute] = []
     for node in ast.walk(fn):
         if not isinstance(node, ast.AnnAssign):
@@ -451,11 +505,16 @@ def _attributes_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Attribute
             continue
         if spec is None:
             continue
-        found.append(Attribute(name=target.attr, spec=spec, position=Position.of(node.annotation)))
+        found.append(
+            Attribute(name=target.attr, spec=spec, position=Position.of(node.annotation, lines))
+        )
     return found
 
 
-def _params_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Param]:
+def _params_of(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    lines: Sequence[str] | None = None,
+) -> list[Param]:
     args = fn.args
     positional = args.posonlyargs + args.args
     defaults_start = len(positional) - len(args.defaults)
@@ -464,11 +523,12 @@ def _params_of(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Param]:
             arg,
             has_default=index >= defaults_start,
             positional_only=index < len(args.posonlyargs),
+            lines=lines,
         )
         for index, arg in enumerate(positional)
     ]
     params += [
-        _parse_param(arg, has_default=default is not None)
+        _parse_param(arg, has_default=default is not None, lines=lines)
         for arg, default in zip(args.kwonlyargs, args.kw_defaults or [])
     ]
     return params
@@ -605,18 +665,23 @@ def scan_source(source: str, path: str) -> FileScan:
             returns = parse_annotation(fn.returns)
         except AnnotationError as exc:
             error = str(exc)
+        target_col = (
+            _byte_to_codepoint(lines[fn.lineno - 1], fn.col_offset)
+            if lines and 0 <= fn.lineno - 1 < len(lines)
+            else fn.col_offset
+        )
         target = Target(
             qualname=qualname,
             name=fn.name,
             position=Position(
                 fn.lineno - 1,
-                fn.col_offset,
+                target_col,
                 fn.lineno - 1,
-                fn.col_offset + len(_def_keyword(fn)) + len(fn.name),
+                target_col + len(_def_keyword(fn)) + len(fn.name),
             ),
-            params=_params_of(fn),
+            params=_params_of(fn, lines),
             returns=returns,
-            returns_position=Position.of(fn.returns) if fn.returns else None,
+            returns_position=Position.of(fn.returns, lines) if fn.returns else None,
             decorators=[_decorator_name(d) for d in fn.decorator_list],
             def_line=_def_line(fn),
             end_line=(fn.end_lineno or fn.lineno) - 1,
@@ -625,7 +690,7 @@ def scan_source(source: str, path: str) -> FileScan:
             signature_end_line=_signature_end_line(fn, lines),
             owner=owner,
             annotation_error=error,
-            einops_calls=_find_einops(fn, einops_names),
+            einops_calls=_find_einops(fn, einops_names, lines),
             is_async=isinstance(fn, ast.AsyncFunctionDef),
         )
         targets.append(target)
@@ -637,14 +702,19 @@ def scan_source(source: str, path: str) -> FileScan:
         node: ast.ClassDef, prefix: str, conditional: bool, enclosing: frozenset[str]
     ) -> None:
         qualname = f"{prefix}.{node.name}" if prefix else node.name
+        class_col = (
+            _byte_to_codepoint(lines[node.lineno - 1], node.col_offset)
+            if lines and 0 <= node.lineno - 1 < len(lines)
+            else node.col_offset
+        )
         info = ClassInfo(
             name=node.name,
             qualname=qualname,
             position=Position(
                 node.lineno - 1,
-                node.col_offset,
+                class_col,
                 node.lineno - 1,
-                node.col_offset + len("class ") + len(node.name),
+                class_col + len("class ") + len(node.name),
             ),
             def_line=_def_line(node),
             end_line=(node.end_lineno or node.lineno) - 1,
@@ -661,8 +731,8 @@ def scan_source(source: str, path: str) -> FileScan:
             ):
                 info.inits.append(
                     InitDef(
-                        params=_params_of(child)[1:],  # drop self
-                        attributes=_attributes_of(child),
+                        params=_params_of(child, lines)[1:],  # drop self
+                        attributes=_attributes_of(child, lines),
                         def_line=_def_line(child),
                         end_line=(child.end_lineno or child.lineno) - 1,
                         conditional=guarded,

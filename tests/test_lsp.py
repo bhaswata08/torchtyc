@@ -6,7 +6,17 @@ from lsprotocol import types as lsp
 
 from torchtyc.config import Overrides
 from torchtyc.diagnostics import Diagnostic, Severity
-from torchtyc.lsp import TorchtycServer, _target_at, did_close, path_to_uri, to_lsp, uri_to_path
+from torchtyc.lsp import (
+    TorchtycServer,
+    _codepoint_to_lsp_units,
+    _lsp_units_to_codepoint,
+    _target_at,
+    did_close,
+    did_open,
+    path_to_uri,
+    to_lsp,
+    uri_to_path,
+)
 
 
 def test_uri_roundtrip(tmp_path):
@@ -210,7 +220,12 @@ def quick_fix_edits(
 
     uri = "file:///a.py"
     document = SimpleNamespace(lines=[line_text + "\n"])
-    ls = SimpleNamespace(workspace=SimpleNamespace(get_text_document=lambda _: document))
+    ls = SimpleNamespace(
+        workspace=SimpleNamespace(
+            get_text_document=lambda _: document,
+            position_encoding=lsp.PositionEncodingKind.Utf16,
+        )
+    )
 
     if anchor is not None:
         start = line_text.index(anchor)
@@ -223,7 +238,7 @@ def quick_fix_edits(
         range=lsp.Range(
             start=lsp.Position(line=0, character=0), end=lsp.Position(line=0, character=0)
         ),
-        context=lsp.CodeActionContext(diagnostics=[to_lsp(diagnostic)]),
+        context=lsp.CodeActionContext(diagnostics=[to_lsp(diagnostic, lines=document.lines)]),
     )
 
     pairs = []
@@ -231,7 +246,9 @@ def quick_fix_edits(
         if not action.title.startswith("Change the annotation"):
             continue
         edit = action.edit.changes[uri][0]
-        replaced = line_text[edit.range.start.character : edit.range.end.character]
+        start = _lsp_units_to_codepoint(line_text, edit.range.start.character)
+        end = _lsp_units_to_codepoint(line_text, edit.range.end.character)
+        replaced = line_text[start:end]
         pairs.append((replaced, edit.new_text))
     return pairs
 
@@ -928,3 +945,203 @@ def test_worker_timeout_reports_as_before(monkeypatch, tmp_path):
     assert error == "the trace timed out after 0.5s"
     assert len(procs) == 1
     assert procs[0].poll() is not None
+
+
+def test_diagnostic_column_with_multibyte_character():
+    """Multi-byte character before anchor: reported column identifies the right span."""
+    from torchtyc.discovery import scan_source
+
+    source = 'def föo(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:\n    return x\n'
+    scan = scan_source(source, "test.py")
+    target = scan.targets[0]
+    param = target.params[0]
+    line = source.splitlines()[param.position.line]
+
+    # In Python code points, 'def föo(x: ' is 11 chars.
+    # In UTF-8 bytes, 'ö' is 2 bytes so byte offset would be 12.
+    assert param.position.column == 11
+    assert line[param.position.column : param.position.end_column] == 'Float[Tensor, "b d"]'
+
+    diagnostic = Diagnostic(
+        path="test.py",
+        line=param.position.line,
+        column=param.position.column,
+        end_line=param.position.end_line,
+        end_column=param.position.end_column,
+        rule="shape-mismatch",
+        message="bad",
+    )
+    lsp_diag = to_lsp(diagnostic, lines=source.splitlines())
+    # In UTF-16, 'ö' is 1 code unit, so character offset is also 11.
+    assert lsp_diag.range.start.character == 11
+    assert lsp_diag.range.end.character == 11 + len('Float[Tensor, "b d"]')
+
+
+def test_diagnostic_column_with_astral_plane_character():
+    """Astral-plane character (emoji): LSP UTF-16 column differs from code-point column."""
+    from torchtyc.discovery import scan_source
+
+    source = 'def foo(msg: Literal["🦀"], x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:\n    return x\n'
+    scan = scan_source(source, "test.py")
+    target = scan.targets[0]
+    param = target.params[1]
+    line = source.splitlines()[param.position.line]
+
+    # Code points: 'def foo(msg: Literal["🦀"], x: ' is 30 code points.
+    assert param.position.column == 30
+    assert line[param.position.column : param.position.end_column] == 'Float[Tensor, "b d"]'
+
+    diagnostic = Diagnostic(
+        path="test.py",
+        line=param.position.line,
+        column=param.position.column,
+        end_line=param.position.end_line,
+        end_column=param.position.end_column,
+        rule="shape-mismatch",
+        message="bad",
+    )
+    lsp_diag = to_lsp(diagnostic, lines=source.splitlines())
+    # In UTF-16, '🦀' is encoded as 2 code units, so start.character is 31 (30 code points + 1 extra UTF-16 unit).
+    assert lsp_diag.range.start.character == 31
+    assert diagnostic.column == 30
+    assert lsp_diag.range.start.character != diagnostic.column
+    assert lsp_diag.range.start.character - diagnostic.column == 1
+
+
+def test_quick_fix_with_non_ascii_multibyte_character():
+    """A code action on a line with a non-ASCII character applies the rewrite."""
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        suggestion='Float[Tensor, "b out_features"]',
+    )
+    line = 'def föo(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
+    edits = quick_fix_edits(line, diagnostic, anchor='Float[Tensor, "b d"]')
+    assert edits == [('Float[Tensor, "b d"]', 'Float[Tensor, "b out_features"]')]
+
+
+def test_quick_fix_with_astral_plane_emoji_reverse_direction():
+    """Reverse-direction conversion: code action on a line with an astral-plane emoji."""
+    diagnostic = Diagnostic(
+        path="a.py",
+        line=0,
+        column=0,
+        rule="shape-mismatch",
+        message="bad",
+        suggestion='Float[Tensor, "b out_features"]',
+    )
+    line = 'def foo(msg: Literal["🦀"], x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:'
+    edits = quick_fix_edits(line, diagnostic, anchor='Float[Tensor, "b d"]')
+    assert edits == [('Float[Tensor, "b d"]', 'Float[Tensor, "b out_features"]')]
+
+
+def test_position_encoding_conversions_and_negotiation():
+    """Unit conversions and UTF-8 position encoding support."""
+    line = 'def f🦀o_ö(x: Float[Tensor, "b"]):'
+    col = line.index("Float")
+
+    # UTF-16: '🦀' adds 1 extra code unit (surrogate pair), 'ö' is 1 code unit
+    utf16_col = _codepoint_to_lsp_units(line, col, lsp.PositionEncodingKind.Utf16)
+    assert utf16_col == col + 1
+    assert _lsp_units_to_codepoint(line, utf16_col, lsp.PositionEncodingKind.Utf16) == col
+
+    # UTF-8: '🦀' is 4 bytes (adds 3 bytes), 'ö' is 2 bytes (adds 1 byte)
+    utf8_col = _codepoint_to_lsp_units(line, col, lsp.PositionEncodingKind.Utf8)
+    assert utf8_col == col + 3 + 1
+    assert _lsp_units_to_codepoint(line, utf8_col, lsp.PositionEncodingKind.Utf8) == col
+
+    # UTF-32: code points directly
+    utf32_col = _codepoint_to_lsp_units(line, col, lsp.PositionEncodingKind.Utf32)
+    assert utf32_col == col
+    assert _lsp_units_to_codepoint(line, utf32_col, lsp.PositionEncodingKind.Utf32) == col
+
+    # Test to_lsp with UTF-8 encoding
+    diag = Diagnostic(path="a.py", line=0, column=col, end_column=col + 5, rule="r", message="m")
+    lsp_utf8 = to_lsp(diag, lines=[line], encoding=lsp.PositionEncodingKind.Utf8)
+    assert lsp_utf8.range.start.character == utf8_col
+
+
+def test_lsp_traceback_and_shape_hints_read_buffer_not_disk(tmp_path):
+    """LSP tracebacks and shape hints must reflect the unsaved buffer, not the stale file on disk."""
+    import asyncio
+
+    from pygls.workspace import Workspace
+
+    disk_source = """\
+from jaxtyping import Float
+from torch import Tensor
+import torch
+
+
+def bad(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+    disk_tensor = x
+    return torch.matmul(disk_tensor, disk_tensor)
+"""
+    buffer_source = """\
+from jaxtyping import Float
+from torch import Tensor
+import torch
+
+
+def bad(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+    buffer_tensor = x
+    return torch.matmul(buffer_tensor, buffer_tensor)
+"""
+    path = tmp_path / "model.py"
+    path.write_text(disk_source)
+
+    server = TorchtycServer()
+    server.protocol._workspace = Workspace(tmp_path.as_uri())
+    uri = path_to_uri(str(path))
+    doc_item = lsp.TextDocumentItem(uri=uri, language_id="python", version=1, text=buffer_source)
+    server.workspace.put_text_document(doc_item)
+
+    published: list = []
+    server.publish = lambda u, diags: published.append((u, list(diags)))
+
+    async def drive() -> None:
+        await did_open(server, lsp.DidOpenTextDocumentParams(text_document=doc_item))
+        await server.pending[uri]
+
+    asyncio.run(drive())
+
+    report = server.reports[uri]
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert "buffer_tensor" in (diagnostic.traceback or "")
+    assert "disk_tensor" not in (diagnostic.traceback or "")
+    assert diagnostic.hint == "buffer_tensor is (b, d)"
+
+    # An unsaved buffer with extra lines shifting line numbers:
+    # line numbers exceed disk length, but traceback and hint must still quote the buffer.
+    shifted_buffer = """\
+# unsaved line 1
+# unsaved line 2
+# unsaved line 3
+# unsaved line 4
+from jaxtyping import Float
+from torch import Tensor
+import torch
+
+
+def bad(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+    shifted_tensor = x
+    return torch.matmul(shifted_tensor, shifted_tensor)
+"""
+    doc_item_shifted = lsp.TextDocumentItem(
+        uri=uri, language_id="python", version=2, text=shifted_buffer
+    )
+    server.workspace.put_text_document(doc_item_shifted)
+
+    async def drive_shifted() -> None:
+        await server.trace_now(uri)
+
+    asyncio.run(drive_shifted())
+
+    report2 = server.reports[uri]
+    diag2 = next(d for d in report2.diagnostics if d.rule == "trace-error")
+    assert "shifted_tensor" in (diag2.traceback or "")
+    assert "return torch.matmul(shifted_tensor, shifted_tensor)" in (diag2.traceback or "")
+    assert diag2.hint == "shifted_tensor is (b, d)"

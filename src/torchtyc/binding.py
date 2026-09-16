@@ -153,13 +153,17 @@ class DimBinder:
     _next: int = 0
     _anonymous_variadic: tuple[int, ...] | None = None
 
+    def __post_init__(self) -> None:
+        self.literals = set(self.literals)
+
     def fresh(self) -> int:
         pool = coprime_pool(self.scale)
-        if self._next >= len(pool):
-            raise BindingError("ran out of distinct dimension primes")
-        value = pool[self._next]
-        self._next += 1
-        return value
+        while self._next < len(pool):
+            value = pool[self._next]
+            self._next += 1
+            if value not in self.literals:
+                return value
+        raise BindingError("ran out of distinct dimension primes")
 
     def bind(self, name: str) -> int:
         """Get the prime for a name, assigning one on first sight."""
@@ -213,6 +217,8 @@ class DimBinder:
         A traced dimension of 10403 with `d_in`=101 and `d_out`=103 bound comes
         back as `d_in*d_out`, which is the whole point of using primes.
         """
+        if size in self.literals:
+            return str(size)
         for name, value in self.sizes.items():
             if value == size:
                 return name
@@ -231,6 +237,8 @@ class DimBinder:
         return str(size)
 
     def _factor_names(self, size: int) -> list[str]:
+        if size in self.literals:
+            return []
         # Only a size above one can be a factor. A name bound to 1 would never
         # shrink the remainder, and one bound to 0 would divide by zero.
         by_value = {v: k for k, v in self.sizes.items() if v > 1}
@@ -289,20 +297,26 @@ class DimBinder:
 
     def is_flattened(self, size: int) -> bool:
         """Whether this size is a product of primes rather than one axis."""
+        if size in self.literals:
+            return False
         return size not in self.issued() and bool(self._factor_names(size))
 
     def issued(self) -> dict[int, str]:
         """Every size this binder handed out, mapped back to what it stands for."""
         table: dict[int, str] = {}
         for name, value in self.sizes.items():
-            table.setdefault(value, name)
+            if value not in self.literals:
+                table.setdefault(value, name)
         for name, values in self.variadics.items():
             for index, value in enumerate(values):
-                table.setdefault(value, f"{name}[{index}]")
+                if value not in self.literals:
+                    table.setdefault(value, f"{name}[{index}]")
         for value in self.anonymous:
-            table.setdefault(value, "...")
+            if value not in self.literals:
+                table.setdefault(value, "...")
         for value in self.anonymous_dims:
-            table.setdefault(value, "_")
+            if value not in self.literals:
+                table.setdefault(value, "_")
         return table
 
     def rename_primes(self, text: str) -> str:
@@ -414,23 +428,29 @@ def _eval_symbolic(dim: Dim, binder: DimBinder) -> int:
     assert dim.expr is not None
     import ast as _ast
 
-    names = {
-        node.id
-        for node in _ast.walk(_ast.parse(dim.expr, mode="eval"))
-        if isinstance(node, _ast.Name)
-    }
-    scope = {name: binder.bind(name) for name in names}
     try:
-        value = eval(compile(_ast.parse(dim.expr, mode="eval"), "<dim>", "eval"), {}, scope)
+        parsed = _ast.parse(dim.expr, mode="eval")
+        names = {node.id for node in _ast.walk(parsed) if isinstance(node, _ast.Name)}
+        scope = {name: binder.bind(name) for name in names}
+        value = eval(compile(parsed, "<dim>", "eval"), {}, scope)
     except Exception as exc:
-        raise BindingError(f"could not evaluate dimension {dim.expr!r}: {exc}") from exc
+        raise BindingError(
+            f"could not evaluate dimension {dim.expr!r}: {exc}",
+            rule="unsupported-annotation",
+        ) from exc
     if not isinstance(value, int):
-        raise BindingError(f"dimension {dim.expr!r} is not an integer")
+        raise BindingError(
+            f"dimension {dim.expr!r} is not an integer",
+            rule="unsupported-annotation",
+        )
     return value
 
 
 def shape_for(spec: ArraySpec, binder: DimBinder) -> tuple[int, ...]:
     """Build the concrete shape an argument should be given."""
+    for dim in spec.dims:
+        if dim.kind == "fixed" and dim.size is not None:
+            binder.literals.add(dim.size)
     prefix, variadic, suffix = _split_variadic(spec)
     shape: list[int] = [_size_of(d, binder) for d in prefix]
     if variadic is not None:
@@ -445,6 +465,9 @@ def check_shape(spec: ArraySpec, shape: tuple[int, ...], binder: DimBinder) -> N
     Names not yet in the binder get bound here, so a return-only name is allowed
     as long as it is used consistently.
     """
+    for dim in spec.dims:
+        if dim.kind == "fixed" and dim.size is not None:
+            binder.literals.add(dim.size)
     prefix, variadic, suffix = _split_variadic(spec)
     fixed_rank = len(prefix) + len(suffix)
 

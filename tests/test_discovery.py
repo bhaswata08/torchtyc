@@ -344,3 +344,28 @@ def test_a_colon_inside_a_default_does_not_end_the_signature():
     source = "def f(\n    x: dict[str, int] = {1: 2},\n):\n    return x\n"
     target = scan_source(source, "default.py").targets[0]
     assert source.splitlines()[target.signature_end_line] == "):"
+
+
+def test_position_with_multibyte_characters():
+    source = 'def föo(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:\n    return x\n'
+    scan = scan_source(source, "net.py")
+    target = scan.targets[0]
+    line = source.splitlines()[0]
+    param = target.params[0]
+    assert line[param.position.column : param.position.end_column] == 'Float[Tensor, "b d"]'
+    assert param.position.column == 11
+    assert target.returns_position is not None
+    assert (
+        line[target.returns_position.column : target.returns_position.end_column]
+        == 'Float[Tensor, "b d"]'
+    )
+
+
+def test_position_with_emoji():
+    source = 'def foo(msg: Literal["🦀"], x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:\n    return x\n'
+    scan = scan_source(source, "net.py")
+    target = scan.targets[0]
+    line = source.splitlines()[0]
+    param = target.params[1]
+    assert line[param.position.column : param.position.end_column] == 'Float[Tensor, "b d"]'
+    assert param.position.column == 30

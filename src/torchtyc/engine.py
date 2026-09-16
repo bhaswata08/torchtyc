@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import threading
@@ -48,6 +49,7 @@ class Report:
     hovers: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     checked_files: int = 0
     checked_functions: int = 0
+    skipped_functions: int = 0
     worker_error: str | None = None
 
     def shapes_in(self, path: str) -> dict[str, dict[str, str]]:
@@ -325,44 +327,144 @@ def _communicate(
     payload: str,
     timeout: float | None,
     cancel: threading.Event | None,
-) -> tuple[str | None, str | None]:
-    """Collect the worker's output, stopping early when asked.
+) -> tuple[list[str], str | None, bool]:
+    """Collect the worker's output line by line, resetting the timeout on progress.
 
-    Returns the two pipes, or (None, None) when the timeout runs out first.
+    Returns (stdout_lines, stderr, timed_out).
     Raises WorkerCancelled when `cancel` is set, discarding whatever the
-    child wrote: a kill mid-write leaves half a JSON document on the pipe,
-    and parsing that would report a result that never happened.
-
-    The payload goes in on the first wait only. Retrying the wait after a
-    timeout keeps what the child wrote so far, so later waits pass no input.
+    child wrote.
     """
+    if cancel is not None and cancel.is_set():
+        _finish(proc)
+        raise WorkerCancelled()
+
+    def _feed_stdin() -> None:
+        try:
+            pipe = getattr(proc, "stdin", None)
+            if pipe is not None:
+                pipe.write(payload)
+                pipe.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    threading.Thread(target=_feed_stdin, daemon=True).start()
+
+    output_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+    def _read_stdout() -> None:
+        pipe = getattr(proc, "stdout", None)
+        try:
+            if pipe is not None:
+                for line in iter(pipe.readline, ""):
+                    output_queue.put(("stdout", line))
+        except (ValueError, OSError):
+            pass
+        finally:
+            output_queue.put(("stdout_eof", None))
+
+    def _read_stderr() -> None:
+        pipe = getattr(proc, "stderr", None)
+        try:
+            if pipe is not None:
+                for line in iter(pipe.readline, ""):
+                    output_queue.put(("stderr", line))
+        except (ValueError, OSError):
+            pass
+        finally:
+            output_queue.put(("stderr_eof", None))
+
+    threading.Thread(target=_read_stdout, daemon=True).start()
+    threading.Thread(target=_read_stderr, daemon=True).start()
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    stdout_eof = False
+    stderr_eof = False
+    timed_out = False
+
     deadline = None if timeout is None else time.monotonic() + timeout
-    pending: str | None = payload
-    while True:
+
+    while not (stdout_eof and stderr_eof):
         if cancel is not None and cancel.is_set():
             _finish(proc)
             raise WorkerCancelled()
+
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
+            timed_out = True
             _finish(proc)
-            return None, None
+            break
+
         quantum = (
-            _WORKER_POLL_SECONDS if remaining is None else min(_WORKER_POLL_SECONDS, remaining)
+            _WORKER_POLL_SECONDS
+            if remaining is None
+            else min(_WORKER_POLL_SECONDS, max(0.001, remaining))
         )
         try:
-            if pending is not None:
-                stdout, stderr = proc.communicate(input=pending, timeout=quantum)
-            else:
-                stdout, stderr = proc.communicate(timeout=quantum)
-        except subprocess.TimeoutExpired:
-            pending = None
+            kind, data = output_queue.get(timeout=quantum)
+        except queue.Empty:
             continue
-        if cancel is not None and cancel.is_set():
-            # Stopped from another thread while the wait returned. The output
-            # ends wherever the kill landed, so it is not a result either.
-            _finish(proc)
-            raise WorkerCancelled()
-        return stdout, stderr
+
+        if kind == "stdout":
+            if data is not None:
+                stdout_lines.append(data)
+                if timeout is not None:
+                    try:
+                        parsed = json.loads(data.strip())
+                        if parsed.get("event") in ("ready", "file_result"):
+                            deadline = time.monotonic() + timeout
+                    except json.JSONDecodeError:
+                        pass
+        elif kind == "stderr":
+            if data is not None:
+                stderr_lines.append(data)
+        elif kind == "stdout_eof":
+            stdout_eof = True
+        elif kind == "stderr_eof":
+            stderr_eof = True
+
+    while not output_queue.empty():
+        try:
+            kind, data = output_queue.get_nowait()
+            if kind == "stdout" and data is not None:
+                stdout_lines.append(data)
+            elif kind == "stderr" and data is not None:
+                stderr_lines.append(data)
+        except queue.Empty:
+            break
+
+    if not timed_out:
+        try:
+            proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    stderr_text = "".join(stderr_lines) if stderr_lines else None
+    return stdout_lines, stderr_text, timed_out
+
+
+class WorkerRunResult(tuple):
+    diagnostics: list[Diagnostic]
+    hovers: dict[str, dict[str, dict[str, str]]]
+    error: str | None
+    checked_functions: int
+    skipped_functions: int
+
+    def __new__(
+        cls,
+        diagnostics: list[Diagnostic],
+        hovers: dict[str, dict[str, dict[str, str]]],
+        error: str | None,
+        checked_functions: int = 0,
+        skipped_functions: int = 0,
+    ):
+        inst = super().__new__(cls, (diagnostics, hovers, error))
+        inst.diagnostics = diagnostics
+        inst.hovers = hovers
+        inst.error = error
+        inst.checked_functions = checked_functions
+        inst.skipped_functions = skipped_functions
+        return inst
 
 
 def run_worker(
@@ -373,7 +475,7 @@ def run_worker(
     *,
     cancel: threading.Event | None = None,
     on_proc: Callable[[subprocess.Popen[str]], None] | None = None,
-) -> tuple[list[Diagnostic], dict[str, dict[str, dict[str, str]]], str | None]:
+) -> WorkerRunResult:
     """Trace the files in a subprocess and bring back what it found.
 
     The worker runs with the project root as its working directory, which is
@@ -395,6 +497,7 @@ def run_worker(
         "sources": {str(Path(p).resolve()): text for p, text in (sources or {}).items()},
         "hover": hover,
         "allow_effects": config.allow_effects,
+        "stream": True,
     }
 
     env = dict(os.environ)
@@ -418,31 +521,99 @@ def run_worker(
             start_new_session=(os.name == "posix"),
         )
     except OSError as exc:
-        return [], {}, f"could not start {config.interpreter}: {exc}"
+        return WorkerRunResult([], {}, f"could not start {config.interpreter}: {exc}")
     if on_proc is not None:
         on_proc(proc)
 
-    stdout, stderr = _communicate(proc, json.dumps(job), config.timeout, cancel)
-    if stdout is None:
-        return [], {}, f"the trace timed out after {config.timeout:g}s"
+    stdout_lines, stderr, timed_out = _communicate(proc, json.dumps(job), config.timeout, cancel)
 
-    if not stdout.strip():
+    diagnostics: list[Diagnostic] = []
+    hovers: dict[str, dict[str, dict[str, str]]] = {}
+    worker_error: str | None = None
+    worker_ready = False
+    current_file: str | None = None
+    completed_files: set[str] = set()
+    checked_functions = 0
+    skipped_functions = 0
+
+    for line in stdout_lines:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            msg = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        event = msg.get("event")
+        if event == "ready":
+            worker_ready = True
+        elif event == "file_start":
+            current_file = msg.get("path")
+        elif event == "file_result":
+            path = msg.get("path")
+            if path:
+                completed_files.add(path)
+            for entry in msg.get("diagnostics", []):
+                diagnostic = Diagnostic.from_json(entry)
+                diagnostic.path = absolute.get(diagnostic.path, diagnostic.path)
+                diagnostics.append(diagnostic)
+            for p, shapes in msg.get("hovers", {}).items():
+                orig_p = absolute.get(p, p)
+                hovers[orig_p] = shapes
+            checked_functions += msg.get("checked_functions", 0)
+            skipped_functions += msg.get("skipped_functions", 0)
+        elif "error" in msg:
+            worker_error = msg["error"]
+        elif "diagnostics" in msg:
+            for entry in msg.get("diagnostics", []):
+                diagnostic = Diagnostic.from_json(entry)
+                diagnostic.path = absolute.get(diagnostic.path, diagnostic.path)
+                diagnostics.append(diagnostic)
+            for p, shapes in msg.get("hovers", {}).items():
+                orig_p = absolute.get(p, p)
+                hovers[orig_p] = shapes
+            checked_functions += msg.get("checked_functions", 0)
+            skipped_functions += msg.get("skipped_functions", 0)
+
+    if timed_out:
+        if not worker_ready and not completed_files:
+            return WorkerRunResult([], {}, f"the trace timed out after {config.timeout:g}s")
+
+        timed_out_path = current_file
+        if not timed_out_path or timed_out_path in completed_files:
+            for p in absolute:
+                if p not in completed_files:
+                    timed_out_path = p
+                    break
+
+        if timed_out_path:
+            caller_path = absolute.get(timed_out_path, timed_out_path)
+            diagnostics.append(
+                Diagnostic(
+                    path=caller_path,
+                    line=0,
+                    column=0,
+                    rule="trace-error",
+                    severity=Severity.ERROR,
+                    message=f"the trace timed out after {config.timeout:g}s",
+                )
+            )
+        return WorkerRunResult(diagnostics, hovers, None, checked_functions, skipped_functions)
+
+    if not stdout_lines:
         detail = (stderr or "").strip().splitlines()
         tail = detail[-1] if detail else f"exit code {proc.returncode}"
-        return [], {}, f"the worker produced no output ({tail})"
+        return WorkerRunResult([], {}, f"the worker produced no output ({tail})")
 
-    try:
-        result = json.loads(stdout)
-    except json.JSONDecodeError:
-        return [], {}, "the worker produced output that was not JSON"
+    if not worker_ready and not diagnostics and not worker_error and not hovers:
+        valid_json = any(
+            (line.strip().startswith("{") and line.strip().endswith("}")) for line in stdout_lines
+        )
+        if not valid_json:
+            return WorkerRunResult([], {}, "the worker produced output that was not JSON")
 
-    diagnostics = []
-    for entry in result.get("diagnostics", []):
-        diagnostic = Diagnostic.from_json(entry)
-        diagnostic.path = absolute.get(diagnostic.path, diagnostic.path)
-        diagnostics.append(diagnostic)
-    hovers = {absolute.get(p, p): shapes for p, shapes in result.get("hovers", {}).items()}
-    return diagnostics, hovers, result.get("error")
+    return WorkerRunResult(diagnostics, hovers, worker_error, checked_functions, skipped_functions)
 
 
 def apply_suppressions(
@@ -503,21 +674,23 @@ def check_paths(
     traceable: list[str] = []
     for path, scan in scans.items():
         report.checked_files += 1
-        report.checked_functions += sum(1 for t in scan.targets if t.has_array_annotation)
         report.diagnostics.extend(lint_scan(scan, config))
         needs_trace = any(t.has_array_annotation for t in scan.targets) or any(
             c.all_attributes for c in scan.classes
         )
         if scan.syntax_error is None and needs_trace:
             traceable.append(path)
+        elif scan.syntax_error is not None:
+            report.skipped_functions += sum(1 for t in scan.targets if t.has_array_annotation)
 
     if traceable:
-        traced, hovers, error = run_worker(
-            traceable, config, sources, hover, cancel=cancel, on_proc=on_proc
-        )
+        worker_res = run_worker(traceable, config, sources, hover, cancel=cancel, on_proc=on_proc)
+        traced, hovers, error = worker_res
         report.diagnostics.extend(traced)
         report.hovers = hovers
         report.worker_error = error
+        report.checked_functions += worker_res.checked_functions
+        report.skipped_functions += worker_res.skipped_functions
 
     per_file: dict[str, list[Diagnostic]] = {}
     for diagnostic in report.diagnostics:

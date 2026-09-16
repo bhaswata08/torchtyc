@@ -13,6 +13,7 @@ import pytest
 from torchtyc import cli, tracing, worker
 from torchtyc.binding import FIRST_PRIME
 from torchtyc.config import Config
+from torchtyc.diagnostics import Severity
 from torchtyc.discovery import scan_source
 from torchtyc.engine import check_paths, collect_files
 
@@ -66,6 +67,44 @@ def test_swapped_return_dims(project):
     report = check_paths(paths, config)
     assert "shape-mismatch" in rules(report)
     assert not report.ok
+
+
+def test_transpose_against_fixed_literal_reports_shape_mismatch(project):
+    paths, config = project(
+        HEADER
+        + """
+    def f(x: Float[Tensor, "b 101"]) -> Float[Tensor, "101 b"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+    assert not report.ok
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert diagnostic.expected == "(101, b)"
+    assert diagnostic.got == "(b, 101)"
+
+
+def test_transpose_against_composite_literal_under_retry_reports_shape_mismatch(project):
+    paths, config = project(
+        HEADER
+        + """
+    class DivisibleTranspose(nn.Module):
+        def __init__(self, n_heads: int = 8) -> None:
+            super().__init__()
+            self.n_heads = n_heads
+
+        def forward(self, x: Float[Tensor, "b 24"]) -> Float[Tensor, "24 b"]:
+            h = x.view(x.shape[0] // self.n_heads, self.n_heads, -1)
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+    assert not report.ok
+    diagnostic = next(d for d in report.diagnostics if d.rule == "shape-mismatch")
+    assert diagnostic.expected == "(24, b)"
+    assert diagnostic.got == "(b, 24)"
 
 
 def test_flatten_is_reported_as_a_rank_error(project):
@@ -609,10 +648,14 @@ def test_call_is_traced(project):
 
 
 def test_an_unannotated_tensor_argument_never_leaks_a_prime(project):
+    # Adapted from bare `bias: Tensor` to `bias: Float[Tensor, "_"]`: a bare
+    # Tensor parameter is now treated as unresolved and skipped (#17). To test
+    # that an anonymous axis renders as `_` without leaking primes, the parameter
+    # is explicitly given an anonymous jaxtyping dimension.
     paths, config = project(
         HEADER
         + """
-    def slice_to(bias: Tensor, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+    def slice_to(bias: Float[Tensor, "_"], x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
         return x[:, : bias.shape[0]]
     """
     )
@@ -2030,3 +2073,587 @@ def test_derived_sizes_explained_when_scale_greater_than_one(project):
     report = check_paths(paths, config)
     diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
     assert "<from d_model>" in diagnostic.message
+
+
+def test_sys_modules_cross_contamination_between_sibling_dirs(tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    (a / "helper.py").write_text("def widen(x): return x\n")
+    (b / "helper.py").write_text("def other(x): return x\n")
+
+    code_a = textwrap.dedent("""
+        import torch
+        from jaxtyping import Float
+        from helper import widen
+
+        def f(x: Float[torch.Tensor, "b d"]) -> Float[torch.Tensor, "b d"]:
+            return widen(x)
+    """)
+    code_b = textwrap.dedent("""
+        import torch
+        from jaxtyping import Float
+        from helper import widen
+
+        def g(x: Float[torch.Tensor, "b d"]) -> Float[torch.Tensor, "b d"]:
+            return widen(x)
+    """)
+
+    path_a = a / "model.py"
+    path_b = b / "model.py"
+    path_a.write_text(code_a)
+    path_b.write_text(code_b)
+
+    config = Config(root=tmp_path, python=sys.executable)
+
+    # 1. check b/model.py alone -> correct import-error, exit 1
+    rep1 = check_paths([str(path_b)], config)
+    assert rep1.errors == 1
+    assert [d.rule for d in rep1.diagnostics] == ["import-error"]
+    assert Path(rep1.diagnostics[0].path).resolve() == path_b.resolve()
+
+    # 2. check a/model.py b/model.py -> b fails with import-error, a succeeds
+    rep2 = check_paths([str(path_a), str(path_b)], config)
+    assert rep2.errors == 1
+    assert [d.rule for d in rep2.diagnostics] == ["import-error"]
+    assert Path(rep2.diagnostics[0].path).resolve() == path_b.resolve()
+
+    # 3. check b/model.py a/model.py -> order does not change outcome (b fails, a succeeds)
+    rep3 = check_paths([str(path_b), str(path_a)], config)
+    assert rep3.errors == 1
+    assert [d.rule for d in rep3.diagnostics] == ["import-error"]
+    assert Path(rep3.diagnostics[0].path).resolve() == path_b.resolve()
+
+
+def test_consistent_path_rendering_across_sibling_dirs(tmp_path, monkeypatch, capsys):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+
+    (a / "model.py").write_text("invalid syntax 1")
+    (b / "model.py").write_text("invalid syntax 2")
+
+    monkeypatch.chdir(tmp_path)
+
+    code_ba = cli.main(["check", "b/model.py", "a/model.py", "--python", sys.executable])
+    out_ba = capsys.readouterr().out
+    assert code_ba == 1
+    assert "a/model.py:" in out_ba
+    assert "b/model.py:" in out_ba
+    assert "model.py:" not in out_ba.replace("a/model.py:", "").replace("b/model.py:", "")
+
+    code_ab = cli.main(["check", "a/model.py", "b/model.py", "--python", sys.executable])
+    out_ab = capsys.readouterr().out
+    assert code_ab == 1
+    assert "a/model.py:" in out_ab
+    assert "b/model.py:" in out_ab
+    assert "model.py:" not in out_ab.replace("a/model.py:", "").replace("b/model.py:", "")
+
+
+def test_divisibility_assertion_regression_names_condition(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Attn(nn.Module):
+        def __init__(self, d_model: int, n_heads: int) -> None:
+            super().__init__()
+            assert d_model % n_heads == 0
+            self.n_heads = n_heads
+            self.qkv = nn.Linear(d_model, 3 * d_model)
+
+        def forward(self, x: Float[Tensor, "b s d_model"]) -> Float[Tensor, "b s d_model"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.errors == 1
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert diagnostic.message != ""
+    assert "d_model % n_heads == 0" in diagnostic.message
+    assert not diagnostic.message.endswith(":")
+    assert not diagnostic.message.endswith(": ")
+    assert diagnostic.hint == "d_model traced as 6 and n_heads as 15, so the assertion cannot hold"
+    assert diagnostic.note == (
+        "torchtyc picks these widths itself; give `n_heads` a default so it can pick ones that divide, "
+        "or add # torchtyc: ignore[trace-error]"
+    )
+
+
+def test_argumentless_exception_never_renders_bare_type_colon(project):
+    paths, config = project(
+        HEADER
+        + """
+    def fails(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        raise RuntimeError()
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert diagnostic.message == "RuntimeError"
+    assert not diagnostic.message.endswith(":")
+    assert not diagnostic.message.endswith(": ")
+    assert ": " not in diagnostic.message
+    assert diagnostic.hint is None
+    assert diagnostic.note is None
+
+
+def test_argumentless_constructor_exception_never_renders_bare_type_colon(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            raise ValueError()
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert diagnostic.message == "ValueError"
+    assert not diagnostic.message.endswith(":")
+    assert not diagnostic.message.endswith(": ")
+    assert not diagnostic.message.endswith("ValueError: ")
+    assert diagnostic.hint == f"d traced as {FIRST_PRIME}"
+    assert (
+        diagnostic.note == "torchtyc picks these widths itself; add # torchtyc: ignore[trace-error]"
+    )
+
+
+def test_tensor_free_line_reports_integer_hint(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Block(nn.Module):
+        def __init__(self, d_model: int, n_heads: int) -> None:
+            super().__init__()
+            assert d_model % n_heads == 0
+
+        def forward(self, x: Float[Tensor, "b s d_model"]) -> Float[Tensor, "b s d_model"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    diagnostic = next(d for d in report.diagnostics if d.rule == "trace-error")
+    assert diagnostic.hint == (
+        f"d_model traced as {FIRST_PRIME} and n_heads as {FIRST_PRIME + 2}, so the assertion cannot hold"
+    )
+    assert diagnostic.note == (
+        "torchtyc picks these widths itself; give `n_heads` a default so it can pick ones that divide, "
+        "or add # torchtyc: ignore[trace-error]"
+    )
+
+
+def test_bare_tensor_parameter_produces_unresolved_arg_warning_and_check_exits_zero(
+    project, tmp_path, monkeypatch, capsys
+):
+    # Reproduction from issue #17:
+    # def f(x: Float[Tensor, "b c"], w: Tensor) -> Float[Tensor, "b k"]: return x @ w
+    # Previously guessed rank 1 and failed with trace-error (exit 1).
+    # Now it produces unresolved-arg at WARNING level and check exits 0.
+    paths, config = project(
+        HEADER
+        + """
+    def f(x: Float[Tensor, "b c"], w: Tensor) -> Float[Tensor, "b k"]:
+        return x @ w
+    """
+    )
+    report = check_paths(paths, config)
+    assert "unresolved-arg" in rules(report)
+    d = next(d for d in report.diagnostics if d.rule == "unresolved-arg")
+    assert d.severity == Severity.WARNING
+    assert "cannot build a value for `w` of type `Tensor`" in d.message
+    assert d.hint == "annotate it with a jaxtyping array type"
+    assert "trace-error" not in rules(report)
+    assert report.errors == 0
+    assert report.ok
+
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "model.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "unresolved-arg" in out
+
+
+def test_bare_tensor_parameter_skips_function_rather_than_silently_passing(project):
+    # A function with a bare Tensor parameter must be skipped rather than
+    # silently passed (which would report 0 diagnostics and pretend it was checked).
+    # Its body is not executed during trace, so runtime errors in the body do not fire.
+    paths, config = project(
+        HEADER
+        + """
+    def broken(x: Float[Tensor, "b d"], w: Tensor) -> Float[Tensor, "b d"]:
+        raise RuntimeError("should not be executed during trace")
+    """
+    )
+    report = check_paths(paths, config)
+    assert [d.rule for d in report.diagnostics] == ["unresolved-arg"]
+    d = report.diagnostics[0]
+    assert d.severity == Severity.WARNING
+    assert d.function == "broken"
+    assert "cannot build a value for `w` of type `Tensor`" in d.message
+    assert "trace-error" not in rules(report)
+    assert "broken" not in report.shapes_in(paths[0])
+
+
+def test_qualified_torch_tensor_parameter_produces_unresolved_arg_warning(project):
+    paths, config = project(
+        HEADER
+        + """
+    def f(x: Float[Tensor, "b d"], w: torch.Tensor) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert [d.rule for d in report.diagnostics] == ["unresolved-arg"]
+    d = report.diagnostics[0]
+    assert d.severity == Severity.WARNING
+    assert "cannot build a value for `w` of type `torch.Tensor`" in d.message
+    assert d.hint == "annotate it with a jaxtyping array type"
+
+
+def test_malformed_symbolic_dim_produces_unsupported_annotation_warning_no_trace_error(project):
+    paths, config = project(
+        HEADER
+        + """
+    def broken(x: Float[Tensor, "a+"]) -> Float[Tensor, "b"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "unsupported-annotation" in rules(report)
+    d = next(d for d in report.diagnostics if d.rule == "unsupported-annotation")
+    assert d.severity == Severity.WARNING
+    assert "`x`: bad dimension 'a+'" in d.message
+    # Anchored at the parameter's line, not at a traced call
+    assert d.line == 6
+    assert "trace-error" not in rules(report)
+    assert report.errors == 0
+    assert report.ok
+
+
+def test_malformed_symbolic_dim_in_return_produces_unsupported_annotation(project):
+    paths, config = project(
+        HEADER
+        + """
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b+"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "unsupported-annotation" in rules(report)
+    d = next(d for d in report.diagnostics if d.rule == "unsupported-annotation")
+    assert d.severity == Severity.WARNING
+    assert "return annotation: bad dimension 'b+'" in d.message
+    assert "trace-error" not in rules(report)
+
+
+def test_malformed_symbolic_dim_does_not_trigger_retry_machinery(tmp_path):
+    source = textwrap.dedent(
+        HEADER
+        + """
+    def broken(x: Float[Tensor, "a+"]) -> Float[Tensor, "b"]:
+        d = 8  # divisor that would trigger retries if tracing failed generically
+        return x
+    """
+    )
+    path = tmp_path / "model.py"
+    path.write_text(source)
+    module = worker.import_from_path(path)
+    scan = scan_source(source, str(path))
+    target = scan.targets[0]
+
+    with patch.object(tracing, "_trace", wraps=tracing._trace) as mock_trace:
+        diags, _ = worker.check_target(module, target, str(path), 2, scan.targets)
+
+    # _trace is skipped on the first attempt without executing retries (which would run _trace 3 times)
+    assert mock_trace.call_count == 1
+    assert any(d.rule == "unresolved-arg" for d in diags)
+    assert not any(d.rule == "trace-error" for d in diags)
+
+
+def test_malformed_symbolic_dim_skips_trace_entirely_when_only_annotation(project):
+    paths, config = project(
+        HEADER
+        + """
+    def broken(x: Float[Tensor, "a+"]):
+        d = 8
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "unsupported-annotation" in rules(report)
+    assert "trace-error" not in rules(report)
+    # The function has no valid array annotations, so it is never traced or retried
+    assert report.checked_functions == 0
+
+
+def test_symbolic_dim_non_dim_construct_produces_unsupported_annotation(project):
+    paths, config = project(
+        HEADER
+        + """
+    def f(x: Float[Tensor, "a.b+1"]) -> Float[Tensor, "c"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert "unsupported-annotation" in rules(report)
+    d = next(d for d in report.diagnostics if d.rule == "unsupported-annotation")
+    assert d.severity == Severity.WARNING
+    assert "bad dimension 'a.b+1'" in d.message
+    assert "trace-error" not in rules(report)
+
+
+def test_symbolic_dim_unbound_identifier_in_return_binds_fresh_prime(project):
+    paths, config = project(
+        HEADER
+        + """
+    def f(x: Float[Tensor, "a"]) -> Float[Tensor, "a+b"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The dimension 'b' binds cleanly to a fresh prime, but the returned tensor
+    # of shape (a,) does not equal (a+b,), producing shape-mismatch rather than a trace crash.
+    assert "shape-mismatch" in rules(report)
+    assert "trace-error" not in rules(report)
+
+
+def test_timeout_preserves_earlier_findings_and_attributes_timeout(tmp_path, monkeypatch, capsys):
+    fast = tmp_path / "fast.py"
+    slow = tmp_path / "slow.py"
+    fast.write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            def mismatch(x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:
+                return x
+            """
+        )
+    )
+    slow.write_text(
+        textwrap.dedent(
+            """
+            import time
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            time.sleep(10)
+
+            def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "fast.py", "slow.py", "--timeout", "1.0", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "shape-mismatch" in out
+    assert "fast.py" in out
+    assert "slow.py" in out
+    assert "the trace timed out after 1s" in out
+
+
+def test_timeout_when_slow_file_is_first(tmp_path, monkeypatch, capsys):
+    slow = tmp_path / "slow.py"
+    slow.write_text(
+        textwrap.dedent(
+            """
+            import time
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            time.sleep(10)
+
+            def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "slow.py", "--timeout", "1.0", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "slow.py" in out
+    assert "the trace timed out after 1s" in out
+
+
+def test_per_file_timeout_does_not_fail_on_aggregate_duration(tmp_path, monkeypatch, capsys):
+    f1 = tmp_path / "f1.py"
+    f2 = tmp_path / "f2.py"
+    f1.write_text(
+        textwrap.dedent(
+            """
+            import time
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            time.sleep(1.2)
+
+            def f1(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    f2.write_text(
+        textwrap.dedent(
+            """
+            import time
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            time.sleep(1.2)
+
+            def f2(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    # Total time of f1 + f2 is 2.4s (plus torch import ~1s, total ~3.5s).
+    # With a per-file timeout of 2.0s, the job succeeds because each file takes < 2.0s.
+    code = cli.main(["check", "f1.py", "f2.py", "--timeout", "2.0", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "No problems" in out
+
+
+def test_worker_cleans_up_linecache_entries(tmp_path):
+    import linecache
+
+    from torchtyc.worker import run_job
+
+    path1 = str(tmp_path / "a.py")
+    path2 = str(tmp_path / "b.py")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+
+    job = {
+        "paths": [path1, path2],
+        "sources": {path1: "buffer_a = 1\n"},
+    }
+    run_job(job)
+    assert path1 not in linecache.cache
+    assert str((tmp_path / "a.py").resolve()) not in linecache.cache
+
+
+def test_config_object_init_gets_zero_coverage_and_still_exits_0(tmp_path, monkeypatch, capsys):
+    model_py = tmp_path / "model.py"
+    model_py.write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor, nn
+
+            class GPTConfig:
+                pass
+
+            class GPT(nn.Module):
+                def __init__(self, cfg: GPTConfig) -> None:
+                    super().__init__()
+
+                def forward(self, x: Float[Tensor, "b s d"]) -> Float[Tensor, "b s d"]:
+                    return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "model.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "0 function(s) (1 skipped)" in out
+
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths(["model.py"], config)
+    assert report.checked_functions == 0
+    assert report.skipped_functions == 1
+
+
+def test_config_object_init_with_severity_error_shows_zero_coverage_and_exits_0(
+    tmp_path, monkeypatch, capsys
+):
+    model_py = tmp_path / "model.py"
+    model_py.write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor, nn
+
+            class GPTConfig:
+                pass
+
+            class GPT(nn.Module):
+                def __init__(self, cfg: GPTConfig) -> None:
+                    super().__init__()
+
+                def forward(self, x: Float[Tensor, "b s d"]) -> Float[Tensor, "b s d"]:
+                    return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "model.py", "--severity", "error", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "No problems in 0 function(s) (1 skipped) across 1 file(s)" in out
+
+
+def test_mixed_checked_and_skipped_functions(project):
+    paths, config = project(
+        HEADER
+        + """
+    class GPTConfig:
+        pass
+
+    class GPT(nn.Module):
+        def __init__(self, cfg: GPTConfig) -> None:
+            super().__init__()
+
+        def forward(self, x: Float[Tensor, "b s d"]) -> Float[Tensor, "b s d"]:
+            return x
+
+    def normal_fn(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.checked_functions == 1
+    assert report.skipped_functions == 1
+
+
+def test_multiple_methods_skipped_on_uninstantiable_class(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Config:
+        pass
+
+    class Model(nn.Module):
+        def __init__(self, cfg: Config) -> None:
+            super().__init__()
+
+        def forward(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+            return x
+
+        def loss(self, x: Float[Tensor, "b d"]) -> Float[Tensor, "b"]:
+            return x.sum(dim=-1)
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.checked_functions == 0
+    assert report.skipped_functions == 2

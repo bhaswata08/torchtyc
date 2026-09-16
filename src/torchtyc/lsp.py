@@ -17,6 +17,7 @@ import logging
 import re
 import subprocess
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -27,7 +28,7 @@ from . import __version__
 from . import config as config_module
 from .config import Config, Overrides
 from .diagnostics import Diagnostic, Severity
-from .discovery import Target, scan_source
+from .discovery import Target, _byte_to_codepoint, scan_source
 from .engine import (
     Report,
     WorkerCancelled,
@@ -67,7 +68,47 @@ def path_to_uri(path: str) -> str:
     return Path(path).resolve().as_uri()
 
 
-def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
+def _codepoint_to_lsp_units(
+    line: str,
+    col: int,
+    encoding: lsp.PositionEncodingKind | str = lsp.PositionEncodingKind.Utf16,
+) -> int:
+    """Convert a 0-based code point index in `line` to LSP character units for `encoding`."""
+    if col <= 0:
+        return 0
+    prefix = line[:col]
+    if encoding == lsp.PositionEncodingKind.Utf8 or encoding == "utf-8":
+        return len(prefix.encode("utf-8"))
+    if encoding == lsp.PositionEncodingKind.Utf32 or encoding == "utf-32":
+        return col
+    return len(prefix.encode("utf-16-le")) // 2
+
+
+def _lsp_units_to_codepoint(
+    line: str,
+    character: int,
+    encoding: lsp.PositionEncodingKind | str = lsp.PositionEncodingKind.Utf16,
+) -> int:
+    """Convert a 0-based LSP character unit offset in `line` to a 0-based code point index."""
+    if character <= 0:
+        return 0
+    if encoding == lsp.PositionEncodingKind.Utf8 or encoding == "utf-8":
+        return _byte_to_codepoint(line, character)
+    if encoding == lsp.PositionEncodingKind.Utf32 or encoding == "utf-32":
+        return min(character, len(line))
+    units = 0
+    for idx, c in enumerate(line):
+        if units >= character:
+            return idx
+        units += 2 if ord(c) >= 0x10000 else 1
+    return len(line)
+
+
+def to_lsp(
+    diagnostic: Diagnostic,
+    lines: Sequence[str] | None = None,
+    encoding: lsp.PositionEncodingKind | str = lsp.PositionEncodingKind.Utf16,
+) -> lsp.Diagnostic:
     message = diagnostic.message
     if diagnostic.expected is not None or diagnostic.got is not None:
         message += f"\n  expected: {diagnostic.expected}\n  got:      {diagnostic.got}"
@@ -78,15 +119,31 @@ def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
     if diagnostic.suggestion:
         message += f"\n  try: {diagnostic.suggestion}"
 
+    if lines is None and diagnostic.path:
+        try:
+            lines = Path(diagnostic.path).read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError:
+            lines = None
+
     end_line = diagnostic.end_line if diagnostic.end_line is not None else diagnostic.line
     end_column = (
         diagnostic.end_column if diagnostic.end_column is not None else diagnostic.column + 1
     )
 
+    start_char = diagnostic.column
+    end_char = end_column
+    if lines is not None:
+        if 0 <= diagnostic.line < len(lines):
+            start_char = _codepoint_to_lsp_units(
+                lines[diagnostic.line], diagnostic.column, encoding
+            )
+        if 0 <= end_line < len(lines):
+            end_char = _codepoint_to_lsp_units(lines[end_line], end_column, encoding)
+
     return lsp.Diagnostic(
         range=lsp.Range(
-            start=lsp.Position(line=diagnostic.line, character=diagnostic.column),
-            end=lsp.Position(line=end_line, character=end_column),
+            start=lsp.Position(line=diagnostic.line, character=start_char),
+            end=lsp.Position(line=end_line, character=end_char),
         ),
         severity=_SEVERITY[diagnostic.severity],
         code=diagnostic.rule,
@@ -96,6 +153,9 @@ def to_lsp(diagnostic: Diagnostic) -> lsp.Diagnostic:
         source="torchtyc",
         message=message,
     )
+
+
+_to_lsp = to_lsp
 
 
 class _TraceRun:
@@ -154,8 +214,19 @@ class TorchtycServer(LanguageServer):
         return self.overrides.apply(config_module.load(path))
 
     def publish(self, uri: str, diagnostics: list[Diagnostic]) -> None:
+        try:
+            document = self.workspace.get_text_document(uri)
+            lines = document.lines
+        except (KeyError, AttributeError, RuntimeError):
+            lines = None
+        encoding = getattr(
+            getattr(self, "workspace", None), "position_encoding", lsp.PositionEncodingKind.Utf16
+        )
         self.text_document_publish_diagnostics(
-            lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[to_lsp(d) for d in diagnostics])
+            lsp.PublishDiagnosticsParams(
+                uri=uri,
+                diagnostics=[to_lsp(d, lines=lines, encoding=encoding) for d in diagnostics],
+            )
         )
 
     def lint_now(self, uri: str) -> None:
@@ -425,7 +496,11 @@ def inlay_hints(ls: TorchtycServer, params: lsp.InlayHintParams) -> list[lsp.Inl
         if summary is None:
             continue
         try:
-            character = len(document.lines[line].rstrip("\r\n"))
+            line_text = document.lines[line].rstrip("\r\n")
+            encoding = getattr(
+                getattr(ls, "workspace", None), "position_encoding", lsp.PositionEncodingKind.Utf16
+            )
+            character = _codepoint_to_lsp_units(line_text, len(line_text), encoding)
         except IndexError:
             continue
         hints.append(
@@ -489,6 +564,9 @@ def code_action(ls: TorchtycServer, params: lsp.CodeActionParams) -> list[lsp.Co
     """Offer to silence a diagnostic, or to adopt the shape that was traced."""
     uri = params.text_document.uri
     document = ls.workspace.get_text_document(uri)
+    encoding = getattr(
+        getattr(ls, "workspace", None), "position_encoding", lsp.PositionEncodingKind.Utf16
+    )
     actions: list[lsp.CodeAction] = []
 
     for diagnostic in params.context.diagnostics:
@@ -512,7 +590,9 @@ def code_action(ls: TorchtycServer, params: lsp.CodeActionParams) -> list[lsp.Co
 
         suggestion = _extract(diagnostic.message, "try:")
         edit = (
-            _rewrite_annotation(uri, document, diagnostic.range, suggestion) if suggestion else None
+            _rewrite_annotation(uri, document, diagnostic.range, suggestion, encoding=encoding)
+            if suggestion
+            else None
         )
         if edit is not None:
             actions.append(
@@ -559,7 +639,11 @@ _ANNOTATION = re.compile(r'[A-Za-z_]\w*\s*\[[^][]*"[^"]*"\s*\]')
 
 
 def _rewrite_annotation(
-    uri: str, document: Any, span: lsp.Range, suggestion: str
+    uri: str,
+    document: Any,
+    span: lsp.Range,
+    suggestion: str,
+    encoding: lsp.PositionEncodingKind | str = lsp.PositionEncodingKind.Utf16,
 ) -> lsp.WorkspaceEdit | None:
     """Replace exactly the annotation the diagnostic points at.
 
@@ -584,7 +668,9 @@ def _rewrite_annotation(
     except IndexError:
         return None
 
-    target = text[span.start.character : span.end.character]
+    start_char = _lsp_units_to_codepoint(text, span.start.character, encoding)
+    end_char = _lsp_units_to_codepoint(text, span.end.character, encoding)
+    target = text[start_char:end_char]
     if _ANNOTATION.fullmatch(target) is None or target == suggestion:
         return None
 

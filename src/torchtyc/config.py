@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -71,8 +73,24 @@ class Overrides:
         return config
 
 
-def find_root(start: Path) -> Path:
-    start = start.resolve()
+def find_root(start: Path | str | Sequence[Path | str]) -> Path:
+    if isinstance(start, (list, tuple)):
+        if not start:
+            return find_root(Path("."))
+        if len(start) == 1:
+            return find_root(start[0])
+        resolved = [Path(p).resolve() for p in start]
+        try:
+            common = Path(os.path.commonpath(resolved))
+        except ValueError:
+            return find_root(resolved[0])
+        common_dir = common if common.is_dir() else common.parent
+        for directory in [common_dir, *common_dir.parents]:
+            if (directory / "pyproject.toml").exists():
+                return directory
+        return common_dir
+
+    start = Path(start).resolve()
     for directory in [start, *start.parents]:
         if (directory / "pyproject.toml").exists():
             return directory
@@ -97,8 +115,8 @@ def _positive(value: float) -> float:
     return value
 
 
-def load(start: Path | str = ".") -> Config:
-    root = find_root(Path(start))
+def load(start: Path | str | Sequence[Path | str] = ".") -> Config:
+    root = find_root(start)
     config = Config(root=root)
 
     pyproject = root / "pyproject.toml"

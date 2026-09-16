@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Sequence
+from pathlib import Path
 
 from . import __version__
 from . import config as config_module
@@ -37,7 +39,7 @@ def _overrides_from(args: argparse.Namespace) -> config_module.Overrides:
     )
 
 
-def _config_from(args: argparse.Namespace, start: str):
+def _config_from(args: argparse.Namespace, start: Path | str | Sequence[Path | str]):
     return _overrides_from(args).apply(config_module.load(start))
 
 
@@ -72,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    config = _config_from(args, args.paths[0])
+    config = _config_from(args, args.paths)
     files = collect_files(args.paths, config)
     if not files:
         print("no python files found", file=sys.stderr)
@@ -127,7 +129,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print("watch needs the `watch` extra: pip install 'torchtyc[watch]'", file=sys.stderr)
         return 2
 
-    config = _config_from(args, args.paths[0])
+    config = _config_from(args, args.paths)
 
     def run_once() -> None:
         files = collect_files(args.paths, config)

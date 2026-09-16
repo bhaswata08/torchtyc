@@ -153,19 +153,26 @@ def _from_plain_type(plain: str | None, name: str, binder: DimBinder) -> Any:
     if plain in _DTYPE_TYPES:
         return torch.float32
     if plain == "Tensor" or (plain or "").endswith(".Tensor"):
-        # An unannotated tensor: one dimension is the least constraining guess.
-        # The axis carries no name the user wrote, so it binds as anonymous and
-        # renders as `_` instead of leaking the synthetic prime.
-        return torch.empty((binder.bind_anonymous(),), device="meta")
+        # A bare tensor carries no shape or rank annotation. Any guess (such as
+        # rank 1) is arbitrary and breaks valid multi-dimensional operations
+        # like matmuls. Leaving it as _MISSING lets the caller report an
+        # unresolved-arg warning and skip the function rather than guessing.
+        return _MISSING
     return _MISSING
 
 
 def _unresolved(name: str, plain: str | None) -> TraceSkipped:
+    is_tensor = plain == "Tensor" or (plain or "").endswith(".Tensor")
+    hint = (
+        "annotate it with a jaxtyping array type"
+        if is_tensor
+        else "give it a default, or annotate it with a jaxtyping array type"
+    )
     return TraceSkipped(
         "unresolved-arg",
         f"cannot build a value for `{name}`"
         + (f" of type `{plain}`" if plain else " because it has no annotation"),
-        hint="give it a default, or annotate it with a jaxtyping array type",
+        hint=hint,
     )
 
 
@@ -629,7 +636,7 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     carries the binder. That is what lets the caller report the failure in the
     user's axis names instead of the primes torch actually saw.
     """
-    binder = DimBinder(variadic_rank=variadic_rank)
+    binder = DimBinder(variadic_rank=variadic_rank, literals=target.literal_dims)
     built = Construction()
     try:
         return _trace(module, target, binder, built)
@@ -641,7 +648,12 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
             raise TraceFailed(first, binder) from first
         failure: BaseException = first
         for scale in _divisible_scales(module, target)[:_MAX_RETRIES]:
-            wider = DimBinder(variadic_rank=variadic_rank, scale=scale, defaults_first=True)
+            wider = DimBinder(
+                variadic_rank=variadic_rank,
+                scale=scale,
+                defaults_first=True,
+                literals=target.literal_dims,
+            )
             again = Construction()
             try:
                 result = _trace(module, target, wider, again)
@@ -809,6 +821,7 @@ def _shapes_with_dim_moved(
         variadic_rank=binder.variadic_rank,
         scale=binder.scale,
         sizes={**binder.sizes, name: size},
+        literals=binder.literals,
         _next=binder._next,
     )
     try:

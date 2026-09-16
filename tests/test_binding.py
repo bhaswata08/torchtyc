@@ -3,11 +3,12 @@ import threading
 
 import pytest
 
-from torchtyc.annotations import ArraySpec, parse_dim_string
+from torchtyc.annotations import ArraySpec, Dim, parse_dim_string
 from torchtyc.binding import (
     FIRST_PRIME,
     BindingError,
     DimBinder,
+    _eval_symbolic,
     check_shape,
     distant_prime,
     shape_for,
@@ -85,6 +86,45 @@ def test_symbolic_dim():
     check_shape(spec("a+b"), (204,), binder)
     with pytest.raises(BindingError):
         check_shape(spec("a+b"), (205,), binder)
+
+
+def test_eval_symbolic_defensive_syntax_error():
+    dim = Dim("symbolic", expr="a+")
+    binder = DimBinder()
+    with pytest.raises(BindingError) as caught:
+        _eval_symbolic(dim, binder)
+    assert caught.value.rule == "unsupported-annotation"
+    assert "could not evaluate dimension 'a+'" in caught.value.message
+
+
+def test_eval_symbolic_non_integer_result():
+    dim = Dim("symbolic", expr="a/b")
+    binder = DimBinder()
+    binder.sizes.update({"a": 101, "b": 103})
+    with pytest.raises(BindingError) as caught:
+        _eval_symbolic(dim, binder)
+    assert caught.value.rule == "unsupported-annotation"
+    assert "is not an integer" in caught.value.message
+
+
+def test_eval_symbolic_zero_division():
+    dim = Dim("symbolic", expr="a//0")
+    binder = DimBinder()
+    binder.sizes["a"] = 101
+    with pytest.raises(BindingError) as caught:
+        _eval_symbolic(dim, binder)
+    assert caught.value.rule == "unsupported-annotation"
+    assert "division by zero" in caught.value.message
+
+
+def test_eval_symbolic_prime_pool_exhaustion():
+    dim = Dim("symbolic", expr="a+b")
+    binder = DimBinder()
+    binder._next = 1000000
+    with pytest.raises(BindingError) as caught:
+        _eval_symbolic(dim, binder)
+    assert caught.value.rule == "unsupported-annotation"
+    assert "could not evaluate dimension" in caught.value.message
 
 
 def test_describe_factors_a_flattened_axis():
@@ -452,3 +492,59 @@ def test_suggest_dims_refuses_an_unbound_prime():
     # 103 is the next prime the binder would hand out, but nothing bound it.
     # Suggesting fixed "103" would leak an implementation detail.
     assert binder.suggest_dims((103,)) is None
+
+
+def test_describe_renders_literal_axis_as_number():
+    binder = DimBinder(literals={101})
+    binder.sizes["b"] = 101
+    assert binder.describe(101) == "101"
+
+
+def test_describe_renders_annotated_literal_as_number_and_reserves_it():
+    binder = DimBinder()
+    shape = shape_for(spec("b 101"), binder)
+    assert binder.sizes["b"] == 103
+    assert shape == (103, 101)
+    assert binder.describe(101) == "101"
+    assert binder.describe(103) == "b"
+
+
+def test_fresh_skips_reserved_literals():
+    binder = DimBinder(literals={101, 103})
+    assert binder.fresh() == 107
+
+
+def test_fresh_skips_composite_literals_under_scale():
+    binder = DimBinder(scale=8, literals={24})
+    assert binder.fresh() == 40
+
+
+def test_fresh_exhaustion_with_reserved_literals():
+    from torchtyc.binding import coprime_pool
+
+    pool = coprime_pool(1)
+    binder = DimBinder(literals=set(pool[1:]))
+    assert binder.fresh() == pool[0]
+    with pytest.raises(BindingError, match="ran out of distinct dimension primes"):
+        binder.fresh()
+
+
+def test_free_return_dim_matching_annotated_literal_reports_no_shape_error():
+    binder = DimBinder(literals={101})
+    shape = shape_for(spec("b 101"), binder)
+    # A free, return-only dimension name whose traced size equals a fixed
+    # literal appearing elsewhere in the signature must bind without error.
+    check_shape(spec("b k"), shape, binder)
+    assert binder.sizes["k"] == 101
+
+
+def test_free_return_dim_matching_annotated_literal_used_consistently():
+    binder = DimBinder(literals={101})
+    shape = shape_for(spec("b 101"), binder)
+    check_shape(spec("b k"), shape, binder)
+    assert binder.sizes["k"] == 101
+    # Consistent use of k passes
+    check_shape(spec("k b"), (101, binder.sizes["b"]), binder)
+    # Inconsistent use of k fails
+    with pytest.raises(BindingError, match=r"annotated `k`, but this axis traced 102"):
+        check_shape(spec("k b"), (102, binder.sizes["b"]), binder)

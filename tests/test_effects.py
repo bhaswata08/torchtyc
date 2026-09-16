@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import signal
 import socket
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -458,3 +460,241 @@ def test_unwrap_blocked_finds_blocked_in_cyclic_cause():
     blocked.__cause__ = first
 
     assert unwrap_blocked(first) is blocked
+
+
+def test_dns_resolution_blocked_during_trace(project):
+    paths, config = project(
+        HEADER
+        + """
+    import socket
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        socket.getaddrinfo("localhost", 80)
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "trace-error"
+    assert "BlockedEffect" in diag.message
+    assert "DNS resolution" in diag.message
+    lines = Path(paths[0]).read_text().splitlines()
+    assert "getaddrinfo" in lines[diag.line]
+
+
+def test_dns_resolution_allowed_by_config(project):
+    paths, config = project(
+        HEADER
+        + """
+    import socket
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        socket.getaddrinfo("localhost", 80)
+        return x
+    """,
+        allow_effects=True,
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_subprocess_run_blocked(project):
+    paths, config = project(
+        HEADER
+        + """
+    import subprocess
+
+    subprocess.run(["echo", "hello"])
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "import-error"
+    assert "BlockedEffect" in diag.message
+    assert "cannot spawn process" in diag.message
+    lines = Path(paths[0]).read_text().splitlines()
+    assert "subprocess.run" in lines[diag.line]
+
+
+def test_os_system_blocked(project):
+    paths, config = project(
+        HEADER
+        + """
+    import os
+
+    os.system("echo hello")
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "import-error"
+    assert "BlockedEffect" in diag.message
+    assert "cannot spawn process" in diag.message
+    lines = Path(paths[0]).read_text().splitlines()
+    assert "os.system" in lines[diag.line]
+
+
+def test_pseudo_cache_directory_write_blocked(project, tmp_path: Path):
+    target_dir = tmp_path / "triton_checkpoints"
+    target_dir.mkdir()
+    target_file = target_dir / "model.pt"
+    paths, config = project(
+        HEADER
+        + f"""
+    from pathlib import Path
+
+    Path({str(target_file)!r}).write_text("weights")
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert not target_file.exists()
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "import-error"
+    assert "BlockedEffect" in diag.message
+    assert "cannot write" in diag.message
+
+
+def test_real_inductor_cache_write_allowed(project):
+    from torchtyc.effects import _allowed_cache_dirs
+
+    cache_dir = _allowed_cache_dirs()[0]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target_file = cache_dir / "test_kernel.py"
+    paths, config = project(
+        HEADER
+        + f"""
+    from pathlib import Path
+
+    Path({str(target_file)!r}).write_text("cache_payload")
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    try:
+        report = check_paths(paths, config)
+        assert target_file.exists()
+        assert target_file.read_text() == "cache_payload"
+        assert report.diagnostics == []
+        assert report.ok
+    finally:
+        if target_file.exists():
+            target_file.unlink()
+
+
+def test_new_hooks_removed_on_uninstall():
+    orig_getaddrinfo = socket.getaddrinfo
+    orig_gethostbyname = socket.gethostbyname
+    orig_gethostbyname_ex = socket.gethostbyname_ex
+    orig_gethostbyaddr = socket.gethostbyaddr
+    orig_getnameinfo = socket.getnameinfo
+
+    orig_popen = subprocess.Popen
+    orig_popen_init = subprocess.Popen.__init__
+    orig_run = subprocess.run
+    orig_call = subprocess.call
+    orig_check_call = subprocess.check_call
+    orig_check_output = subprocess.check_output
+
+    orig_system = os.system
+
+    posix_names = ("posix_spawn", "posix_spawnp")
+    orig_posix = {name: getattr(os, name) for name in posix_names if hasattr(os, name)}
+
+    spawn_names = (
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+    )
+    orig_spawn = {name: getattr(os, name) for name in spawn_names if hasattr(os, name)}
+
+    exec_names = (
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+    )
+    orig_exec = {name: getattr(os, name) for name in exec_names if hasattr(os, name)}
+
+    sub_extra_names = ("getoutput", "getstatusoutput")
+    orig_sub_extra = {
+        name: getattr(subprocess, name) for name in sub_extra_names if hasattr(subprocess, name)
+    }
+
+    with active_guard(enabled=True):
+        assert socket.getaddrinfo != orig_getaddrinfo
+        assert socket.gethostbyname != orig_gethostbyname
+        assert socket.gethostbyname_ex != orig_gethostbyname_ex
+        assert socket.gethostbyaddr != orig_gethostbyaddr
+        assert socket.getnameinfo != orig_getnameinfo
+
+        assert subprocess.Popen != orig_popen
+        assert subprocess.Popen.__init__ != orig_popen_init
+        assert subprocess.run != orig_run
+        assert subprocess.call != orig_call
+        assert subprocess.check_call != orig_check_call
+        assert subprocess.check_output != orig_check_output
+
+        assert os.system != orig_system
+
+        for name, orig_fn in orig_posix.items():
+            assert getattr(os, name) != orig_fn
+
+        for name, orig_fn in orig_spawn.items():
+            assert getattr(os, name) != orig_fn
+
+        for name, orig_fn in orig_exec.items():
+            assert getattr(os, name) != orig_fn
+
+        for name, orig_fn in orig_sub_extra.items():
+            assert getattr(subprocess, name) != orig_fn
+
+    assert socket.getaddrinfo is orig_getaddrinfo
+    assert socket.gethostbyname is orig_gethostbyname
+    assert socket.gethostbyname_ex is orig_gethostbyname_ex
+    assert socket.gethostbyaddr is orig_gethostbyaddr
+    assert socket.getnameinfo is orig_getnameinfo
+
+    assert subprocess.Popen is orig_popen
+    assert subprocess.Popen.__init__ is orig_popen_init
+    assert subprocess.run is orig_run
+    assert subprocess.call is orig_call
+    assert subprocess.check_call is orig_check_call
+    assert subprocess.check_output is orig_check_output
+
+    assert os.system is orig_system
+
+    for name, orig_fn in orig_posix.items():
+        assert getattr(os, name) is orig_fn
+
+    for name, orig_fn in orig_spawn.items():
+        assert getattr(os, name) is orig_fn
+
+    for name, orig_fn in orig_exec.items():
+        assert getattr(os, name) is orig_fn
+
+    for name, orig_fn in orig_sub_extra.items():
+        assert getattr(subprocess, name) is orig_fn

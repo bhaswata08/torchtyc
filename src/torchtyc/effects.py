@@ -13,12 +13,15 @@ effects such as automated downloads, hardware initialization, and logging.
 from __future__ import annotations
 
 import builtins
+import getpass
 import inspect
 import io
 import os
 import pathlib
+import re
 import shutil
 import socket
+import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -84,14 +87,60 @@ def _is_write_mode(mode: str) -> bool:
     return any(char in mode for char in ("w", "a", "x", "+"))
 
 
+def _allowed_cache_dirs() -> list[Path]:
+    dirs: list[Path] = []
+
+    # TorchInductor cache
+    inductor_env = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+    if inductor_env:
+        try:
+            dirs.append(Path(inductor_env).resolve())
+        except (ValueError, OSError):
+            pass
+    try:
+        username = getpass.getuser()
+    except (KeyError, OSError):
+        getuid = getattr(os, "getuid", None)
+        username = f"uid_{getuid()}" if callable(getuid) else "unknown_user"
+    sanitized_username = re.sub(r'[\\/:*?"<>|]', "_", username)
+    default_name = f"torchinductor_{sanitized_username}"
+    dirs.append((Path(tempfile.gettempdir()) / default_name).resolve())
+    dirs.append((Path("/var/tmp") / default_name).resolve())
+
+    # Triton caches
+    for env_var in ("TRITON_CACHE_DIR", "TRITON_DUMP_DIR", "TRITON_OVERRIDE_DIR"):
+        val = os.environ.get(env_var)
+        if val:
+            try:
+                dirs.append(Path(val).resolve())
+            except (ValueError, OSError):
+                pass
+
+    triton_home = os.environ.get("TRITON_HOME")
+    if triton_home:
+        try:
+            dirs.append((Path(triton_home) / ".triton").resolve())
+        except (ValueError, OSError):
+            pass
+    else:
+        try:
+            dirs.append((Path.home() / ".triton").resolve())
+        except (RuntimeError, OSError):
+            pass
+
+    return dirs
+
+
 def _is_allowed_write(target: Any) -> bool:
     # Importing torch and tracing on meta tensors populates the inductor and
     # triton caches. Those writes come from us, not from the user's code, and
     # blocking them would break the check we are trying to run.
     try:
-        p = Path(target)
-        for part in p.parts:
-            if part.startswith(("torchinductor_", "triton_")):
+        if isinstance(target, bytes):
+            target = os.fsdecode(target)
+        p = Path(target).resolve()
+        for allowed in _allowed_cache_dirs():
+            if p.is_relative_to(allowed):
                 return True
     except (TypeError, ValueError, OSError):
         return False
@@ -147,6 +196,40 @@ _orig_socket_connect = socket.socket.connect
 _orig_socket_connect_ex = socket.socket.connect_ex
 _orig_socket_sendto = socket.socket.sendto
 _orig_create_connection = socket.create_connection
+_orig_socket_getaddrinfo = socket.getaddrinfo
+_orig_socket_gethostbyname = socket.gethostbyname
+_orig_socket_gethostbyname_ex = socket.gethostbyname_ex
+_orig_socket_gethostbyaddr = socket.gethostbyaddr
+_orig_socket_getnameinfo = socket.getnameinfo
+
+_orig_subprocess_popen = subprocess.Popen
+_orig_subprocess_popen_init = subprocess.Popen.__init__
+_orig_subprocess_run = subprocess.run
+_orig_subprocess_call = subprocess.call
+_orig_subprocess_check_call = subprocess.check_call
+_orig_subprocess_check_output = subprocess.check_output
+_orig_subprocess_getoutput = getattr(subprocess, "getoutput", None)
+_orig_subprocess_getstatusoutput = getattr(subprocess, "getstatusoutput", None)
+
+_orig_os_system = os.system
+_orig_os_posix_spawn = getattr(os, "posix_spawn", None)
+_orig_os_posix_spawnp = getattr(os, "posix_spawnp", None)
+_orig_os_spawnl = getattr(os, "spawnl", None)
+_orig_os_spawnle = getattr(os, "spawnle", None)
+_orig_os_spawnlp = getattr(os, "spawnlp", None)
+_orig_os_spawnlpe = getattr(os, "spawnlpe", None)
+_orig_os_spawnv = getattr(os, "spawnv", None)
+_orig_os_spawnve = getattr(os, "spawnve", None)
+_orig_os_spawnvp = getattr(os, "spawnvp", None)
+_orig_os_spawnvpe = getattr(os, "spawnvpe", None)
+_orig_os_execl = getattr(os, "execl", None)
+_orig_os_execle = getattr(os, "execle", None)
+_orig_os_execlp = getattr(os, "execlp", None)
+_orig_os_execlpe = getattr(os, "execlpe", None)
+_orig_os_execv = getattr(os, "execv", None)
+_orig_os_execve = getattr(os, "execve", None)
+_orig_os_execvp = getattr(os, "execvp", None)
+_orig_os_execvpe = getattr(os, "execvpe", None)
 
 
 def _guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
@@ -180,6 +263,8 @@ def _guarded_os_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
 
 
 def _guarded_os_remove(path: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(path):
+        return _orig_os_remove(path, *args, **kwargs)
     raise BlockedEffect(
         f"cannot remove '{path}' during {_current_phase()}",
         target=str(path),
@@ -188,6 +273,8 @@ def _guarded_os_remove(path: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_os_unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(path):
+        return _orig_os_unlink(path, *args, **kwargs)
     raise BlockedEffect(
         f"cannot unlink '{path}' during {_current_phase()}",
         target=str(path),
@@ -232,18 +319,24 @@ def _guarded_os_makedirs(name: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_os_rename(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(src) and _is_allowed_write(dst):
+        return _orig_os_rename(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot rename '{src}' during {_current_phase()}", target=str(src), culprit=_caller_info()
     )
 
 
 def _guarded_os_renames(old: Any, new: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(old) and _is_allowed_write(new):
+        return _orig_os_renames(old, new, *args, **kwargs)
     raise BlockedEffect(
         f"cannot rename '{old}' during {_current_phase()}", target=str(old), culprit=_caller_info()
     )
 
 
 def _guarded_os_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(src) and _is_allowed_write(dst):
+        return _orig_os_replace(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot replace '{src}' during {_current_phase()}", target=str(src), culprit=_caller_info()
     )
@@ -344,6 +437,8 @@ def _guarded_shutil_chown(path: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_path_touch(self: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(self):
+        return _orig_path_touch(self, *args, **kwargs)
     raise BlockedEffect(
         f"cannot touch '{self}' during {_current_phase()}", target=str(self), culprit=_caller_info()
     )
@@ -368,6 +463,8 @@ def _guarded_path_rmdir(self: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_path_unlink(self: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(self):
+        return _orig_path_unlink(self, *args, **kwargs)
     raise BlockedEffect(
         f"cannot unlink '{self}' during {_current_phase()}",
         target=str(self),
@@ -376,6 +473,8 @@ def _guarded_path_unlink(self: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_path_rename(self: Any, target: Any) -> Any:
+    if _is_allowed_write(self) and _is_allowed_write(target):
+        return _orig_path_rename(self, target)
     raise BlockedEffect(
         f"cannot rename '{self}' during {_current_phase()}",
         target=str(self),
@@ -384,6 +483,8 @@ def _guarded_path_rename(self: Any, target: Any) -> Any:
 
 
 def _guarded_path_replace(self: Any, target: Any) -> Any:
+    if _is_allowed_write(self) and _is_allowed_write(target):
+        return _orig_path_replace(self, target)
     raise BlockedEffect(
         f"cannot replace '{self}' during {_current_phase()}",
         target=str(self),
@@ -480,6 +581,114 @@ def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
     )
 
 
+def _guarded_socket_getaddrinfo(*args: Any, **kwargs: Any) -> Any:
+    host = args[0] if args else kwargs.get("host")
+    culprit = _caller_info()
+    target_str = str(host) if host is not None else None
+    raise BlockedEffect(
+        f"DNS resolution for {host!r} blocked during {_current_phase()}",
+        target=target_str,
+        culprit=culprit,
+    )
+
+
+def _guarded_socket_gethostbyname(hostname: Any, *args: Any, **kwargs: Any) -> Any:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"DNS resolution for {hostname!r} blocked during {_current_phase()}",
+        target=str(hostname),
+        culprit=culprit,
+    )
+
+
+def _guarded_socket_gethostbyname_ex(hostname: Any, *args: Any, **kwargs: Any) -> Any:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"DNS resolution for {hostname!r} blocked during {_current_phase()}",
+        target=str(hostname),
+        culprit=culprit,
+    )
+
+
+def _guarded_socket_gethostbyaddr(ip_address: Any, *args: Any, **kwargs: Any) -> Any:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"DNS resolution for {ip_address!r} blocked during {_current_phase()}",
+        target=str(ip_address),
+        culprit=culprit,
+    )
+
+
+def _guarded_socket_getnameinfo(sockaddr: Any, *args: Any, **kwargs: Any) -> Any:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"DNS resolution for {sockaddr!r} blocked during {_current_phase()}",
+        target=str(sockaddr),
+        culprit=culprit,
+    )
+
+
+def _guarded_process_spawn(*args: Any, **kwargs: Any) -> Any:
+    cmd = args[0] if args else kwargs.get("args")
+    if cmd is None:
+        cmd = kwargs.get("cmd") or kwargs.get("command")
+    culprit = _caller_info()
+    msg = (
+        f"cannot spawn process '{cmd}' during {_current_phase()}"
+        if cmd is not None
+        else f"cannot spawn process during {_current_phase()}"
+    )
+    raise BlockedEffect(msg, target=str(cmd) if cmd is not None else None, culprit=culprit)
+
+
+class _GuardedPopen(_orig_subprocess_popen):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        cmd = args[0] if args else kwargs.get("args")
+        culprit = _caller_info()
+        msg = (
+            f"cannot spawn process '{cmd}' during {_current_phase()}"
+            if cmd is not None
+            else f"cannot spawn process during {_current_phase()}"
+        )
+        raise BlockedEffect(msg, target=str(cmd) if cmd is not None else None, culprit=culprit)
+
+
+def _guarded_os_system(command: Any) -> int:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"cannot spawn process '{command}' during {_current_phase()}",
+        target=str(command),
+        culprit=culprit,
+    )
+
+
+def _guarded_os_posix_spawn(path: Any, *args: Any, **kwargs: Any) -> int:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"cannot spawn process '{path}' during {_current_phase()}",
+        target=str(path),
+        culprit=culprit,
+    )
+
+
+def _guarded_os_spawn(mode: Any, file: Any, *args: Any, **kwargs: Any) -> Any:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"cannot spawn process '{file}' during {_current_phase()}",
+        target=str(file),
+        culprit=culprit,
+    )
+
+
+def _guarded_os_exec(file: Any, *args: Any, **kwargs: Any) -> None:
+    culprit = _caller_info()
+    raise BlockedEffect(
+        f"cannot spawn process '{file}' during {_current_phase()}",
+        target=str(file),
+        culprit=culprit,
+    )
+
+
 _depth = 0
 
 
@@ -538,6 +747,53 @@ def _install_guard() -> None:
     socket.socket.connect_ex = _guarded_socket_connect_ex
     socket.socket.sendto = _guarded_socket_sendto
     socket.create_connection = _guarded_create_connection
+    socket.getaddrinfo = _guarded_socket_getaddrinfo
+    socket.gethostbyname = _guarded_socket_gethostbyname
+    socket.gethostbyname_ex = _guarded_socket_gethostbyname_ex
+    socket.gethostbyaddr = _guarded_socket_gethostbyaddr
+    socket.getnameinfo = _guarded_socket_getnameinfo
+
+    subprocess.Popen = _GuardedPopen
+    subprocess.Popen.__init__ = _GuardedPopen.__init__
+    _orig_subprocess_popen.__init__ = _GuardedPopen.__init__
+    subprocess.run = _guarded_process_spawn
+    subprocess.call = _guarded_process_spawn
+    subprocess.check_call = _guarded_process_spawn
+    subprocess.check_output = _guarded_process_spawn
+    if hasattr(subprocess, "getoutput"):
+        subprocess.getoutput = _guarded_process_spawn
+    if hasattr(subprocess, "getstatusoutput"):
+        subprocess.getstatusoutput = _guarded_process_spawn
+
+    os.system = _guarded_os_system
+    if hasattr(os, "posix_spawn"):
+        os.posix_spawn = _guarded_os_posix_spawn
+    if hasattr(os, "posix_spawnp"):
+        os.posix_spawnp = _guarded_os_posix_spawn
+    for spawn_name in (
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+    ):
+        if hasattr(os, spawn_name):
+            setattr(os, spawn_name, _guarded_os_spawn)
+    for exec_name in (
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+    ):
+        if hasattr(os, exec_name):
+            setattr(os, exec_name, _guarded_os_exec)
 
 
 def _remove_guard() -> None:
@@ -595,6 +851,62 @@ def _remove_guard() -> None:
     socket.socket.connect_ex = _orig_socket_connect_ex
     socket.socket.sendto = _orig_socket_sendto
     socket.create_connection = _orig_create_connection
+    socket.getaddrinfo = _orig_socket_getaddrinfo
+    socket.gethostbyname = _orig_socket_gethostbyname
+    socket.gethostbyname_ex = _orig_socket_gethostbyname_ex
+    socket.gethostbyaddr = _orig_socket_gethostbyaddr
+    socket.getnameinfo = _orig_socket_getnameinfo
+
+    subprocess.Popen = _orig_subprocess_popen
+    subprocess.Popen.__init__ = _orig_subprocess_popen_init
+    _orig_subprocess_popen.__init__ = _orig_subprocess_popen_init
+    subprocess.run = _orig_subprocess_run
+    subprocess.call = _orig_subprocess_call
+    subprocess.check_call = _orig_subprocess_check_call
+    subprocess.check_output = _orig_subprocess_check_output
+    if _orig_subprocess_getoutput is not None:
+        subprocess.getoutput = _orig_subprocess_getoutput
+    if _orig_subprocess_getstatusoutput is not None:
+        subprocess.getstatusoutput = _orig_subprocess_getstatusoutput
+
+    os.system = _orig_os_system
+    if _orig_os_posix_spawn is not None:
+        os.posix_spawn = _orig_os_posix_spawn
+    if _orig_os_posix_spawnp is not None:
+        os.posix_spawnp = _orig_os_posix_spawnp
+    if _orig_os_spawnl is not None:
+        os.spawnl = _orig_os_spawnl
+    if _orig_os_spawnle is not None:
+        os.spawnle = _orig_os_spawnle
+    if _orig_os_spawnlp is not None:
+        os.spawnlp = _orig_os_spawnlp
+    if _orig_os_spawnlpe is not None:
+        os.spawnlpe = _orig_os_spawnlpe
+    if _orig_os_spawnv is not None:
+        os.spawnv = _orig_os_spawnv
+    if _orig_os_spawnve is not None:
+        os.spawnve = _orig_os_spawnve
+    if _orig_os_spawnvp is not None:
+        os.spawnvp = _orig_os_spawnvp
+    if _orig_os_spawnvpe is not None:
+        os.spawnvpe = _orig_os_spawnvpe
+
+    if _orig_os_execl is not None:
+        os.execl = _orig_os_execl
+    if _orig_os_execle is not None:
+        os.execle = _orig_os_execle
+    if _orig_os_execlp is not None:
+        os.execlp = _orig_os_execlp
+    if _orig_os_execlpe is not None:
+        os.execlpe = _orig_os_execlpe
+    if _orig_os_execv is not None:
+        os.execv = _orig_os_execv
+    if _orig_os_execve is not None:
+        os.execve = _orig_os_execve
+    if _orig_os_execvp is not None:
+        os.execvp = _orig_os_execvp
+    if _orig_os_execvpe is not None:
+        os.execvpe = _orig_os_execvpe
 
 
 @contextmanager

@@ -12,13 +12,18 @@ one JSON result on stdout. It lives in a separate process for three reasons:
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import importlib
 import importlib.util
 import json
 import linecache
 import re
+import site
 import sys
+import sysconfig
 import traceback
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +46,105 @@ from .tracing import (
     resolve_qualname,
     trace,
 )
+
+
+def _collect_system_dirs() -> tuple[Path, ...]:
+    dirs: set[Path] = set()
+    for key in ("stdlib", "platstdlib"):
+        val = sysconfig.get_path(key)
+        if val:
+            dirs.add(Path(val).resolve())
+    if hasattr(site, "getsitepackages"):
+        with contextlib.suppress(Exception):
+            for p in site.getsitepackages():
+                dirs.add(Path(p).resolve())
+    if getattr(site, "ENABLE_USER_SITE", False) and hasattr(site, "getusersitepackages"):
+        with contextlib.suppress(Exception):
+            user_site = site.getusersitepackages()
+            if isinstance(user_site, str):
+                dirs.add(Path(user_site).resolve())
+    for p in sys.path:
+        if "site-packages" in p or "dist-packages" in p:
+            dirs.add(Path(p).resolve())
+    return tuple(dirs)
+
+
+_SYSTEM_DIRS: tuple[Path, ...] = _collect_system_dirs()
+_BASELINE_MODULES: frozenset[str] = frozenset(sys.modules)
+
+
+def _is_system_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        return any(resolved.is_relative_to(d) for d in _SYSTEM_DIRS)
+    except (ValueError, OSError):
+        return False
+
+
+def _should_keep_module(name: str) -> bool:
+    if name in _BASELINE_MODULES:
+        return True
+    if name == "torch" or name.startswith("torch."):
+        return True
+    if name == "torchtyc" or name.startswith("torchtyc."):
+        return True
+
+    mod = sys.modules.get(name)
+    if mod is None:
+        return False
+
+    if name in sys.builtin_module_names:
+        return True
+
+    file = getattr(mod, "__file__", None)
+    if file is not None:
+        return _is_system_path(Path(file))
+
+    paths = getattr(mod, "__path__", None)
+    if paths is not None:
+        try:
+            resolved_paths = [Path(p).resolve() for p in paths]
+            return bool(resolved_paths) and all(_is_system_path(p) for p in resolved_paths)
+        except (ValueError, OSError):
+            return False
+
+    top = name.partition(".")[0]
+    return top in sys.stdlib_module_names or top in sys.builtin_module_names
+
+
+def _restore_modules_and_path(saved_path: list[str]) -> None:
+    sys.path[:] = saved_path
+    for name in list(sys.modules):
+        if not _should_keep_module(name):
+            sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+    sys.path_importer_cache.clear()
+
+
+def _prime_linecache(path: Path | str, source: str) -> tuple[str, ...]:
+    lines = [line + "\n" for line in source.splitlines()]
+    keys: list[str] = [str(path)]
+    try:
+        resolved = str(Path(path).resolve())
+        if resolved != str(path):
+            keys.append(resolved)
+    except (ValueError, OSError):
+        resolved = str(path)
+    entry = (len(source), None, lines, resolved)
+    for key in keys:
+        linecache.cache[key] = entry
+    return tuple(keys)
+
+
+def _clear_linecache(paths: Iterable[Path | str]) -> None:
+    for p in paths:
+        raw = str(p)
+        linecache.cache.pop(raw, None)
+        try:
+            resolved = str(Path(p).resolve())
+            linecache.cache.pop(resolved, None)
+        except (ValueError, OSError):
+            pass
 
 
 def import_from_path(path: Path, source: str | None = None) -> Any:
@@ -70,6 +174,8 @@ def import_from_path(path: Path, source: str | None = None) -> Any:
 
     if source is None:
         return importlib.import_module(dotted)
+
+    _prime_linecache(path, source)
 
     package, _, _ = dotted.rpartition(".")
     if package:
@@ -107,7 +213,7 @@ def _anchor(
     fallback: Position,
     binder: DimBinder,
     others: list[tuple[int, int, str]] | None = None,
-) -> tuple[Position, str, str | None]:
+) -> tuple[Position, str, str | None, str | None]:
     """Point at the deepest frame inside the file that torchtyc is not already checking.
 
     A shape error usually surfaces several frames down, inside einsum or matmul.
@@ -138,15 +244,16 @@ def _anchor(
     picked = (outside or mine)[-1] if mine else None
     text = _format_traceback(exc, binder)
     hint = _hint(mine, picked, spans, binder)
+    statement = _statement(mine[-1][0]) if mine else None
     if picked is None:
-        return fallback, text, hint
+        return fallback, text, hint, statement
     chosen = picked[0]
     line = chosen.lineno - 1 if chosen.lineno else fallback.line
     end_line = chosen.end_lineno - 1 if chosen.end_lineno else line
     if chosen.colno is not None and chosen.end_colno is not None:
-        return Position(line, chosen.colno, end_line, chosen.end_colno), text, hint
+        return Position(line, chosen.colno, end_line, chosen.end_colno), text, hint, statement
     # No column information: fall back to underlining the whole line.
-    return Position(line, 0, line, len(chosen.line or "") or 1), text, hint
+    return Position(line, 0, line, len(chosen.line or "") or 1), text, hint, statement
 
 
 def _live_frames(exc: BaseException) -> list[Any]:
@@ -202,6 +309,30 @@ def _derived_note(*texts: str | None) -> str | None:
     return "a <from ...> width is one your __init__ computed, so it is not that dimension itself"
 
 
+def _note(message: str | None, hint: str | None, statement: str | None = None) -> str | None:
+    """A note explaining synthetic widths or primes when present."""
+    derived = _derived_note(message, hint)
+    if derived is not None:
+        return derived
+    if not hint or "traced as" not in hint:
+        return None
+
+    combined = f"{message or ''} {statement or ''}"
+    divisor_match = re.search(r"(?:%|//)\s*([A-Za-z_][A-Za-z0-9_]*)", combined)
+    if divisor_match and divisor_match.group(1) in hint:
+        divisor = divisor_match.group(1)
+        return (
+            f"torchtyc picks these widths itself; give `{divisor}` a default so it can pick ones that divide, "
+            "or add # torchtyc: ignore[trace-error]"
+        )
+    if "%" in combined or "//" in combined:
+        return (
+            "torchtyc picks these widths itself; give parameter defaults so it can pick ones that divide, "
+            "or add # torchtyc: ignore[trace-error]"
+        )
+    return "torchtyc picks these widths itself; add # torchtyc: ignore[trace-error]"
+
+
 # A name, or a dotted path such as `self.weight`, as it appears in source.
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _STRING = re.compile(r"(\"\"\"|\'\'\'|\"|\').*?\1", re.DOTALL)
@@ -220,6 +351,64 @@ def _statement(summary: traceback.FrameSummary) -> str:
         return summary.line or ""
     lines = linecache.getlines(summary.filename)[summary.lineno - 1 : end]
     return "".join(lines) if lines else (summary.line or "")
+
+
+def _describe_integer(value: int, binder: DimBinder, issued: dict[int, str]) -> str | None:
+    """Describe an integer value when it stands for a bound dimension or product."""
+    if value in issued:
+        return str(value)
+    if binder.is_flattened(value):
+        product_name = binder.describe(value)
+        return f"{value} ({product_name})"
+    return None
+
+
+def _failed_condition(statement: str | None) -> str | None:
+    """Extract the condition expression from an assert statement."""
+    if not statement:
+        return None
+    text = statement.strip()
+    try:
+        tree = ast.parse(text)
+        if tree.body and isinstance(tree.body[0], ast.Assert):
+            node = tree.body[0]
+            cond = ast.get_source_segment(text, node.test)
+            if cond:
+                return " ".join(cond.split())
+            return ast.unparse(node.test)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    match = re.match(r"^assert\s+(.+?)(?:,.*)?$", text, re.DOTALL)
+    if match:
+        return " ".join(match.group(1).split())
+    return None
+
+
+def _format_exc(exc: BaseException, statement: str | None = None, prefix: str = "") -> str:
+    """Format an exception into a diagnostic message that never ends in a bare 'Type: '.
+
+    When an exception has an empty str() (such as an argument-less AssertionError or
+    RuntimeError), fall back to naming the failed condition from the raising statement,
+    or simply the exception type name without a trailing colon.
+    """
+    exc_type = type(exc).__name__
+    err_str = str(exc).strip()
+    if err_str:
+        msg = f"{exc_type}: {err_str}"
+    elif isinstance(exc, AssertionError):
+        cond = _failed_condition(statement)
+        if cond:
+            msg = f"AssertionError: {cond}"
+        elif statement and statement.strip():
+            msg = f"AssertionError: {statement.strip()}"
+        else:
+            msg = "AssertionError: assertion failed"
+    else:
+        msg = exc_type
+
+    if prefix:
+        return f"{prefix}{msg}"
+    return msg
 
 
 def _shapes_on_line(frame: Any, text: str | None, binder: DimBinder) -> str:
@@ -243,7 +432,53 @@ def _shapes_on_line(frame: Any, text: str | None, binder: DimBinder) -> str:
             found[name] = binder.render_shape(tuple(value.shape))
         if len(found) == _MAX_SHAPES:
             break
-    return ", ".join(f"{name} is {shape}" for name, shape in found.items())
+    if found:
+        return ", ".join(f"{name} is {shape}" for name, shape in found.items())
+
+    # When the failing line has no tensors, report bound integer dimensions.
+    int_found: dict[str, str] = {}
+    issued = binder.issued()
+
+    for match in _NAME.finditer(_STRING.sub('""', text or "")):
+        name = match.group(0)
+        if name in int_found:
+            continue
+        value = _value_of(frame, name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            desc = _describe_integer(value, binder, issued)
+            if desc is not None:
+                int_found[name] = desc
+        if len(int_found) == _MAX_SHAPES:
+            break
+
+    if not int_found and frame is not None and hasattr(frame, "f_locals"):
+        for var_name, value in frame.f_locals.items():
+            if var_name.startswith("_") or var_name in int_found:
+                continue
+            if isinstance(value, int) and not isinstance(value, bool):
+                desc = _describe_integer(value, binder, issued)
+                if desc is not None:
+                    int_found[var_name] = desc
+            if len(int_found) == _MAX_SHAPES:
+                break
+
+    if int_found:
+        items = list(int_found.items())
+        parts = [
+            f"{name} traced as {desc}" if i == 0 else f"{name} as {desc}"
+            for i, (name, desc) in enumerate(items)
+        ]
+        if len(parts) == 1:
+            joined = parts[0]
+        elif len(parts) == 2:
+            joined = f"{parts[0]} and {parts[1]}"
+        else:
+            joined = f"{', '.join(parts[:-1])} and {parts[-1]}"
+        if _failed_condition(text) is not None or (text and text.strip().startswith("assert")):
+            return f"{joined}, so the assertion cannot hold"
+        return joined
+
+    return ""
 
 
 def _value_of(frame: Any, dotted: str) -> Any:
@@ -304,7 +539,7 @@ def _blocked_diagnostic(
     blocked = unwrap_blocked(exc)
     if blocked is None:
         return None
-    position, _, _ = _anchor(exc, path, fallback, binder, others)
+    position, _, _, _ = _anchor(exc, path, fallback, binder, others)
     culprit_msg = str(blocked)
     if blocked.culprit is not None and Path(blocked.culprit[0]).resolve() != Path(path).resolve():
         culprit_file = Path(blocked.culprit[0]).name
@@ -321,6 +556,28 @@ def _blocked_diagnostic(
         function=function,
         traceback=None,
     )
+
+
+class TargetOutcome(tuple):
+    diagnostics: list[Diagnostic]
+    result: TraceResult | None
+    checked: bool
+    skipped: bool
+
+    def __new__(
+        cls,
+        diagnostics: list[Diagnostic],
+        result: TraceResult | None,
+        *,
+        checked: bool = False,
+        skipped: bool = False,
+    ):
+        inst = super().__new__(cls, (diagnostics, result))
+        inst.diagnostics = diagnostics
+        inst.result = result
+        inst.checked = checked
+        inst.skipped = skipped
+        return inst
 
 
 def check_target(
@@ -344,7 +601,7 @@ def check_target(
         with active_guard(enabled=not allow_effects, phase="trace"):
             result = trace(module, target, variadic_rank)
     except NotLive:
-        return [], None
+        return TargetOutcome([], None, checked=False, skipped=False)
     except TraceFailed as exc:
         diag = _blocked_diagnostic(
             exc.error,
@@ -356,42 +613,52 @@ def check_target(
             others=_body_spans(siblings or [], target),
         )
         if diag is not None:
-            return [diag], None
-        position, text, hint = _anchor(
+            return TargetOutcome([diag], None, checked=True, skipped=False)
+        position, text, hint, statement = _anchor(
             exc.error, path, target.position, exc.binder, _body_spans(siblings or [], target)
         )
-        message = exc.binder.rename_primes(f"{type(exc.error).__name__}: {exc.error}")
-        return [
-            Diagnostic(
-                path=path,
-                line=position.line,
-                column=position.column,
-                end_line=position.end_line,
-                end_column=position.end_column,
-                rule="trace-error",
-                severity=Severity.ERROR,
-                message=message,
-                function=target.qualname,
-                hint=hint,
-                note=_derived_note(message, hint),
-                traceback=text,
-            )
-        ], None
+        message = exc.binder.rename_primes(_format_exc(exc.error, statement))
+        return TargetOutcome(
+            [
+                Diagnostic(
+                    path=path,
+                    line=position.line,
+                    column=position.column,
+                    end_line=position.end_line,
+                    end_column=position.end_column,
+                    rule="trace-error",
+                    severity=Severity.ERROR,
+                    message=message,
+                    function=target.qualname,
+                    hint=hint,
+                    note=_note(message, hint, statement),
+                    traceback=text,
+                )
+            ],
+            None,
+            checked=True,
+            skipped=False,
+        )
     except TraceSkipped as exc:
-        return [
-            Diagnostic(
-                path=path,
-                line=target.position.line,
-                column=target.position.column,
-                end_line=target.position.end_line,
-                end_column=target.position.end_column,
-                rule=exc.rule,
-                severity=_severity(exc.rule),
-                message=exc.message,
-                function=target.qualname,
-                hint=exc.hint or None,
-            )
-        ], None
+        return TargetOutcome(
+            [
+                Diagnostic(
+                    path=path,
+                    line=target.position.line,
+                    column=target.position.column,
+                    end_line=target.position.end_line,
+                    end_column=target.position.end_column,
+                    rule=exc.rule,
+                    severity=_severity(exc.rule),
+                    message=exc.message,
+                    function=target.qualname,
+                    hint=exc.hint or None,
+                )
+            ],
+            None,
+            checked=False,
+            skipped=True,
+        )
 
     problems = check_return(target.returns, result.returned, result.binder)
     if problems and result.built is not None:
@@ -425,7 +692,7 @@ def check_target(
             )
         )
 
-    return out, result
+    return TargetOutcome(out, result, checked=True, skipped=False)
 
 
 def check_attributes(
@@ -437,7 +704,7 @@ def check_attributes(
     allow_effects: bool = False,
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
-    binder = DimBinder(variadic_rank=variadic_rank)
+    binder = DimBinder(variadic_rank=variadic_rank, literals=info.literal_dims)
     attributes: list[Attribute] = []
 
     try:
@@ -481,7 +748,10 @@ def check_attributes(
         )
         if diag is not None:
             return [diag]
-        position, text, _ = _anchor(exc, path, info.position, binder)
+        position, text, hint, statement = _anchor(exc, path, info.position, binder)
+        message = binder.rename_primes(
+            _format_exc(exc, statement, prefix=f"constructing `{info.qualname}`: ")
+        )
         return [
             Diagnostic(
                 path=path,
@@ -491,10 +761,10 @@ def check_attributes(
                 end_column=position.end_column,
                 rule="trace-error",
                 severity=Severity.ERROR,
-                message=binder.rename_primes(
-                    f"constructing `{info.qualname}`: {type(exc).__name__}: {exc}"
-                ),
+                message=message,
                 function=info.qualname,
+                hint=hint,
+                note=_note(message, hint, statement),
                 traceback=text,
             )
         ]
@@ -543,7 +813,7 @@ def _is_local(qualname: str) -> bool:
     return "<locals>" in qualname
 
 
-def run_job(job: dict[str, Any]) -> dict[str, Any]:
+def run_job(job: dict[str, Any], channel: Any = None) -> dict[str, Any]:
     variadic_rank = job.get("variadic_rank", 2)
     want_hover = job.get("hover", False)
     allow_effects = job.get("allow_effects", False)
@@ -551,72 +821,131 @@ def run_job(job: dict[str, Any]) -> dict[str, Any]:
     # path -> qualname -> shapes. Two files in one job can define the same
     # qualname, so the path has to be part of the key.
     hovers: dict[str, dict[str, dict[str, str]]] = {}
+    total_checked = 0
+    total_skipped = 0
 
     for path in job["paths"]:
+        if channel is not None:
+            channel.write(json.dumps({"event": "file_start", "path": path}) + "\n")
+            channel.flush()
+        file_diags: list[dict[str, Any]] = []
+        file_hovers: dict[str, dict[str, str]] = {}
+        file_checked = 0
+        file_skipped = 0
+        saved_path = list(sys.path)
         buffer = job.get("sources", {}).get(path)
-        source = buffer if buffer is not None else Path(path).read_text(encoding="utf-8")
-        scan = scan_source(source, path)
-        if scan.syntax_error is not None:
-            continue  # the in-process pass already reported it
-
-        targets = [t for t in scan.targets if t.has_array_annotation]
-        # A class inside a function body reports once, at the class line, so a
-        # factory with several annotated methods does not repeat itself. A local
-        # class with nothing annotated is not reported at all: there is no
-        # coverage to miss, so saying so would be noise.
-        annotated_owners = {t.owner.qualname for t in targets if t.owner is not None}
-        local_classes = {
-            c.qualname
-            for c in scan.classes
-            if _is_local(c.qualname) and (c.all_attributes or c.qualname in annotated_owners)
-        }
-        targets = [t for t in targets if t.owner is None or t.owner.qualname not in local_classes]
-        classes = [c for c in scan.classes if c.all_attributes or c.qualname in local_classes]
-        if not targets and not classes:
-            continue
-
+        if buffer is not None:
+            _prime_linecache(path, buffer)
         try:
-            with active_guard(enabled=not allow_effects, phase="import"):
-                module = import_from_path(Path(path), buffer)
-        except Exception as exc:  # noqa: BLE001
-            diag = _blocked_diagnostic(
-                exc, path, Position(0, 0, 0, 1), DimBinder(), rule="import-error"
-            )
-            if diag is None:
-                position, text, _ = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
-                diag = Diagnostic(
-                    path=path,
-                    line=position.line,
-                    column=position.column,
-                    end_line=position.end_line,
-                    end_column=position.end_column,
-                    rule="import-error",
-                    severity=Severity.ERROR,
-                    message=f"{type(exc).__name__}: {exc}",
-                    traceback=text,
-                )
-            diagnostics.append(diag.to_json())
-            continue
+            source = buffer if buffer is not None else Path(path).read_text(encoding="utf-8")
+            scan = scan_source(source, path)
+            if scan.syntax_error is not None:
+                continue  # the in-process pass already reported it
 
-        with active_guard(enabled=not allow_effects, phase="trace"):
-            for info in classes:
-                for diagnostic in check_attributes(
-                    module, info, path, variadic_rank, allow_effects=allow_effects
-                ):
-                    diagnostics.append(diagnostic.to_json())
+            targets = [t for t in scan.targets if t.has_array_annotation]
+            # A class inside a function body reports once, at the class line, so a
+            # factory with several annotated methods does not repeat itself. A local
+            # class with nothing annotated is not reported at all: there is no
+            # coverage to miss, so saying so would be noise.
+            annotated_owners = {t.owner.qualname for t in targets if t.owner is not None}
+            local_classes = {
+                c.qualname
+                for c in scan.classes
+                if _is_local(c.qualname) and (c.all_attributes or c.qualname in annotated_owners)
+            }
+            local_targets = [
+                t for t in targets if t.owner is not None and t.owner.qualname in local_classes
+            ]
+            file_skipped += len(local_targets)
+            targets = [
+                t for t in targets if t.owner is None or t.owner.qualname not in local_classes
+            ]
+            classes = [c for c in scan.classes if c.all_attributes or c.qualname in local_classes]
+            if not targets and not classes:
+                continue
 
-            for target in targets:
-                found, result = check_target(
-                    module, target, path, variadic_rank, targets, allow_effects=allow_effects
+            try:
+                with active_guard(enabled=not allow_effects, phase="import"):
+                    module = import_from_path(Path(path), buffer)
+            except Exception as exc:  # noqa: BLE001
+                diag = _blocked_diagnostic(
+                    exc, path, Position(0, 0, 0, 1), DimBinder(), rule="import-error"
                 )
-                for diagnostic in found:
-                    diagnostics.append(diagnostic.to_json())
-                if want_hover:
-                    hovers.setdefault(path, {})[target.qualname] = (
-                        shapes_for_hover(result) if result is not None else {}
+                if diag is None:
+                    position, text, _, statement = _anchor(
+                        exc, path, Position(0, 0, 0, 1), DimBinder()
                     )
+                    diag = Diagnostic(
+                        path=path,
+                        line=position.line,
+                        column=position.column,
+                        end_line=position.end_line,
+                        end_column=position.end_column,
+                        rule="import-error",
+                        severity=Severity.ERROR,
+                        message=_format_exc(exc, statement),
+                        traceback=text,
+                    )
+                file_diags.append(diag.to_json())
+                file_skipped += len(targets)
+                continue
 
-    return {"diagnostics": diagnostics, "hovers": hovers}
+            with active_guard(enabled=not allow_effects, phase="trace"):
+                for info in classes:
+                    for diagnostic in check_attributes(
+                        module, info, path, variadic_rank, allow_effects=allow_effects
+                    ):
+                        file_diags.append(diagnostic.to_json())
+
+                for target in targets:
+                    outcome = check_target(
+                        module, target, path, variadic_rank, targets, allow_effects=allow_effects
+                    )
+                    found, result = outcome
+                    for diagnostic in found:
+                        file_diags.append(diagnostic.to_json())
+                    if want_hover:
+                        file_hovers[target.qualname] = (
+                            shapes_for_hover(result) if result is not None else {}
+                        )
+                    if getattr(outcome, "skipped", False):
+                        file_skipped += 1
+                    elif getattr(outcome, "checked", False):
+                        file_checked += 1
+        finally:
+            total_checked += file_checked
+            total_skipped += file_skipped
+            _clear_linecache([path])
+            _restore_modules_and_path(saved_path)
+            diagnostics.extend(file_diags)
+            if file_hovers:
+                hovers[path] = file_hovers
+            if channel is not None:
+                channel.write(
+                    json.dumps(
+                        {
+                            "event": "file_result",
+                            "path": path,
+                            "diagnostics": file_diags,
+                            "hovers": {path: file_hovers} if file_hovers else {},
+                            "checked_functions": file_checked,
+                            "skipped_functions": file_skipped,
+                        }
+                    )
+                    + "\n"
+                )
+                channel.flush()
+
+    if channel is not None:
+        channel.write(json.dumps({"event": "done"}) + "\n")
+        channel.flush()
+
+    return {
+        "diagnostics": diagnostics,
+        "hovers": hovers,
+        "checked_functions": total_checked,
+        "skipped_functions": total_skipped,
+    }
 
 
 def main() -> int:
@@ -632,8 +961,13 @@ def main() -> int:
         json.dump({"error": f"bad job: {exc}"}, channel)
         return 2
 
+    streaming = job.get("stream", False)
+    if streaming:
+        channel.write(json.dumps({"event": "ready"}) + "\n")
+        channel.flush()
+
     try:
-        result = run_job(job)
+        result = run_job(job, channel=channel if streaming else None)
     except Exception as exc:  # noqa: BLE001
         result = {
             "error": f"{type(exc).__name__}: {exc}",
@@ -641,8 +975,17 @@ def main() -> int:
             "diagnostics": [],
             "hovers": {},
         }
-    json.dump(result, channel)
-    channel.flush()
+        if streaming:
+            channel.write(json.dumps(result) + "\n")
+            channel.flush()
+            return 1
+        json.dump(result, channel)
+        channel.flush()
+        return 0
+
+    if not streaming:
+        json.dump(result, channel)
+        channel.flush()
     return 0
 
 

@@ -107,19 +107,19 @@ def _summary(report: Report, color: bool) -> str:
     for d in report.diagnostics:
         counts[d.severity] += 1
 
+    fn_part = f"{report.checked_functions} function(s)"
+    if report.skipped_functions:
+        fn_part += f" ({report.skipped_functions} skipped)"
+
     if not report.diagnostics:
         return _paint(
-            f"No problems in {report.checked_functions} function(s) "
-            f"across {report.checked_files} file(s)",
+            f"No problems in {fn_part} across {report.checked_files} file(s)",
             _COLORS[Severity.INFO],
             color,
         )
 
     parts = [f"{counts[level]} {level.label}(s)" for level in Severity if counts[level]]
-    return (
-        f"Found {', '.join(parts)} in {report.checked_functions} function(s) "
-        f"across {report.checked_files} file(s)"
-    )
+    return f"Found {', '.join(parts)} in {fn_part} across {report.checked_files} file(s)"
 
 
 def _json(report: Report) -> str:
@@ -129,6 +129,7 @@ def _json(report: Report) -> str:
             "hovers": report.hovers,
             "checked_files": report.checked_files,
             "checked_functions": report.checked_functions,
+            "skipped_functions": report.skipped_functions,
             "worker_error": report.worker_error,
             "ok": report.ok,
         },

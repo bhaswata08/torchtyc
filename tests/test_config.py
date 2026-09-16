@@ -80,3 +80,17 @@ def test_wrongly_typed_lists_fall_back_to_the_default(tmp_path):
     config = config_module.load(root)
     assert config.ignore == frozenset()
     assert config.exclude == (".venv", "build", "dist", "__pycache__", ".git")
+
+
+def test_find_root_multiple_paths_common_ancestor(tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    p_a = a / "model.py"
+    p_b = b / "model.py"
+    p_a.touch()
+    p_b.touch()
+
+    root = config_module.find_root([p_a, p_b])
+    assert root == tmp_path

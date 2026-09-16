@@ -98,3 +98,42 @@ def test_surrounding_whitespace_never_changes_a_dim_string(text, names):
     dims = parse_dim_string(text)
     assert tuple(d.name for d in dims if d.name is not None) == names
     assert dims == parse_dim_string(text.strip())
+
+
+@pytest.mark.parametrize(
+    "bad_dim",
+    [
+        "a+",
+        "a-",
+        "(a+",
+        "+",
+        "a++",
+        "a.b",
+        "a+foo()",
+        "a[0]",
+        "a+None",
+        "a+1.5",
+        "a+#b",
+    ],
+)
+def test_malformed_symbolic_dims_raise(bad_dim):
+    with pytest.raises(AnnotationError):
+        parse_dim_string(bad_dim)
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_expr"),
+    [
+        ("2*d", "2*d"),
+        ("(a+b)*c", "(a+b)*c"),
+        ("d_model//2", "d_model//2"),
+        ("#d_in+d_out", "d_in+d_out"),
+    ],
+)
+def test_valid_symbolic_expressions(expr, expected_expr):
+    dims = parse_dim_string(expr)
+    assert len(dims) == 1
+    assert dims[0].kind == "symbolic"
+    assert dims[0].expr == expected_expr
+    if expr.startswith("#"):
+        assert dims[0].broadcastable is True
