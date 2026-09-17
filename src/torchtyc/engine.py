@@ -254,6 +254,11 @@ _WORKER_POLL_SECONDS = 0.05
 # How long a terminate request gets before it becomes a kill. A worker in the
 # middle of importing torch can take a moment to unwind.
 _WORKER_TERMINATE_GRACE_SECONDS = 2.0
+# The worker announces `ready` as soon as it has read the job, before it
+# imports torch. That import is not user code and is not part of anyone's
+# per-file budget, so the window between `ready` and the first `file_start`
+# gets its own floor. A `--timeout` larger than this still wins.
+_WORKER_STARTUP_GRACE_SECONDS = 60.0
 
 
 def terminate_worker(proc: subprocess.Popen[str]) -> None:
@@ -411,7 +416,12 @@ def _communicate(
                 if timeout is not None:
                     try:
                         parsed = json.loads(data.strip())
-                        if parsed.get("event") in ("ready", "file_result"):
+                        event = parsed.get("event")
+                        if event == "ready":
+                            deadline = time.monotonic() + max(
+                                timeout, _WORKER_STARTUP_GRACE_SECONDS
+                            )
+                        elif event in ("file_start", "file_result"):
                             deadline = time.monotonic() + timeout
                     except json.JSONDecodeError:
                         pass

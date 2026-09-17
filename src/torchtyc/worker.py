@@ -25,27 +25,77 @@ import sysconfig
 import traceback
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
-
-import torch
+from typing import TYPE_CHECKING, Any
 
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import Attribute, ClassInfo, Position, Target, scan_source
 from .effects import active_guard, unwrap_blocked
-from .tracing import (
-    NotLive,
-    TraceFailed,
-    TraceResult,
-    TraceSkipped,
-    check_return,
-    describe,
-    explain_derived_sizes,
-    instantiate,
-    live_init,
-    resolve_qualname,
-    trace,
-)
+
+# torch and everything that touches it load on first use, not at import. The
+# parent starts the per-file timeout clock when this process announces
+# `ready`, and `ready` has to come out before a torch import that can run for
+# seconds. Until `_ensure_initialized` has run these names are None, so call
+# it at the top of anything that traces.
+if TYPE_CHECKING:
+    import torch
+
+    from .tracing import (
+        NotLive,
+        TraceFailed,
+        TraceResult,
+        TraceSkipped,
+        check_return,
+        describe,
+        explain_derived_sizes,
+        instantiate,
+        live_init,
+        resolve_qualname,
+        trace,
+    )
+else:
+    torch = None
+    NotLive = None
+    TraceFailed = None
+    TraceResult = None
+    TraceSkipped = None
+    check_return = None
+    describe = None
+    explain_derived_sizes = None
+    instantiate = None
+    live_init = None
+    resolve_qualname = None
+    trace = None
+
+
+def _ensure_initialized() -> None:
+    global torch, NotLive, TraceFailed, TraceResult, TraceSkipped
+    global \
+        check_return, \
+        describe, \
+        explain_derived_sizes, \
+        instantiate, \
+        live_init, \
+        resolve_qualname, \
+        trace
+    if torch is not None:
+        return
+    import torch as _torch
+
+    from . import tracing as _tracing
+
+    torch = _torch
+    NotLive = _tracing.NotLive
+    TraceFailed = _tracing.TraceFailed
+    TraceResult = _tracing.TraceResult
+    TraceSkipped = _tracing.TraceSkipped
+    check_return = _tracing.check_return
+    describe = _tracing.describe
+    explain_derived_sizes = _tracing.explain_derived_sizes
+    instantiate = _tracing.instantiate
+    live_init = _tracing.live_init
+    resolve_qualname = _tracing.resolve_qualname
+    trace = _tracing.trace
 
 
 def _collect_system_dirs() -> tuple[Path, ...]:
@@ -595,6 +645,7 @@ def check_target(
     forward pass, and the editor asks for both on every keystroke.
     """
     out: list[Diagnostic] = []
+    _ensure_initialized()
     anchor = target.returns_position or target.position
 
     try:
@@ -704,6 +755,7 @@ def check_attributes(
     allow_effects: bool = False,
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
+    _ensure_initialized()
     binder = DimBinder(variadic_rank=variadic_rank, literals=info.literal_dims)
     attributes: list[Attribute] = []
 
@@ -802,6 +854,7 @@ def check_attributes(
 
 def shapes_for_hover(result: TraceResult) -> dict[str, str]:
     """Argument and return shapes of a completed trace, for hover and inlay hints."""
+    _ensure_initialized()
     hints = {
         name: result.binder.render_shape(shape) for name, shape in result.argument_shapes.items()
     }
@@ -814,6 +867,7 @@ def _is_local(qualname: str) -> bool:
 
 
 def run_job(job: dict[str, Any], channel: Any = None) -> dict[str, Any]:
+    _ensure_initialized()
     variadic_rank = job.get("variadic_rank", 2)
     want_hover = job.get("hover", False)
     allow_effects = job.get("allow_effects", False)

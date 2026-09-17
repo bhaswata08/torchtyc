@@ -433,6 +433,11 @@ def _eval_symbolic(dim: Dim, binder: DimBinder) -> int:
         names = {node.id for node in _ast.walk(parsed) if isinstance(node, _ast.Name)}
         scope = {name: binder.bind(name) for name in names}
         value = eval(compile(parsed, "<dim>", "eval"), {}, scope)
+    except ZeroDivisionError as exc:
+        raise BindingError(
+            f"could not evaluate dimension {dim.expr!r}: division by zero",
+            rule="unsupported-annotation",
+        ) from exc
     except Exception as exc:
         raise BindingError(
             f"could not evaluate dimension {dim.expr!r}: {exc}",
