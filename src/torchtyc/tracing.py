@@ -16,26 +16,49 @@ import contextlib
 import dis
 import inspect
 import itertools
+import linecache
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from .annotations import ArraySpec, OpaqueSpec, Spec, TupleSpec
+from .annotations import DTYPE_NAMES, ArraySpec, OpaqueSpec, Spec, TupleSpec
 from .binding import BindingError, DimBinder, check_shape, distant_prime, shape_for
-from .discovery import ClassInfo, InitDef, Param, Target
+from .discovery import ClassInfo, InitDef, Param, Position, Target
 from .effects import unwrap_blocked
 
 # jaxtyping dtype name -> (dtype used to build an argument, dtypes accepted on
 # the way out). Building picks one representative; checking accepts the family.
-_FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+# The `hasattr` guards are load-bearing, not defensive: older torch builds lack
+# the sub-byte and extended integer dtypes, and the broad families below must
+# only accept what this torch actually has.
+_FLOATS = tuple(
+    getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, name)
+) + (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 _COMPLEX = (torch.complex64, torch.complex128)
-_SIGNED = (torch.int8, torch.int16, torch.int32, torch.int64)
+_SIGNED = tuple(getattr(torch, name) for name in ("int4",) if hasattr(torch, name)) + (
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+)
 _UNSIGNED = (torch.uint8,) + tuple(
-    getattr(torch, name) for name in ("uint16", "uint32", "uint64") if hasattr(torch, name)
+    getattr(torch, name) for name in ("uint4", "uint16", "uint32", "uint64") if hasattr(torch, name)
+)
+
+# Narrow dtypes that only newer torch builds have. Each entry is added only
+# when this torch actually carries the dtype, checked rather than trusted.
+_NARROW_DTYPES = (
+    ("Int4", "int4"),
+    ("UInt4", "uint4"),
+    ("UInt16", "uint16"),
+    ("UInt32", "uint32"),
+    ("UInt64", "uint64"),
+    ("Float8e4m3fn", "float8_e4m3fn"),
+    ("Float8e5m2", "float8_e5m2"),
 )
 
 DTYPES: dict[str, tuple[torch.dtype, tuple[torch.dtype, ...]]] = {
@@ -63,15 +86,27 @@ DTYPES: dict[str, tuple[torch.dtype, tuple[torch.dtype, ...]]] = {
     "UInt8": (torch.uint8, (torch.uint8,)),
 }
 
+for _name, _attr in _NARROW_DTYPES:
+    _dtype = getattr(torch, _attr, None)
+    if _dtype is not None:
+        DTYPES[_name] = (_dtype, (_dtype,))
+
 
 class TraceSkipped(Exception):
     """The target could not be set up. Carries a rule name and a message."""
 
-    def __init__(self, rule: str, message: str, hint: str = ""):
+    def __init__(
+        self,
+        rule: str,
+        message: str,
+        hint: str = "",
+        position: Position | None = None,
+    ):
         super().__init__(message)
         self.rule = rule
         self.message = message
         self.hint = hint
+        self.position = position
 
 
 @dataclass
@@ -86,6 +121,7 @@ class Construction:
     cls: type | None = None
     module: Any = None
     instance: Any = None
+    guessed_args: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -98,11 +134,22 @@ class TraceResult:
     # named once something is about to be reported. None when the target is a
     # plain function, which builds nothing.
     built: Construction | None = None
+    retried: bool = False
+    first_error: BaseException | None = None
+    rescaled_widths: dict[str, int] = field(default_factory=dict)
 
 
 def build_dtype(spec: ArraySpec) -> torch.dtype:
     entry = DTYPES.get(spec.dtype)
     if entry is None:
+        if spec.dtype in DTYPE_NAMES:
+            # Parsed fine: the name is a real jaxtyping dtype, this torch just
+            # has no equivalent for it. Saying "unknown" would send the reader
+            # hunting for a typo that is not there.
+            raise TraceSkipped(
+                "unsupported-annotation",
+                f"dtype `{spec.dtype}` has no equivalent in this torch, so the function cannot be traced",
+            )
         raise TraceSkipped("unsupported-annotation", f"unknown dtype `{spec.dtype}`")
     return entry[0]
 
@@ -182,7 +229,12 @@ def _mentions(plain: str | None, types: tuple[str, ...]) -> bool:
     return any(part in types for part in parts)
 
 
-def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
+def build_value(
+    param: Param,
+    binder: DimBinder,
+    dim_names: set[str],
+    synthesised: dict[str, Any] | None = None,
+) -> Any:
     """Produce an argument for one parameter.
 
     The interesting case is a plain `int` whose name matches a dimension name in
@@ -206,6 +258,8 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
             value = _from_plain_type(raw, param.name, binder)
             if value is _MISSING:
                 raise _unresolved(param.name, raw)
+            if synthesised is not None and raw in ("str", "bool", "float"):
+                synthesised[param.name] = value
             built.append(value)
         return tuple(built)
 
@@ -218,6 +272,9 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
         # `d_model // n_heads` come out whole. The axis is still checked: the
         # first place an annotation mentions it binds it to 8.
         if binder.defaults_first and param.has_default:
+            if type(param.default) is int:
+                binder.sizes[param.name] = param.default
+                binder.literals.add(param.default)
             raise _UseDefault()
         return binder.bind(param.name)
 
@@ -238,6 +295,8 @@ def build_value(param: Param, binder: DimBinder, dim_names: set[str]) -> Any:
     value = _from_plain_type(plain, param.name, binder)
     if value is _MISSING:
         raise _unresolved(param.name, plain)
+    if synthesised is not None and plain in ("str", "bool", "float"):
+        synthesised[param.name] = value
     return value
 
 
@@ -297,6 +356,7 @@ def instantiate(
     dim_names: set[str],
     module: Any,
     init: InitDef | None = _INIT_NOT_GIVEN,  # type: ignore[assignment]
+    built: Construction | None = None,
 ) -> Any:
     """Construct a module on the meta device so its parameters cost nothing.
 
@@ -305,14 +365,18 @@ def instantiate(
     """
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
+    synthesised_args: dict[str, Any] = {}
     positional_open = True
     if init is _INIT_NOT_GIVEN:
         init = live_init(owner, cls, module)
+    init_pos = (
+        init.position if init and getattr(init, "position", None) is not None else owner.position
+    )
     for param in init.params if init else []:
         if param.positional_only and not positional_open:
             continue
         try:
-            value = build_value(param, binder, dim_names)
+            value = build_value(param, binder, dim_names, synthesised=synthesised_args)
         except _UseDefault:
             if param.positional_only:
                 positional_open = False
@@ -322,11 +386,15 @@ def instantiate(
                 "uninstantiable",
                 f"cannot construct `{owner.qualname or owner.name}`: {exc.message}",
                 hint=exc.hint,
+                position=exc.position or init_pos,
             ) from exc
         if param.positional_only:
             args.append(value)
         else:
             kwargs[param.name] = value
+
+    if built is not None:
+        built.guessed_args = dict(synthesised_args)
 
     before_threads = set(threading.enumerate())
     instance = None
@@ -337,8 +405,27 @@ def instantiate(
                 instance = cls(*args, **kwargs)
             except TypeError as exc:
                 raise TraceSkipped(
-                    "uninstantiable", f"cannot construct `{owner.qualname or owner.name}`: {exc}"
+                    "uninstantiable",
+                    f"cannot construct `{owner.qualname or owner.name}`: {exc}",
+                    position=init_pos,
                 ) from exc
+            except BaseException as exc:
+                if synthesised_args:
+                    guessed_str = ", ".join(f"{k}={v!r}" for k, v in synthesised_args.items())
+                    exc_line = f"{type(exc).__name__}: {exc}"
+                    names_str = ", ".join(f"`{k}`" for k in synthesised_args)
+                    hint = (
+                        f"give `{next(iter(synthesised_args))}` a default, or # torchtyc: ignore[uninstantiable]"
+                        if len(synthesised_args) == 1
+                        else f"give {names_str} a default, or # torchtyc: ignore[uninstantiable]"
+                    )
+                    raise TraceSkipped(
+                        "uninstantiable",
+                        f"`{owner.qualname or owner.name}.__init__` raised with the arguments torchtyc guessed: {guessed_str}\n  {exc_line}",
+                        hint=hint,
+                        position=init_pos,
+                    ) from exc
+                raise
     except BaseException:
         failed = True
         raise
@@ -356,6 +443,7 @@ def instantiate(
                     "uninstantiable",
                     f"cannot construct `{owner.qualname or owner.name}`: constructor left background thread {names} running",
                     hint="shut down background threads in `__init__` or start them lazily",
+                    position=init_pos,
                 )
     return instance
 
@@ -596,7 +684,7 @@ def resolve_callable(
     if "classmethod" in target.decorators:
         return _live_method(module, cls, target), params[1:]
 
-    instance = instantiate(owner, cls, binder, owner.dim_names, module)
+    instance = instantiate(owner, cls, binder, owner.dim_names, module, built=built)
     if built is not None:
         built.owner, built.cls, built.module, built.instance = owner, cls, module, instance
     return _live_method(module, instance, target), params[1:]  # drop self
@@ -636,43 +724,67 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
     carries the binder. That is what lets the caller report the failure in the
     user's axis names instead of the primes torch actually saw.
     """
-    binder = DimBinder(variadic_rank=variadic_rank, literals=target.literal_dims)
+    module_literals = _written_integers(module, max_value=None)
+    literals = target.literal_dims | module_literals
+    binder = DimBinder(variadic_rank=variadic_rank, literals=literals)
     built = Construction()
     try:
         return _trace(module, target, binder, built)
-    except (TraceSkipped, NotLive, TraceFailed):
+    except (NotLive, TraceFailed):
         raise
-    except Exception as first:
-        if unwrap_blocked(first) is not None:
+    except TraceSkipped as skipped:
+        # A constructor that raises on the guessed widths can still build on
+        # widths that divide: a parity guard rejects every odd prime but
+        # accepts the rescaled retry. Anything else that skips setup reports
+        # as it did before.
+        if unwrap_blocked(skipped) is not None:
             close_instance(built.instance)
-            raise TraceFailed(first, binder) from first
-        failure: BaseException = first
-        for scale in _divisible_scales(module, target)[:_MAX_RETRIES]:
-            wider = DimBinder(
-                variadic_rank=variadic_rank,
-                scale=scale,
-                defaults_first=True,
-                literals=target.literal_dims,
-            )
-            again = Construction()
-            try:
-                result = _trace(module, target, wider, again)
-                close_instance(built.instance)
-                return result
-            except (TraceSkipped, NotLive, BindingError):
-                # This attempt never reached the user's code, so it says
-                # nothing the one before it has not already said.
-                close_instance(again.instance)
-                continue
-            except Exception as later:  # noqa: BLE001
-                # It ran on widths that divide, so whatever it hit is more
-                # likely the real mistake than a split losing a remainder on
-                # the way to it.
-                close_instance(built.instance)
-                failure, binder, built = later, wider, again
-        explain_derived_sizes(binder, built)
-        close_instance(built.instance)
-        raise TraceFailed(failure, binder) from failure
+            raise TraceFailed(skipped, binder) from skipped
+        if skipped.rule != "uninstantiable":
+            raise
+        cause = skipped.__cause__
+        first: BaseException = cause if isinstance(cause, BaseException) else skipped
+        first_skipped: TraceSkipped | None = skipped
+    except Exception as exc:
+        if unwrap_blocked(exc) is not None:
+            close_instance(built.instance)
+            raise TraceFailed(exc, binder) from exc
+        first = exc
+        first_skipped = None
+    failure: BaseException = first
+    for scale in _divisible_scales(module, target)[:_MAX_RETRIES]:
+        wider = DimBinder(
+            variadic_rank=variadic_rank,
+            scale=scale,
+            defaults_first=True,
+            literals=literals,
+        )
+        again = Construction()
+        try:
+            result = _trace(module, target, wider, again)
+            close_instance(built.instance)
+            result.retried = True
+            result.first_error = first
+            result.rescaled_widths = dict(wider.sizes)
+            return result
+        except (TraceSkipped, NotLive, BindingError):
+            # This attempt never reached the user's code, so it says
+            # nothing the one before it has not already said.
+            close_instance(again.instance)
+            continue
+        except Exception as later:  # noqa: BLE001
+            # It ran on widths that divide, so whatever it hit is more
+            # likely the real mistake than a split losing a remainder on
+            # the way to it.
+            close_instance(built.instance)
+            failure, binder, built = later, wider, again
+    explain_derived_sizes(binder, built)
+    close_instance(built.instance)
+    if first_skipped is not None and failure is first:
+        # Every retry skipped setup too, so the module really cannot be
+        # built: the downgrade stands as if no retry had run.
+        raise first_skipped
+    raise TraceFailed(failure, binder) from failure
 
 
 # A written integer is taken as a divisor only inside this range. Below it there
@@ -723,30 +835,54 @@ def _divisible_scales(module: Any, target: Target) -> list[int]:
     return [scale for scale in dict.fromkeys((lowest, product)) if scale > 1]
 
 
-def _written_integers(fn: Any) -> set[int]:
-    """Every integer a function writes down, as a default or as a literal.
+_MODULE_INTS_CACHE: dict[int, set[int]] = {}
 
-    `def __init__(self, d_model: int, n_heads: int = 8)` writing `8`, and a body
-    writing `d_model // 64`, are the same statement about widths, so both are
-    read. Booleans are not integers for this purpose, whatever Python says.
 
-    Body literals come from the bytecode, not from `co_consts`. Since 3.14 a
-    small literal compiles to an inline `LOAD_SMALL_INT` and may never appear
-    in the constants at all, and whether it does shifts with unrelated lines
-    elsewhere in the body. A guard like `d_k % 2` next to a keyword call is the
-    case that vanishes. Only the two opcodes that load a constant are read, by
-    name so numbering changes do not matter. Anything else carrying an integer
-    `argval`, a jump target or a comparison index, is not a number the code
-    writes down. Nested code objects count too: a literal inside a
-    comprehension or a helper in the same body is still the same function
-    writing the same number down. A body that cannot be disassembled reads as
-    no literals, so one odd function cannot break the whole check.
-    """
-    found: set[int] = set()
+def _written_integers(fn: Any, *, max_value: int | None = _MAX_WRITTEN_DIVISOR) -> set[int]:
+    """Every integer a function or module writes down, as a default or as a literal."""
+    if inspect.ismodule(fn):
+        mod_id = id(fn)
+        if max_value is None and mod_id in _MODULE_INTS_CACHE:
+            return _MODULE_INTS_CACHE[mod_id]
+        found: set[int] = set()
+        file = getattr(fn, "__file__", None)
+        if file:
+            try:
+                lines = linecache.getlines(file)
+                source = "".join(lines) if lines else Path(file).read_text(encoding="utf-8")
+                code = compile(source, file, "exec")
+                found.update(_written_integers(code, max_value=None))
+            except Exception:  # noqa: BLE001, S110
+                pass
+        for val in getattr(fn, "__dict__", {}).values():
+            if type(val) is int:
+                found.add(val)
+            elif getattr(val, "__module__", None) == getattr(fn, "__name__", None) and (
+                inspect.isfunction(val) or inspect.isclass(val)
+            ):
+                found.update(_written_integers(val, max_value=None))
+        res = {value for value in found if value >= 0}
+        if max_value is None:
+            _MODULE_INTS_CACHE[mod_id] = res
+            return res
+        return {value for value in res if 2 <= value <= max_value}
+
+    if inspect.isclass(fn):
+        found = set()
+        for val in getattr(fn, "__dict__", {}).values():
+            if type(val) is int:
+                found.add(val)
+            elif inspect.isfunction(val) or isinstance(val, (classmethod, staticmethod, property)):
+                found.update(_written_integers(val, max_value=max_value))
+        if max_value is not None:
+            return {value for value in found if 2 <= value <= max_value}
+        return {value for value in found if value >= 0}
+
+    found = set()
     found.update(value for value in getattr(fn, "__defaults__", None) or () if type(value) is int)
     kwonly = getattr(fn, "__kwdefaults__", None) or {}
     found.update(value for value in kwonly.values() if type(value) is int)
-    code = getattr(fn, "__code__", None)
+    code = fn if isinstance(fn, type(compile("", "", "exec"))) else getattr(fn, "__code__", None)
     if code is not None:
         try:
             stack = [code]
@@ -762,10 +898,16 @@ def _written_integers(fn: Any) -> set[int]:
                         and type(instruction.argval) is int
                     ):
                         found.add(instruction.argval)
+                    elif instruction.opname == "LOAD_CONST" and isinstance(
+                        instruction.argval, tuple
+                    ):
+                        found.update(v for v in instruction.argval if type(v) is int)
                 stack.extend(const for const in current.co_consts if isinstance(const, type(code)))
         except Exception:  # noqa: BLE001, S110
             pass
-    return {value for value in found if 2 <= value <= _MAX_WRITTEN_DIVISOR}
+    if max_value is not None:
+        return {value for value in found if 2 <= value <= max_value}
+    return {value for value in found if value >= 0}
 
 
 def explain_derived_sizes(binder: DimBinder, built: Construction) -> None:

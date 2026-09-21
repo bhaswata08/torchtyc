@@ -23,6 +23,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -131,20 +132,122 @@ def _allowed_cache_dirs() -> list[Path]:
     return dirs
 
 
+def _scratch_dirs() -> list[Path]:
+    """Destinations that are scratch space, not exfiltration or persistence.
+
+    The system temp directory (via `tempfile.gettempdir()`, which already
+    respects `TMPDIR`, plus an explicit read of `TMPDIR`/`TEMP`/`TMP` in case
+    the environment changed after `tempfile` cached its answer) and the user
+    cache directory (`XDG_CACHE_HOME`, falling back to `~/.cache`). Libraries
+    such as matplotlib (font cache), joblib, numba, and HuggingFace hubs write
+    here during import; blocking that pushes users to `allow-effects = true`,
+    which switches the guard off wholesale and protects less, not more.
+
+    Only destinations are allowed, never callers: anything writing outside
+    these directories, the inductor/triton caches, is still blocked no matter
+    which module it comes from.
+    """
+    dirs: list[Path] = []
+    try:
+        dirs.append(Path(tempfile.gettempdir()).resolve())
+    except (ValueError, OSError):
+        pass
+    for env_var in ("TMPDIR", "TEMP", "TMP"):
+        val = os.environ.get(env_var)
+        if val:
+            try:
+                dirs.append(Path(val).resolve())
+            except (ValueError, OSError):
+                pass
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    try:
+        if xdg_cache:
+            dirs.append(Path(xdg_cache).resolve())
+        else:
+            dirs.append((Path.home() / ".cache").resolve())
+    except (RuntimeError, ValueError, OSError):
+        pass
+    return dirs
+
+
+def attempt_cooperative_stop(thread: threading.Thread) -> None:
+    """Attempt cooperative shutdown of a thread the checked code spawned.
+
+    Only cooperative hooks such as `cancel` or `stop` are safe to call.
+    Asynchronous exception injection can interrupt a thread holding internal
+    locks or blocked in C calls, which risks deadlocking or corrupting the
+    process. Unstoppable threads are left alone for the caller to report.
+    """
+    if not thread.is_alive():
+        return
+    if hasattr(thread, "cancel") and callable(thread.cancel):
+        try:
+            thread.cancel()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    if hasattr(thread, "stop") and callable(thread.stop):
+        try:
+            thread.stop()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    thread.join(timeout=0.05)
+
+
 def _is_allowed_write(target: Any) -> bool:
     # Importing torch and tracing on meta tensors populates the inductor and
     # triton caches. Those writes come from us, not from the user's code, and
-    # blocking them would break the check we are trying to run.
+    # blocking them would break the check we are trying to run. Scratch files
+    # under the system temp directory and the user cache directory are likewise
+    # allowed: a font or dataset cache landing in /tmp or ~/.cache is not a
+    # dataset download, telemetry, or checkpoint write. The checked project
+    # tree stays blocked even when it sits under one of those directories
+    # (a pytest `tmp_path` project lives under /tmp, as does any project
+    # someone keeps directly in /tmp): a checkpoint or source overwrite inside
+    # the project is exactly what the guard is for.
     try:
         if isinstance(target, bytes):
             target = os.fsdecode(target)
         p = Path(target).resolve()
         for allowed in _allowed_cache_dirs():
-            if p.is_relative_to(allowed):
-                return True
+            try:
+                if p.is_relative_to(allowed):
+                    return True
+            except (TypeError, ValueError):
+                continue
+        for allowed in _scratch_dirs():
+            try:
+                if p.is_relative_to(allowed) and not _is_protected(p):
+                    return True
+            except (TypeError, ValueError):
+                continue
     except (TypeError, ValueError, OSError):
         return False
     return False
+
+
+_protected_stack: list[tuple[Path, ...]] = []
+
+
+def _is_protected(p: Path) -> bool:
+    """Whether a resolved path sits inside a tree the current check protects."""
+    for roots in _protected_stack:
+        for root in roots:
+            try:
+                if p.is_relative_to(root):
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _resolve_roots(roots: Any) -> tuple[Path, ...]:
+    resolved: list[Path] = []
+    for root in roots or ():
+        try:
+            resolved.append(Path(root).resolve())
+        except (TypeError, ValueError, OSError):
+            continue
+    return tuple(resolved)
 
 
 _orig_builtins_open = builtins.open
@@ -910,20 +1013,32 @@ def _remove_guard() -> None:
 
 
 @contextmanager
-def active_guard(enabled: bool = True, phase: str = "import"):
-    """Activate the effect guard within a context block."""
+def active_guard(enabled: bool = True, phase: str = "import", protect: Any = ()):
+    """Activate the effect guard within a context block.
+
+    `protect` names trees that stay blocked even under the scratch allowance:
+    the project being checked lives there, so a checkpoint or source overwrite
+    inside it is exactly what the guard is for, wherever that tree happens to
+    sit. Nested contexts union, and the roots apply whether or not this
+    particular context enables the hooks, so a caller can protect a whole job
+    with `active_guard(enabled=False, protect=[root])`.
+    """
     global _depth
-    if not enabled:
-        yield
-        return
-    _contexts.append(phase)
-    if _depth == 0:
-        _install_guard()
-    _depth += 1
+    _protected_stack.append(_resolve_roots(protect))
     try:
-        yield
-    finally:
-        _depth -= 1
+        if not enabled:
+            yield
+            return
+        _contexts.append(phase)
         if _depth == 0:
-            _remove_guard()
-        _contexts.pop()
+            _install_guard()
+        _depth += 1
+        try:
+            yield
+        finally:
+            _depth -= 1
+            if _depth == 0:
+                _remove_guard()
+            _contexts.pop()
+    finally:
+        _protected_stack.pop()

@@ -947,6 +947,160 @@ def test_worker_timeout_reports_as_before(monkeypatch, tmp_path):
     assert procs[0].poll() is not None
 
 
+def test_retained_trace_diagnostic_honours_a_new_ignore_comment(tmp_path):
+    """A suppression just typed silences the retained trace result at once.
+
+    lint_now keeps the last trace's diagnostics so results do not flicker
+    while the user types. Those retained diagnostics used to be added
+    verbatim, so typing `# torchtyc: ignore[shape-mismatch]` appeared to do
+    nothing until the next trace fired. Now they go through the current
+    buffer's suppressions and the config filters like the fresh ones.
+    """
+    source = (
+        "import torch\n"
+        "from jaxtyping import Float\n"
+        "from torch import Tensor\n"
+        "\n"
+        "\n"
+        'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "d b"]:{ignore}\n'
+        "    return x\n"
+    )
+    def_line = 5
+    path = tmp_path / "model.py"
+    path.write_text(source.format(ignore=""))
+
+    from torchtyc.engine import Report
+
+    server = TorchtycServer()
+    uri = path_to_uri(str(path))
+    server.reports[uri] = Report(
+        diagnostics=[
+            Diagnostic(
+                path=str(path),
+                line=def_line,
+                column=0,
+                rule="shape-mismatch",
+                message="stale",
+                severity=Severity.ERROR,
+            )
+        ]
+    )
+
+    published: list = []
+
+    def drive(buffer: str) -> list:
+        del published[:]
+        server.source_of = lambda _uri: buffer
+        server.publish = lambda _uri, diagnostics: published.append(list(diagnostics))
+        server.lint_now(uri)
+        return published[0]
+
+    # Without the comment the retained diagnostic is still published:
+    # the anti-flicker behaviour is unchanged.
+    assert [d.rule for d in drive(source.format(ignore=""))] == ["shape-mismatch"]
+    # With it, the retained diagnostic is silenced immediately.
+    assert drive(source.format(ignore="  # torchtyc: ignore[shape-mismatch]")) == []
+
+
+def test_retained_trace_diagnostic_honours_config_filters(tmp_path):
+    """Retained diagnostics are dropped by ignore/severity like fresh ones."""
+    from torchtyc.config import Overrides
+
+    source = (
+        "import torch\n"
+        "from jaxtyping import Float\n"
+        "from torch import Tensor\n"
+        "\n"
+        "\n"
+        'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:\n'
+        "    return x\n"
+    )
+    path = tmp_path / "model.py"
+    path.write_text(source)
+
+    server = TorchtycServer()
+    server.overrides = Overrides(severity=Severity.ERROR)
+    uri = path_to_uri(str(path))
+    from torchtyc.engine import Report
+
+    server.reports[uri] = Report(
+        diagnostics=[
+            Diagnostic(
+                path=str(path),
+                line=5,
+                column=0,
+                rule="device-mismatch",
+                message="stale",
+                severity=Severity.WARNING,
+            )
+        ]
+    )
+
+    published: list = []
+    server.source_of = lambda _uri: source
+    server.publish = lambda _uri, diagnostics: published.append(list(diagnostics))
+    server.lint_now(uri)
+    assert published[0] == []
+
+
+def test_worker_error_diagnostic_is_suppressible(monkeypatch, tmp_path):
+    """The worker-failure diagnostic goes through suppressions like the rest.
+
+    It is constructed after suppressions were applied, so without routing it
+    through the current buffer's scan no ignore comment could silence it, and
+    it used to wear `trace-error` at a second severity besides.
+    """
+    import asyncio
+
+    from torchtyc import lsp as lsp_module
+    from torchtyc.diagnostics import RULES
+    from torchtyc.engine import Report
+
+    assert RULES["worker-error"].severity is Severity.ERROR
+
+    base = (
+        "import torch\n"
+        "from jaxtyping import Float\n"
+        "from torch import Tensor\n"
+        "\n"
+        "\n"
+        'def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:\n'
+        "    return x\n"
+    )
+    path = tmp_path / "model.py"
+    path.write_text(base)
+
+    server = TorchtycServer()
+    uri = path_to_uri(str(path))
+    published: list = []
+
+    def fake_check(paths, config, sources=None, hover=False, **kwargs):
+        return Report(diagnostics=[], worker_error="boom")
+
+    monkeypatch.setattr(lsp_module, "check_paths", fake_check)
+    server.publish = lambda _uri, diagnostics: published.append(list(diagnostics))
+
+    async def drive(buffer: str) -> list:
+        del published[:]
+        path.write_text(buffer)
+        server.source_of = lambda _uri: buffer
+        await server.trace_now(uri)
+        return published[-1]
+
+    # No suppression: the failure is reported, as an error, under its own rule.
+    diags = asyncio.run(drive(base))
+    (diag,) = [d for d in diags if d.rule == "worker-error"]
+    assert diag.severity is Severity.ERROR
+    assert "torchtyc could not trace this file" in diag.message
+    assert "boom" in diag.message
+    assert "trace-error" not in [d.rule for d in diags]
+
+    # With the ignore comment on the diagnostic's line, it is silenced, with
+    # no stale "matched nothing" marker left behind.
+    silenced = asyncio.run(drive("# torchtyc: ignore[worker-error]\n" + base))
+    assert [d.rule for d in silenced] == []
+
+
 def test_diagnostic_column_with_multibyte_character():
     """Multi-byte character before anchor: reported column identifies the right span."""
     from torchtyc.discovery import scan_source

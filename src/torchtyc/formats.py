@@ -132,6 +132,7 @@ def _json(report: Report) -> str:
             "skipped_functions": report.skipped_functions,
             "worker_error": report.worker_error,
             "ok": report.ok,
+            "retried": report.retried,
         },
         indent=2,
     )

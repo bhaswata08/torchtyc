@@ -118,7 +118,14 @@ def cmd_trace(args: argparse.Namespace) -> int:
         arrow = "->" if name == "return" else " :"
         label = "return" if name == "return" else name
         print(f"  {label:<{width}} {dim}{arrow}{reset} {shape}")
-    print(f"\n{dim}dimension names are bound to distinct primes starting at 101{reset}")
+    retried_diag = next(
+        (d for d in report.diagnostics if d.function == qualname and d.rule == "trace-retried"),
+        None,
+    )
+    if retried_diag:
+        print(f"\n{dim}traced on rescaled widths (retried){reset}")
+    else:
+        print(f"\n{dim}dimension names are bound to distinct primes starting at 101{reset}")
     return 0
 
 

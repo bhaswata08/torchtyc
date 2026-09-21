@@ -17,6 +17,7 @@ import tokenize
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .annotations import AnnotationError, ArraySpec, Spec, TupleSpec, parse_annotation
 
@@ -75,6 +76,9 @@ class Param:
     plain_type: str | None = None
     # Declared before `/`, so it can only be passed positionally.
     positional_only: bool = False
+    # The written default evaluated without running any code, so a retry can
+    # prefer it. None when there is no default or it is not a literal.
+    default: Any = None
 
 
 @dataclass
@@ -107,6 +111,7 @@ class InitDef:
     def_line: int = 0
     end_line: int = 0
     conditional: bool = False
+    position: Position | None = None
 
 
 @dataclass
@@ -409,6 +414,7 @@ def _parse_param(
     has_default: bool,
     positional_only: bool = False,
     lines: Sequence[str] | None = None,
+    default_node: ast.expr | None = None,
 ) -> Param:
     position = Position.of(arg, lines)
     spec: Spec | None = None
@@ -429,7 +435,22 @@ def _parse_param(
         annotation_error=error,
         plain_type=plain,
         positional_only=positional_only,
+        default=_literal_value(default_node),
     )
+
+
+def _literal_value(node: ast.expr | None) -> Any:
+    """Evaluate a written default without running any code.
+
+    Anything that is not a literal, a name lookup away from running, reads as
+    no default: the value is only ever compared by type, never called.
+    """
+    if node is None:
+        return None
+    try:
+        return ast.literal_eval(node)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _plain_type(node: ast.expr) -> str | None:
@@ -524,11 +545,14 @@ def _params_of(
             has_default=index >= defaults_start,
             positional_only=index < len(args.posonlyargs),
             lines=lines,
+            default_node=(
+                args.defaults[index - defaults_start] if index >= defaults_start else None
+            ),
         )
         for index, arg in enumerate(positional)
     ]
     params += [
-        _parse_param(arg, has_default=default is not None, lines=lines)
+        _parse_param(arg, has_default=default is not None, lines=lines, default_node=default)
         for arg, default in zip(args.kwonlyargs, args.kw_defaults or [])
     ]
     return params
@@ -729,6 +753,11 @@ def scan_source(source: str, path: str) -> FileScan:
                 isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and child.name == "__init__"
             ):
+                init_col = (
+                    _byte_to_codepoint(lines[child.lineno - 1], child.col_offset)
+                    if lines and 0 <= child.lineno - 1 < len(lines)
+                    else child.col_offset
+                )
                 info.inits.append(
                     InitDef(
                         params=_params_of(child, lines)[1:],  # drop self
@@ -736,6 +765,12 @@ def scan_source(source: str, path: str) -> FileScan:
                         def_line=_def_line(child),
                         end_line=(child.end_lineno or child.lineno) - 1,
                         conditional=guarded,
+                        position=Position(
+                            child.lineno - 1,
+                            init_col,
+                            child.lineno - 1,
+                            init_col + len(_def_keyword(child)) + len(child.name),
+                        ),
                     )
                 )
         visit_body(node.body, info, qualname, conditional, enclosing)

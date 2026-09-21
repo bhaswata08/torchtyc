@@ -18,10 +18,12 @@ import importlib
 import importlib.util
 import json
 import linecache
+import os
 import re
 import site
 import sys
 import sysconfig
+import threading
 import traceback
 from collections.abc import Iterable
 from pathlib import Path
@@ -30,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import Attribute, ClassInfo, Position, Target, scan_source
-from .effects import active_guard, unwrap_blocked
+from .effects import active_guard, attempt_cooperative_stop, unwrap_blocked
 
 # torch and everything that touches it load on first use, not at import. The
 # parent starts the per-file timeout clock when this process announces
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
         TraceFailed,
         TraceResult,
         TraceSkipped,
+        _written_integers,
         check_return,
         describe,
         explain_derived_sizes,
@@ -66,6 +69,7 @@ else:
     live_init = None
     resolve_qualname = None
     trace = None
+    _written_integers = None
 
 
 def _ensure_initialized() -> None:
@@ -77,7 +81,8 @@ def _ensure_initialized() -> None:
         instantiate, \
         live_init, \
         resolve_qualname, \
-        trace
+        trace, \
+        _written_integers
     if torch is not None:
         return
     import torch as _torch
@@ -96,6 +101,7 @@ def _ensure_initialized() -> None:
     live_init = _tracing.live_init
     resolve_qualname = _tracing.resolve_qualname
     trace = _tracing.trace
+    _written_integers = _tracing._written_integers
 
 
 def _collect_system_dirs() -> tuple[Path, ...]:
@@ -152,10 +158,13 @@ def _should_keep_module(name: str) -> bool:
 
     paths = getattr(mod, "__path__", None)
     if paths is not None:
+        # A namespace package's `__path__` recomputes itself on iteration by
+        # looking its parent up in `sys.modules`, and raises `KeyError` once the
+        # parent is gone. A parent that is gone was dropped, so the child goes too.
         try:
             resolved_paths = [Path(p).resolve() for p in paths]
             return bool(resolved_paths) and all(_is_system_path(p) for p in resolved_paths)
-        except (ValueError, OSError):
+        except (ValueError, OSError, KeyError):
             return False
 
     top = name.partition(".")[0]
@@ -164,9 +173,11 @@ def _should_keep_module(name: str) -> bool:
 
 def _restore_modules_and_path(saved_path: list[str]) -> None:
     sys.path[:] = saved_path
-    for name in list(sys.modules):
-        if not _should_keep_module(name):
-            sys.modules.pop(name, None)
+    # Decide everything before dropping anything: a namespace package reads its
+    # parent out of `sys.modules` to answer, and the parent comes first here.
+    doomed = [name for name in list(sys.modules) if not _should_keep_module(name)]
+    for name in doomed:
+        sys.modules.pop(name, None)
     importlib.invalidate_caches()
     sys.path_importer_cache.clear()
 
@@ -691,14 +702,15 @@ def check_target(
             skipped=False,
         )
     except TraceSkipped as exc:
+        pos = exc.position or target.position
         return TargetOutcome(
             [
                 Diagnostic(
                     path=path,
-                    line=target.position.line,
-                    column=target.position.column,
-                    end_line=target.position.end_line,
-                    end_column=target.position.end_column,
+                    line=pos.line,
+                    column=pos.column,
+                    end_line=pos.end_line,
+                    end_column=pos.end_column,
                     rule=exc.rule,
                     severity=_severity(exc.rule),
                     message=exc.message,
@@ -709,6 +721,31 @@ def check_target(
             None,
             checked=False,
             skipped=True,
+        )
+
+    if result.retried and result.first_error is not None:
+        first = result.first_error
+        statement = None
+        try:
+            _, _, _, statement = _anchor(first, path, target.position, result.binder)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        first_reason = result.binder.rename_primes(_format_exc(first, statement))
+        first_reason = first_reason.splitlines()[0]
+        widths_str = ", ".join(f"{k}={v}" for k, v in result.rescaled_widths.items())
+        out.append(
+            Diagnostic(
+                path=path,
+                line=target.position.line,
+                column=target.position.column,
+                end_line=target.position.end_line,
+                end_column=target.position.end_column,
+                rule="trace-retried",
+                severity=Severity.INFO,
+                message=f"`{target.qualname}` traced on rescaled widths\n  {widths_str} ({first_reason})",
+                function=target.qualname,
+                hint="the annotation was not checked at the widths torchtyc normally uses",
+            )
         )
 
     problems = check_return(target.returns, result.returned, result.binder)
@@ -756,7 +793,8 @@ def check_attributes(
 ) -> list[Diagnostic]:
     """Construct the class once and compare `self.X` against its annotation."""
     _ensure_initialized()
-    binder = DimBinder(variadic_rank=variadic_rank, literals=info.literal_dims)
+    module_literals = _written_integers(module, max_value=None) if _written_integers else set()
+    binder = DimBinder(variadic_rank=variadic_rank, literals=info.literal_dims | module_literals)
     attributes: list[Attribute] = []
 
     try:
@@ -775,13 +813,14 @@ def check_attributes(
     except NotLive:
         return []
     except TraceSkipped as exc:
+        pos = exc.position or info.position
         return [
             Diagnostic(
                 path=path,
-                line=info.position.line,
-                column=info.position.column,
-                end_line=info.position.end_line,
-                end_column=info.position.end_column,
+                line=pos.line,
+                column=pos.column,
+                end_line=pos.end_line,
+                end_column=pos.end_column,
                 rule=exc.rule,
                 severity=_severity(exc.rule),
                 message=exc.message,
@@ -866,129 +905,307 @@ def _is_local(qualname: str) -> bool:
     return "<locals>" in qualname
 
 
-def run_job(job: dict[str, Any], channel: Any = None) -> dict[str, Any]:
-    _ensure_initialized()
+def _check_one_file(path: str, job: dict[str, Any]) -> dict[str, Any]:
     variadic_rank = job.get("variadic_rank", 2)
     want_hover = job.get("hover", False)
     allow_effects = job.get("allow_effects", False)
+    file_diags: list[dict[str, Any]] = []
+    file_hovers: dict[str, dict[str, str]] = {}
+    file_checked = 0
+    file_skipped = 0
+    saved_path = list(sys.path)
+    buffer = job.get("sources", {}).get(path)
+    if buffer is not None:
+        _prime_linecache(path, buffer)
+    # The project tree stays blocked even where it sits under a scratch
+    # directory: without this, a project checked out under /tmp (pytest's
+    # tmp_path included) could overwrite its own files through the temp-dir
+    # allowance. Entered manually rather than with `with` so the existing
+    # try/finally below can own the exit on every path out.
+    _protection = active_guard(
+        enabled=False, protect=job.get("protect_roots") or [str(Path(path).parent)]
+    )
+    _protection.__enter__()
+    try:
+        source = buffer if buffer is not None else Path(path).read_text(encoding="utf-8")
+        scan = scan_source(source, path)
+        if scan.syntax_error is not None:
+            return {
+                "diagnostics": [],
+                "hovers": {},
+                "checked_functions": 0,
+                "skipped_functions": 0,
+            }
+
+        targets = [t for t in scan.targets if t.has_array_annotation]
+        # A class inside a function body reports once, at the class line, so a
+        # factory with several annotated methods does not repeat itself. A local
+        # class with nothing annotated is not reported at all: there is no
+        # coverage to miss, so saying so would be noise.
+        annotated_owners = {t.owner.qualname for t in targets if t.owner is not None}
+        local_classes = {
+            c.qualname
+            for c in scan.classes
+            if _is_local(c.qualname) and (c.all_attributes or c.qualname in annotated_owners)
+        }
+        local_targets = [
+            t for t in targets if t.owner is not None and t.owner.qualname in local_classes
+        ]
+        file_skipped += len(local_targets)
+        targets = [t for t in targets if t.owner is None or t.owner.qualname not in local_classes]
+        classes = [c for c in scan.classes if c.all_attributes or c.qualname in local_classes]
+        if not targets and not classes:
+            return {
+                "diagnostics": [],
+                "hovers": {},
+                "checked_functions": 0,
+                "skipped_functions": file_skipped,
+            }
+
+        # Threads started by the import are policed here, while the guard is
+        # still installed: anything such a thread writes after the guard
+        # uninstalls would otherwise escape coverage entirely. Only
+        # constructor-spawned threads were checked before (in
+        # tracing.instantiate); an import that leaves one running is reported
+        # the same way, as an import error, instead of being left to write
+        # into the gap between the import and trace phases.
+        before_threads = set(threading.enumerate())
+        try:
+            with active_guard(enabled=not allow_effects, phase="import"):
+                module = import_from_path(Path(path), buffer)
+                if not allow_effects:
+                    spawned = [
+                        t for t in threading.enumerate() if t not in before_threads and t.is_alive()
+                    ]
+                    for thread in spawned:
+                        attempt_cooperative_stop(thread)
+                    surviving = [t for t in spawned if t.is_alive()]
+                    if surviving:
+                        names = ", ".join(f"`{t.name}`" for t in surviving)
+                        file_diags.append(
+                            Diagnostic(
+                                path=path,
+                                line=0,
+                                column=0,
+                                rule="import-error",
+                                severity=Severity.ERROR,
+                                message=f"module left background thread {names} running during import",
+                                hint="shut down background threads at import time or start them lazily",
+                            ).to_json()
+                        )
+                        file_skipped += len(targets)
+                        return {
+                            "diagnostics": file_diags,
+                            "hovers": {},
+                            "checked_functions": 0,
+                            "skipped_functions": file_skipped,
+                        }
+        except KeyboardInterrupt:
+            raise
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
+            diag = _blocked_diagnostic(
+                exc, path, Position(0, 0, 0, 1), DimBinder(), rule="import-error"
+            )
+            if diag is None:
+                position, text, _, statement = _anchor(exc, path, Position(0, 0, 0, 1), DimBinder())
+                diag = Diagnostic(
+                    path=path,
+                    line=position.line,
+                    column=position.column,
+                    end_line=position.end_line,
+                    end_column=position.end_column,
+                    rule="import-error",
+                    severity=Severity.ERROR,
+                    message=_format_exc(exc, statement),
+                    traceback=text,
+                )
+            file_diags.append(diag.to_json())
+            file_skipped += len(targets)
+            return {
+                "diagnostics": file_diags,
+                "hovers": {},
+                "checked_functions": 0,
+                "skipped_functions": file_skipped,
+            }
+
+        with active_guard(enabled=not allow_effects, phase="trace"):
+            for info in classes:
+                for diagnostic in check_attributes(
+                    module, info, path, variadic_rank, allow_effects=allow_effects
+                ):
+                    file_diags.append(diagnostic.to_json())
+
+            for target in targets:
+                outcome = check_target(
+                    module, target, path, variadic_rank, targets, allow_effects=allow_effects
+                )
+                found, result = outcome
+                for diagnostic in found:
+                    file_diags.append(diagnostic.to_json())
+                if want_hover:
+                    file_hovers[target.qualname] = (
+                        shapes_for_hover(result) if result is not None else {}
+                    )
+                if getattr(outcome, "skipped", False):
+                    file_skipped += 1
+                elif getattr(outcome, "checked", False):
+                    file_checked += 1
+    finally:
+        _clear_linecache([path])
+        _restore_modules_and_path(saved_path)
+        _protection.__exit__(None, None, None)
+
+    return {
+        "diagnostics": file_diags,
+        "hovers": file_hovers,
+        "checked_functions": file_checked,
+        "skipped_functions": file_skipped,
+    }
+
+
+def _run_file_in_child(path: str, job: dict[str, Any]) -> dict[str, Any]:
+    r_fd, w_fd = os.pipe()
+    if sys.stdout is not None:
+        sys.stdout.flush()
+    if sys.stderr is not None:
+        sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            res = _check_one_file(path, job)
+            payload = json.dumps(res).encode("utf-8")
+            total = 0
+            while total < len(payload):
+                written = os.write(w_fd, payload[total:])
+                total += written
+        except KeyboardInterrupt:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+            os._exit(130)
+        except BaseException as exc:  # noqa: BLE001
+            try:
+                err_payload = json.dumps(
+                    {
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                ).encode("utf-8")
+                os.write(w_fd, err_payload)
+            except Exception:  # noqa: BLE001, S110
+                pass
+        finally:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+            os._exit(0)
+
+    # Parent process
+    os.close(w_fd)
+    chunks: list[bytes] = []
+    try:
+        while True:
+            chunk = os.read(r_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(r_fd)
+
+    _, status = os.waitpid(pid, 0)
+    raw = b"".join(chunks)
+
+    res: dict[str, Any] | None = None
+    if raw:
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed, dict) and "diagnostics" in parsed:
+                res = parsed
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            res = None
+
+    if res is not None:
+        return res
+
+    detail = ""
+    if raw:
+        with contextlib.suppress(Exception):
+            parsed_err = json.loads(raw.decode("utf-8"))
+            if isinstance(parsed_err, dict) and "error" in parsed_err:
+                detail = str(parsed_err["error"])
+
+    if not detail:
+        if os.WIFSIGNALED(status):
+            sig = os.WTERMSIG(status)
+            detail = f"signal {sig}"
+        elif os.WIFEXITED(status):
+            code = os.WEXITSTATUS(status)
+            detail = f"exit code {code}"
+        else:
+            detail = "died unexpectedly"
+
+    diag = Diagnostic(
+        path=path,
+        line=0,
+        column=0,
+        rule="worker-error",
+        severity=_severity("worker-error"),
+        message=f"worker child process failed ({detail})",
+    )
+    return {
+        "diagnostics": [diag.to_json()],
+        "hovers": {},
+        "checked_functions": 0,
+        "skipped_functions": 0,
+    }
+
+
+def run_job(job: dict[str, Any], channel: Any = None) -> dict[str, Any]:
+    _ensure_initialized()
     diagnostics: list[dict[str, Any]] = []
-    # path -> qualname -> shapes. Two files in one job can define the same
-    # qualname, so the path has to be part of the key.
     hovers: dict[str, dict[str, dict[str, str]]] = {}
     total_checked = 0
     total_skipped = 0
+    can_fork = hasattr(os, "fork")
 
     for path in job["paths"]:
         if channel is not None:
             channel.write(json.dumps({"event": "file_start", "path": path}) + "\n")
             channel.flush()
-        file_diags: list[dict[str, Any]] = []
-        file_hovers: dict[str, dict[str, str]] = {}
-        file_checked = 0
-        file_skipped = 0
-        saved_path = list(sys.path)
-        buffer = job.get("sources", {}).get(path)
-        if buffer is not None:
-            _prime_linecache(path, buffer)
-        try:
-            source = buffer if buffer is not None else Path(path).read_text(encoding="utf-8")
-            scan = scan_source(source, path)
-            if scan.syntax_error is not None:
-                continue  # the in-process pass already reported it
 
-            targets = [t for t in scan.targets if t.has_array_annotation]
-            # A class inside a function body reports once, at the class line, so a
-            # factory with several annotated methods does not repeat itself. A local
-            # class with nothing annotated is not reported at all: there is no
-            # coverage to miss, so saying so would be noise.
-            annotated_owners = {t.owner.qualname for t in targets if t.owner is not None}
-            local_classes = {
-                c.qualname
-                for c in scan.classes
-                if _is_local(c.qualname) and (c.all_attributes or c.qualname in annotated_owners)
-            }
-            local_targets = [
-                t for t in targets if t.owner is not None and t.owner.qualname in local_classes
-            ]
-            file_skipped += len(local_targets)
-            targets = [
-                t for t in targets if t.owner is None or t.owner.qualname not in local_classes
-            ]
-            classes = [c for c in scan.classes if c.all_attributes or c.qualname in local_classes]
-            if not targets and not classes:
-                continue
+        if can_fork:
+            file_res = _run_file_in_child(path, job)
+        else:
+            file_res = _check_one_file(path, job)
 
-            try:
-                with active_guard(enabled=not allow_effects, phase="import"):
-                    module = import_from_path(Path(path), buffer)
-            except Exception as exc:  # noqa: BLE001
-                diag = _blocked_diagnostic(
-                    exc, path, Position(0, 0, 0, 1), DimBinder(), rule="import-error"
+        file_diags = file_res.get("diagnostics", [])
+        file_hovers = file_res.get("hovers", {})
+        file_checked = file_res.get("checked_functions", 0)
+        file_skipped = file_res.get("skipped_functions", 0)
+
+        total_checked += file_checked
+        total_skipped += file_skipped
+        diagnostics.extend(file_diags)
+        if file_hovers:
+            hovers[path] = file_hovers
+
+        if channel is not None:
+            channel.write(
+                json.dumps(
+                    {
+                        "event": "file_result",
+                        "path": path,
+                        "diagnostics": file_diags,
+                        "hovers": {path: file_hovers} if file_hovers else {},
+                        "checked_functions": file_checked,
+                        "skipped_functions": file_skipped,
+                    }
                 )
-                if diag is None:
-                    position, text, _, statement = _anchor(
-                        exc, path, Position(0, 0, 0, 1), DimBinder()
-                    )
-                    diag = Diagnostic(
-                        path=path,
-                        line=position.line,
-                        column=position.column,
-                        end_line=position.end_line,
-                        end_column=position.end_column,
-                        rule="import-error",
-                        severity=Severity.ERROR,
-                        message=_format_exc(exc, statement),
-                        traceback=text,
-                    )
-                file_diags.append(diag.to_json())
-                file_skipped += len(targets)
-                continue
-
-            with active_guard(enabled=not allow_effects, phase="trace"):
-                for info in classes:
-                    for diagnostic in check_attributes(
-                        module, info, path, variadic_rank, allow_effects=allow_effects
-                    ):
-                        file_diags.append(diagnostic.to_json())
-
-                for target in targets:
-                    outcome = check_target(
-                        module, target, path, variadic_rank, targets, allow_effects=allow_effects
-                    )
-                    found, result = outcome
-                    for diagnostic in found:
-                        file_diags.append(diagnostic.to_json())
-                    if want_hover:
-                        file_hovers[target.qualname] = (
-                            shapes_for_hover(result) if result is not None else {}
-                        )
-                    if getattr(outcome, "skipped", False):
-                        file_skipped += 1
-                    elif getattr(outcome, "checked", False):
-                        file_checked += 1
-        finally:
-            total_checked += file_checked
-            total_skipped += file_skipped
-            _clear_linecache([path])
-            _restore_modules_and_path(saved_path)
-            diagnostics.extend(file_diags)
-            if file_hovers:
-                hovers[path] = file_hovers
-            if channel is not None:
-                channel.write(
-                    json.dumps(
-                        {
-                            "event": "file_result",
-                            "path": path,
-                            "diagnostics": file_diags,
-                            "hovers": {path: file_hovers} if file_hovers else {},
-                            "checked_functions": file_checked,
-                            "skipped_functions": file_skipped,
-                        }
-                    )
-                    + "\n"
-                )
-                channel.flush()
+                + "\n"
+            )
+            channel.flush()
 
     if channel is not None:
         channel.write(json.dumps({"event": "done"}) + "\n")

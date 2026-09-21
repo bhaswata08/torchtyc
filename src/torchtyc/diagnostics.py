@@ -73,6 +73,11 @@ DEVICE_MISMATCH = _rule("device-mismatch", Severity.WARNING, "a traced value lef
 # Problems reaching the point where a shape could be compared.
 TRACE_ERROR = _rule("trace-error", Severity.ERROR, "the function raised while being traced")
 IMPORT_ERROR = _rule("import-error", Severity.ERROR, "the module could not be imported")
+# The file could not be traced at all: the worker failed, the trace timed out,
+# the child died, or the file does not even parse. That is not the same event
+# as a function raising while being traced, so it gets its own rule rather
+# than wearing `trace-error` at a second severity.
+WORKER_ERROR = _rule("worker-error", Severity.ERROR, "the file could not be traced")
 UNINSTANTIABLE = _rule(
     "uninstantiable", Severity.WARNING, "a module's __init__ could not be called automatically"
 )
@@ -86,6 +91,9 @@ LOCAL_DEFINITION = _rule(
 )
 UNSUPPORTED_ANNOTATION = _rule(
     "unsupported-annotation", Severity.WARNING, "an annotation could not be parsed"
+)
+TRACE_RETRIED = _rule(
+    "trace-retried", Severity.INFO, "a function traced only after widths were rescaled"
 )
 
 # Hygiene rules, off the critical path but cheap once a trace exists.

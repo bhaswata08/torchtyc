@@ -100,16 +100,83 @@ on show: here `self.w1` was built with its two widths the wrong way round.
 
 ## Install
 
+Into the project, so the version is pinned alongside everything else:
+
 ```bash
-uv add --dev torchtyc      # or: pip install torchtyc
+uv add --dev "torchtyc[all]"      # or: pip install "torchtyc[all]"
+```
+
+Or once, for every project on the machine:
+
+```bash
+uv tool install "torchtyc[all]"
 ```
 
 Extras: `torchtyc[lsp]` for the language server, `[watch]` for watch mode,
 `[einops]` for einops-aware hints, `[all]` for everything.
 
-torchtyc must run under the same interpreter as your project, since it imports
-your code. By default it finds `.venv/bin/python` next to your `pyproject.toml`.
-Override with `--python` or `[tool.torchtyc] python = "..."`.
+torchtyc itself runs under any interpreter. Your code is imported by a separate
+worker process, which torchtyc starts under your *project's* interpreter with
+its own source added to that interpreter's path. A standalone torchtyc on 3.14
+therefore checks a project on 3.13 without being installed into that project's
+venv.
+
+The worker needs `torch` importable, plus whatever your modules import at import
+time. torchtyc looks for `.venv/bin/python`, then `venv/bin/python`, beside the
+nearest `pyproject.toml` above the paths you gave it, and falls back to the
+interpreter it is running under. Override with `--python` or
+`[tool.torchtyc] python = "..."`.
+
+Confirm the pieces line up before anything else:
+
+```bash
+torchtyc version
+torchtyc check src/one_model.py
+```
+
+A `worker failed:` line means the interpreter is wrong or your module does not
+import. Anything else is a finding about your code.
+
+## Checking every file
+
+```bash
+torchtyc check .
+```
+
+A directory argument is walked recursively for `*.py`. `.venv`, `build`,
+`dist`, `__pycache__` and `.git` are skipped. Setting `exclude` in
+`pyproject.toml` *replaces* that list, so repeat the defaults you still want:
+
+```toml
+[tool.torchtyc]
+exclude = [".venv", "build", "dist", "__pycache__", ".git", "experiments"]
+```
+
+Each name matches a whole path component below the directory you named, so
+`experiments` drops `src/experiments/train.py`. Directories above the one you
+asked for are not considered, which is why a checkout that happens to live under
+a path called `build` still gets checked when you point at it directly.
+
+The language server only ever checks the buffer you have open. Project-wide
+coverage comes from the CLI. While you work:
+
+```bash
+torchtyc watch .
+```
+
+Before a commit, as a `.pre-commit-config.yaml` hook:
+
+```yaml
+- repo: local
+  hooks:
+    - id: torchtyc
+      name: torchtyc
+      entry: uv run torchtyc check
+      language: system
+      types: [python]
+```
+
+On a pull request, see [CI](#ci) below.
 
 ## Commands
 
@@ -195,7 +262,7 @@ rot.
 python = ".venv/bin/python"   # interpreter that imports your code
 severity = "warning"          # drop anything below this level
 ignore = ["unused-dim"]
-exclude = [".venv", "build", "experiments"]
+exclude = [".venv", "build", "dist", "__pycache__", ".git"]   # replaces the defaults
 variadic-rank = 2             # how many axes `...` stands for
 einops = true
 timeout = 60.0
@@ -250,6 +317,7 @@ matched no python file.
 | `einops-pattern` | error | an einops pattern disagrees with the tensors given to it |
 | `trace-error` | error | the function raised while being traced |
 | `import-error` | error | the module could not be imported |
+| `worker-error` | error | the file could not be traced |
 | `device-mismatch` | warning | a traced value left the meta device |
 | `einops-unknown-axis` | warning | an einops axis matches no input axis or keyword |
 | `uninstantiable` | warning | a module's `__init__` could not be called automatically |
@@ -258,6 +326,7 @@ matched no python file.
 | `local-definition` | info | a target inside a function body cannot be reached after import |
 | `anonymous-return` | info | arguments are annotated but the return is not |
 | `missing-annotation` | info | a public function has no jaxtyping annotation |
+| `trace-retried` | info | a function traced only after widths were rescaled |
 | `unused-dim` | info | a dimension name is used once, so it constrains nothing |
 | `suppression-unused` | info | an ignore comment matched no diagnostic |
 
@@ -285,13 +354,28 @@ axis - `head_dim = d_model // n_heads`, then `view(b, s, n_heads, head_dim)` -
 gets a quotient that does not multiply back. A trace that fails this way is run
 again on widths that do divide, taken from the numbers the model itself writes
 down: a parameter's default, or a literal in the body of the constructor or
-the traced method. Multi-head attention passes on the second attempt. A model
-that splits by a width written nowhere either of those can see, or by one above
-256, still needs `# torchtyc: ignore[trace-error]`.
+the traced method. Multi-head attention passes on the second attempt and reports
+`trace-retried` at info level. A model that splits by a width written nowhere
+either of those can see, or by one above 256, still needs `# torchtyc: ignore[trace-error]`.
 
 Runtime checking with `jaxtyping` and `beartype` remains worth having. torchtyc
 tells you the shapes are consistent for the sizes it chose; beartype tells you
 they were right for the batch you actually ran.
+
+If your package installs one of those hooks over itself, remember that torchtyc
+calls your constructors with real integers, so your own runtime checks see them.
+A width annotated `float` that receives `101` is rejected by beartype, which
+does not apply the PEP 484 numeric tower unless asked, and it reaches you as a
+`trace-error` on the constructor. Every static checker accepts an `int` there,
+so the two disagree about your code rather than about torchtyc. Either annotate
+`int`, or turn the tower on for the whole package:
+
+```python
+install_import_hook(
+    modules="mypkg",
+    typechecker="beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
+)
+```
 
 ## Security
 

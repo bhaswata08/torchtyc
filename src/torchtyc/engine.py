@@ -64,6 +64,10 @@ class Report:
     def ok(self) -> bool:
         return self.errors == 0 and self.worker_error is None
 
+    @property
+    def retried(self) -> list[str]:
+        return [d.function for d in self.diagnostics if d.rule == "trace-retried" and d.function]
+
 
 def lint_scan(scan: FileScan, config: Config) -> list[Diagnostic]:
     """Everything decidable from the source text alone."""
@@ -79,8 +83,8 @@ def lint_scan(scan: FileScan, config: Config) -> list[Diagnostic]:
                 column=position.column,
                 end_line=position.end_line,
                 end_column=position.end_column,
-                rule="trace-error",
-                severity=Severity.ERROR,
+                rule="worker-error",
+                severity=RULES["worker-error"].severity,
                 message=f"SyntaxError: {message}",
             )
         ]
@@ -508,6 +512,11 @@ def run_worker(
         "hover": hover,
         "allow_effects": config.allow_effects,
         "stream": True,
+        # The tree being checked stays blocked even where it sits under a
+        # scratch directory (see effects.active_guard): without the worker
+        # knowing the root, a project under /tmp could overwrite its own
+        # files through the temp-dir allowance.
+        "protect_roots": [str(Path(config.root).resolve())],
     }
 
     env = dict(os.environ)
@@ -536,6 +545,8 @@ def run_worker(
         on_proc(proc)
 
     stdout_lines, stderr, timed_out = _communicate(proc, json.dumps(job), config.timeout, cancel)
+    if not timed_out and proc.poll() is None:
+        _finish(proc)
 
     diagnostics: list[Diagnostic] = []
     hovers: dict[str, dict[str, dict[str, str]]] = {}
@@ -604,8 +615,8 @@ def run_worker(
                     path=caller_path,
                     line=0,
                     column=0,
-                    rule="trace-error",
-                    severity=Severity.ERROR,
+                    rule="worker-error",
+                    severity=RULES["worker-error"].severity,
                     message=f"the trace timed out after {config.timeout:g}s",
                 )
             )
@@ -622,6 +633,18 @@ def run_worker(
         )
         if not valid_json:
             return WorkerRunResult([], {}, "the worker produced output that was not JSON")
+
+    uncompleted = [p for p in absolute if p not in completed_files]
+    if uncompleted:
+        failing_file = (
+            current_file if (current_file and current_file in uncompleted) else uncompleted[0]
+        )
+        caller_path = absolute.get(failing_file, failing_file)
+        if worker_error is None:
+            worker_error = f"worker failed on {caller_path} (exit code {proc.returncode})"
+
+    if proc.returncode != 0 and worker_error is None:
+        worker_error = f"worker failed with exit code {proc.returncode}"
 
     return WorkerRunResult(diagnostics, hovers, worker_error, checked_functions, skipped_functions)
 

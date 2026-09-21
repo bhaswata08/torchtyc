@@ -27,7 +27,7 @@ from lsprotocol import types as lsp
 from . import __version__
 from . import config as config_module
 from .config import Config, Overrides
-from .diagnostics import Diagnostic, Severity
+from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import Target, _byte_to_codepoint, scan_source
 from .engine import (
     Report,
@@ -242,10 +242,25 @@ class TorchtycServer(LanguageServer):
             if d.rule not in config.ignore and d.severity <= config.severity
         ]
         # Keep whatever the last trace found, so results do not flicker away
-        # while the user types.
+        # while the user types. The retained diagnostics are re-run through
+        # the current buffer's suppressions and the config filters, so an
+        # ignore comment the user just typed takes effect immediately instead
+        # of sitting there until the next trace fires.
+        #
+        # Staleness caveat: a retained diagnostic carries the line number the
+        # last trace saw, while suppressions come from the edited buffer. When
+        # the edit only adds an ignore comment to the diagnostic's own line,
+        # the numbers still agree and the match is exact. When the edit moves
+        # lines around, a retained diagnostic can miss its suppression (or
+        # match a neighbour's) until the next trace re-anchors it.
         previous = self.reports.get(uri)
         if previous is not None:
             traced = [d for d in previous.diagnostics if d.rule in _TRACE_RULES]
+            traced = [
+                d
+                for d in apply_suppressions(traced, scan.suppressions)
+                if d.rule not in config.ignore and d.severity <= config.severity
+            ]
             diagnostics = diagnostics + traced
         self.publish(uri, diagnostics)
 
@@ -352,17 +367,38 @@ class TorchtycServer(LanguageServer):
 
         diagnostics = list(report.diagnostics)
         if report.worker_error:
-            diagnostics.append(
-                Diagnostic(
-                    path=path,
-                    line=0,
-                    column=0,
-                    rule="trace-error",
-                    severity=Severity.WARNING,
-                    message=f"torchtyc could not trace this file: {report.worker_error}",
-                    hint=f"interpreter: {config.interpreter}",
-                )
+            worker_diag = Diagnostic(
+                path=path,
+                line=0,
+                column=0,
+                rule="worker-error",
+                severity=RULES["worker-error"].severity,
+                message=f"torchtyc could not trace this file: {report.worker_error}",
+                hint=f"interpreter: {config.interpreter}",
             )
+            # This diagnostic is constructed after suppressions were applied,
+            # so route it through the current buffer's suppressions and the
+            # config filters the way every other diagnostic goes. Otherwise
+            # `# torchtyc: ignore[worker-error]` cannot silence it.
+            worker_scan = scan_source(source, path)
+            kept = apply_suppressions([worker_diag], worker_scan.suppressions)
+            kept = [
+                d for d in kept if d.rule not in config.ignore and d.severity <= config.severity
+            ]
+            diagnostics.extend(kept)
+            if not kept:
+                # A suppression matching only this diagnostic was already
+                # counted as unused inside check_paths, before this diagnostic
+                # existed. It is used now, so drop the stale marker rather
+                # than reporting both the failure and a bogus "matched
+                # nothing".
+                used_lines = {s.line for s in worker_scan.suppressions if s.used}
+                if used_lines:
+                    diagnostics = [
+                        d
+                        for d in diagnostics
+                        if not (d.rule == "suppression-unused" and d.line in used_lines)
+                    ]
         self.publish(uri, diagnostics)
 
 
@@ -377,6 +413,7 @@ _TRACE_RULES = frozenset(
         "device-mismatch",
         "attribute-mismatch",
         "trace-error",
+        "worker-error",
         "import-error",
         "uninstantiable",
         "unresolved-arg",
@@ -464,7 +501,18 @@ def hover(ls: TorchtycServer, params: lsp.HoverParams) -> lsp.Hover | None:
         lines.append(f"{label:<{width}} {'->' if name == 'return' else ' :'} {shape}")
     lines.append("```")
     lines.append("")
-    lines.append("_Each dimension name is bound to a distinct prime from 101._")
+    retried_diag = next(
+        (
+            d
+            for d in report.diagnostics
+            if d.function == target.qualname and d.rule == "trace-retried"
+        ),
+        None,
+    )
+    if retried_diag:
+        lines.append("_Traced on rescaled widths (retried)._")
+    else:
+        lines.append("_Each dimension name is bound to a distinct prime from 101._")
 
     return lsp.Hover(
         contents=lsp.MarkupContent(kind=lsp.MarkupKind.Markdown, value="\n".join(lines))

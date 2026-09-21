@@ -596,6 +596,160 @@ def test_real_inductor_cache_write_allowed(project):
             target_file.unlink()
 
 
+def test_tempfile_scratch_write_allowed_at_import(project, tmp_path: Path):
+    import tempfile
+
+    probe = Path(tempfile.gettempdir()) / "torchtyc_scratch_probe.txt"
+    probe.unlink(missing_ok=True)
+    paths, config = project(
+        HEADER
+        + f"""
+    import tempfile
+    from pathlib import Path
+
+    _f = tempfile.NamedTemporaryFile(mode="w")
+    Path({str(probe)!r}).write_text("scratch")
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    try:
+        report = check_paths(paths, config)
+        assert probe.exists()
+        assert probe.read_text() == "scratch"
+        assert report.diagnostics == []
+        assert report.ok
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_user_cache_write_allowed_at_import(project, tmp_path: Path, monkeypatch):
+    # Beside the project, not inside it: the project tree stays protected
+    # even under /tmp, while a cache directory outside it is scratch.
+    cache = tmp_path.parent / "shared_user_cache"
+    cache.mkdir(exist_ok=True)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    target = cache / "torchtyc_test" / "cache.json"
+    paths, config = project(
+        HEADER
+        + f"""
+    import os
+    from pathlib import Path
+
+    Path({str(target)!r}).parent.mkdir(parents=True, exist_ok=True)
+    Path({str(target)!r}).write_text("cached")
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    try:
+        report = check_paths(paths, config)
+        assert target.exists()
+        assert target.read_text() == "cached"
+        assert report.diagnostics == []
+        assert report.ok
+    finally:
+        import shutil
+
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def test_scratch_dirs_honour_xdg_cache_home(tmp_path: Path, monkeypatch):
+    # Unit coverage for the cache branch itself: a cache directory outside
+    # the system temp dir is still scratch, and protection still wins inside
+    # the project tree.
+    import tempfile
+
+    from torchtyc.effects import _is_allowed_write, _scratch_dirs, active_guard
+
+    cache = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    assert cache.resolve() in _scratch_dirs()
+    assert _is_allowed_write(cache / "fonts" / "cache.json")
+    assert _is_allowed_write(Path(tempfile.gettempdir()) / "whatever.bin")
+    outside = tmp_path.parent / "outside_cache"
+    with active_guard(enabled=False, protect=[str(tmp_path)]):
+        # Inside the protected tree nothing scratch is writable, even the
+        # configured cache directory when it sits inside the project.
+        assert not _is_allowed_write(tmp_path / "checkpoint.pt")
+        assert not _is_allowed_write(cache / "fonts" / "cache.json")
+        assert _is_allowed_write(outside / "fonts" / "cache.json")
+
+
+def test_project_tree_under_tmp_stays_blocked(project, tmp_path: Path):
+    # tmp_path itself lives under the system temp directory, so this also
+    # proves the scratch allowance does not extend to the project being
+    # checked: a checkpoint write into the project tree is still blocked.
+    import tempfile
+
+    assert str(tmp_path.resolve()).startswith(str(Path(tempfile.gettempdir()).resolve()))
+    target = tmp_path / "checkpoint.pt"
+    paths, config = project(
+        HEADER
+        + f"""
+    from pathlib import Path
+
+    Path({str(target)!r}).write_text("weights")
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert not target.exists()
+    assert len(report.diagnostics) == 1
+    assert report.diagnostics[0].rule == "import-error"
+
+
+def test_import_spawned_thread_is_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    import threading
+
+    _stop = threading.Event()
+    _bg = threading.Thread(target=_stop.wait, name="torchtyc-test-bg", daemon=True)
+    _bg.start()
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """
+    )
+    report = check_paths(paths, config)
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "import-error"
+    assert "background thread" in diag.message
+    assert "torchtyc-test-bg" in diag.message
+
+
+def test_import_spawned_thread_allowed_by_config(project):
+    paths, config = project(
+        HEADER
+        + """
+    import threading
+
+    _done = threading.Event()
+
+    def _quick():
+        _done.set()
+
+    _bg = threading.Thread(target=_quick, daemon=True)
+    _bg.start()
+    _bg.join(timeout=10)
+
+    def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+        return x
+    """,
+        allow_effects=True,
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
 def test_new_hooks_removed_on_uninstall():
     orig_getaddrinfo = socket.getaddrinfo
     orig_gethostbyname = socket.gethostbyname

@@ -1541,7 +1541,12 @@ def test_multi_head_attention_splitting_a_width_is_clean(project):
     # `d_model // n_heads` loses a remainder at any prime width, so tracing on
     # primes alone reports this correct block as a shape error. The retry runs
     # it at a width the eight the constructor writes down divides.
-    assert report.diagnostics == []
+    assert all(d.severity is Severity.INFO for d in report.diagnostics)
+    assert report.ok
+    (retried,) = [d for d in report.diagnostics if d.rule == "trace-retried"]
+    assert retried.function == "MHA.forward"
+    assert "d_model=" in retried.message
+    assert "RuntimeError" in retried.message
 
 
 def test_a_dimension_named_by_a_defaulted_parameter_takes_the_default(project):
@@ -1564,7 +1569,12 @@ def test_a_dimension_named_by_a_defaulted_parameter_takes_the_default(project):
     report = check_paths(paths, config)
     # `n_heads` names an axis and states a width. On the retry the width wins,
     # so the split comes out whole and the axis binds to eight.
-    assert rules(report) == ["unused-dim"]
+    assert rules(report) == ["trace-retried", "unused-dim"]
+    assert all(d.severity is Severity.INFO for d in report.diagnostics)
+    assert report.ok
+    retried = report.diagnostics[0]
+    assert retried.function == "Heads.forward"
+    assert "n_heads=8" in retried.message
 
 
 def test_a_width_split_twice_is_clean(project):
@@ -1588,7 +1598,12 @@ def test_a_width_split_twice_is_clean(project):
     report = check_paths(paths, config)
     # The head width is split again, so a factor that survives one division is
     # not enough. The second retry multiplies the written widths instead.
-    assert report.diagnostics == []
+    assert all(d.severity is Severity.INFO for d in report.diagnostics)
+    assert report.ok
+    (retried,) = [d for d in report.diagnostics if d.rule == "trace-retried"]
+    assert retried.function == "Rotary.forward"
+    assert "d_model=" in retried.message
+    assert "RuntimeError" in retried.message
 
 
 def test_a_wrong_width_beside_a_split_is_still_reported(project):
@@ -1632,7 +1647,13 @@ def test_a_split_that_no_written_width_repairs_is_reported(project):
     report = check_paths(paths, config)
     # Seven is written down, so it is tried, and the reshape still adds an axis
     # the annotation does not have.
-    assert rules(report) == ["rank-mismatch"]
+    assert rules(report) == ["trace-retried", "rank-mismatch"]
+    retried, mismatch = report.diagnostics
+    assert retried.severity is Severity.INFO
+    assert retried.function == "Split.forward"
+    assert "d=" in retried.message
+    assert "RuntimeError" in retried.message
+    assert mismatch.severity is Severity.ERROR
 
 
 def test_a_returned_width_the_init_computed_is_named_not_numbered(project):
@@ -1712,7 +1733,14 @@ def test_a_parity_guard_beside_a_keyword_call_is_clean(project):
     # The `2` in the guard compiles to an inline instruction and never reaches
     # the constants beside the keyword call, so reading the constants alone
     # finds no divisor and the retry never runs. Reading the bytecode sees it.
-    assert report.diagnostics == []
+    # The first attempt still fails the guard while building, so the retry is
+    # what traces, and it says so.
+    assert all(d.severity is Severity.INFO for d in report.diagnostics)
+    assert report.ok
+    (retried,) = [d for d in report.diagnostics if d.rule == "trace-retried"]
+    assert retried.function == "RoPE.forward"
+    assert "d_k=" in retried.message
+    assert "divisible by 2" in retried.message
 
 
 def test_a_guarded_constructor_after_a_dead_one_is_used(project):
@@ -2040,7 +2068,10 @@ def test_failed_instance_is_closed_when_retry_succeeds(tmp_path):
     scan = scan_source(source, str(path))
     target = next(t for t in scan.targets if t.has_array_annotation)
     diags, result = worker.check_target(module, target, str(path), 2, scan.targets)
-    assert diags == []
+    assert all(d.severity is Severity.INFO for d in diags)
+    (retried,) = [d for d in diags if d.rule == "trace-retried"]
+    assert retried.function == "DivisibleModel.forward"
+    assert "d_model=" in retried.message
     assert result is not None
     assert len(module.closed_ids) == 2
     assert module.closed_ids[0] is True
@@ -2657,3 +2688,262 @@ def test_multiple_methods_skipped_on_uninstantiable_class(project):
     report = check_paths(paths, config)
     assert report.checked_functions == 0
     assert report.skipped_functions == 2
+
+
+def test_sys_exit_at_import_reports_import_error_diagnostic(tmp_path, monkeypatch, capsys):
+    bad = tmp_path / "bad.py"
+    bad.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            sys.exit(0)
+
+            def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x.reshape(-1)
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "bad.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "error[import-error]" in out
+    assert "SystemExit: 0" in out
+    assert "bad.py" in out
+
+
+def test_two_file_contamination_prevented_by_per_file_fork(tmp_path, monkeypatch, capsys):
+    a_first = tmp_path / "a_first.py"
+    z_last = tmp_path / "z_last.py"
+    a_first.write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            torch.set_default_dtype(torch.float64)
+
+            def h(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    z_last.write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from jaxtyping import Float32
+            from torch import Tensor
+
+            def g(x: Float32[Tensor, "b d"]) -> Float32[Tensor, "b d"]:
+                return x + torch.zeros(x.shape[0], x.shape[1])
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "a_first.py", "z_last.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "No problems in 2 function(s) across 2 file(s)" in out
+
+
+def test_worker_child_uncatchable_death_is_isolated_and_reported(tmp_path, monkeypatch, capsys):
+    crash = tmp_path / "crash.py"
+    clean = tmp_path / "clean.py"
+    crash.write_text(
+        textwrap.dedent(
+            """
+            import os
+            import signal
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            os.kill(os.getpid(), signal.SIGKILL)
+
+            def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    clean.write_text(
+        textwrap.dedent(
+            """
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            def good(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "crash.py", "clean.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "error[worker-error]" in out
+    assert "worker child process failed" in out
+    assert "crash.py" in out
+    # Verify clean.py was still checked because child death was isolated
+    assert "Found 1 error(s) in 1 function(s) across 2 file(s)" in out
+
+
+def test_worker_process_death_triggers_fail_closed_exit_2(tmp_path, monkeypatch, capsys):
+    crash = tmp_path / "die.py"
+    crash.write_text(
+        textwrap.dedent(
+            """
+            import os
+            import signal
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            # Kill parent worker process (or self if in-process)
+            target_pid = os.getppid() if hasattr(os, "getppid") else os.getpid()
+            os.kill(target_pid, signal.SIGKILL)
+
+            def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "die.py", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "worker failed" in out
+    assert "die.py" in out
+    assert "exit code" in out
+
+
+def test_a_namespace_subpackage_does_not_break_the_module_cleanup(tmp_path):
+    """`pkg/sub` without an `__init__.py` has a lazy `__path__`.
+
+    Iterating it asks `sys.modules` for the parent, so dropping `pkg` before
+    looking at `pkg.sub` used to raise `KeyError: 'pkg'` out of the cleanup.
+    """
+    package = tmp_path / "pkg"
+    (package / "sub").mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "sub" / "helpers.py").write_text("SCALE = 2\n")
+
+    model = tmp_path / "model.py"
+    model.write_text(
+        textwrap.dedent(HEADER)
+        + textwrap.dedent(
+            """
+            from pkg.sub.helpers import SCALE
+
+            def scale(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x * SCALE
+            """
+        )
+    )
+
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths([str(model)], config)
+
+    assert report.worker_error is None
+    assert report.diagnostics == []
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    ["Int4", "UInt4", "UInt16", "UInt32", "UInt64", "Float8e4m3fn", "Float8e5m2"],
+)
+def test_narrow_dtypes_are_traced_not_skipped(project, dtype):
+    paths, config = project(
+        """
+        import torch
+        from jaxtyping import DTYPE
+        from torch import Tensor
+
+        def f(x: DTYPE[Tensor, "b d"]) -> DTYPE[Tensor, "b d"]:
+            return x
+        """.replace("DTYPE", dtype)
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+    assert report.checked_functions == 1
+
+
+def test_uint64_mismatch_is_caught(project):
+    paths, config = project(
+        """
+        import torch
+        from jaxtyping import UInt64
+        from torch import Tensor
+
+        def f(x: UInt64[Tensor, "b d"]) -> UInt64[Tensor, "d b"]:
+            return x
+        """
+    )
+    report = check_paths(paths, config)
+    assert "shape-mismatch" in rules(report)
+    assert not report.ok
+
+
+def test_dtype_without_torch_equivalent_says_so(monkeypatch):
+    from torchtyc.annotations import ArraySpec
+    from torchtyc.tracing import DTYPES, TraceSkipped, build_dtype
+
+    monkeypatch.delitem(DTYPES, "UInt64")
+    spec = ArraySpec(dtype="UInt64", array_type="Tensor", dims=(), raw='UInt64[Tensor, "b d"]')
+    with pytest.raises(TraceSkipped) as caught:
+        build_dtype(spec)
+    assert caught.value.rule == "unsupported-annotation"
+    assert "has no equivalent" in caught.value.message
+    assert "unknown dtype" not in caught.value.message
+
+
+def test_syntax_error_uses_worker_error(project):
+    paths, config = project("def broken(:\n")
+    report = check_paths(paths, config)
+    assert len(report.diagnostics) == 1
+    diag = report.diagnostics[0]
+    assert diag.rule == "worker-error"
+    assert diag.severity is Severity.ERROR
+    assert diag.message.startswith("SyntaxError:")
+    assert not report.ok
+
+
+def test_timeout_uses_worker_error_and_attributes_the_slow_file(tmp_path, monkeypatch, capsys):
+    slow = tmp_path / "slow.py"
+    slow.write_text(
+        textwrap.dedent(
+            """
+            import time
+            import torch
+            from jaxtyping import Float
+            from torch import Tensor
+
+            time.sleep(10)
+
+            def f(x: Float[Tensor, "b d"]) -> Float[Tensor, "b d"]:
+                return x
+            """
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    code = cli.main(["check", "slow.py", "--timeout", "1.0", "--python", sys.executable])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "error[worker-error]" in out
+    assert "trace-error" not in out
+    assert "slow.py" in out
+    assert "the trace timed out after 1s" in out
+
+
+def test_rules_lists_worker_error(capsys):
+    code = cli.main(["rules"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "worker-error" in out
