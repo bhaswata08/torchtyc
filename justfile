@@ -95,22 +95,31 @@ release new:
         echo ".env is missing, so UV_PUBLISH_TOKEN is unavailable" >&2
         exit 1
     fi
+    if [ ! -t 0 ] && [ "${CONFIRM:-}" != "yes" ]; then
+        echo "stdin is not a terminal, so the publish cannot be confirmed." >&2
+        echo "run this from a terminal, or pass CONFIRM=yes to answer in advance." >&2
+        exit 1
+    fi
 
     just bump {{new}}
     just ci
     just build
 
-    git commit -am "release: {{new}}"
-
     echo
     ls -l dist
     echo
-    read -r -p "publish torchtyc {{new}} to PyPI? a version cannot be reused [y/N] " reply
+    if [ "${CONFIRM:-}" = "yes" ]; then
+        reply=y
+    else
+        read -r -p "publish torchtyc {{new}} to PyPI? a version cannot be reused [y/N] " reply || reply=""
+    fi
     if [ "$reply" != "y" ]; then
-        git reset --hard HEAD~1
-        echo "aborted, and the bump commit is undone"
+        git checkout src/torchtyc/__init__.py
+        echo "aborted, and the bump is reverted; nothing was committed"
         exit 1
     fi
+
+    git commit -am "release: {{new}}"
 
     set -a
     . ./.env
