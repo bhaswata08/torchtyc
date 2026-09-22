@@ -1,6 +1,6 @@
 [project]
 name = "torchtyc"
-version = "0.3.1"
+dynamic = ["version"]
 description = "Shape checking for PyTorch, from your jaxtyping annotations"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,9 @@ torchtyc = "torchtyc.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/torchtyc/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/torchtyc"]
