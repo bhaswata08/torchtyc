@@ -37,7 +37,10 @@
       packages = forAll (pkgs: {
         default = pkgs.python313Packages.buildPythonApplication {
           pname = "torchtyc";
-          version = "0.3.1";
+          # Read from the one place `just bump` writes it.
+          version = builtins.head (
+            builtins.match ''.*__version__ = "([^"]+)".*'' (builtins.readFile ./src/torchtyc/__init__.py)
+          );
           pyproject = true;
           src = self;
           build-system = [ pkgs.python313Packages.hatchling ];
