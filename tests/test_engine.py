@@ -1743,6 +1743,64 @@ def test_a_parity_guard_beside_a_keyword_call_is_clean(project):
     assert "divisible by 2" in retried.message
 
 
+def test_a_constructor_bug_behind_a_parity_guard_is_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    class RoPE(nn.Module):
+        def __init__(self, theta: float, d_k: int, max_seq_len: int) -> None:
+            super().__init__()
+            if d_k % 2 != 0:
+                raise ValueError("RoPE dimension d_k should be divisible by 2")
+            i: Float[Tensor, " max_seq_len"] = torch.arange(0, max_seq_len)
+            k: Float[Tensor, " d_k//2"] = torch.arange(0, d_k // 2)
+            base: Float[Tensor, " d_k//2"] = theta ** ((2 * k - 2) / d_k)
+            self.angle = i / base
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The prime `d_k` fails the guard, and the retry on even widths gets past
+    # it to the real bug: `(max_seq_len,) / (d_k//2,)` does not broadcast.
+    # The guessed `theta` must not make the retry's error look like setup
+    # trouble and hand the report back to the guard.
+    assert not report.ok
+    assert "uninstantiable" not in rules(report)
+    assert not any("divisible by 2" in d.message for d in report.diagnostics)
+    (diagnostic,) = [d for d in report.diagnostics if d.severity is Severity.ERROR]
+    assert diagnostic.rule == "trace-error"
+    assert "broadcast" in diagnostic.message
+    # 0-based: the `self.angle = i / base` line.
+    assert diagnostic.line == 14
+
+
+def test_guessed_constructor_arguments_name_the_dimension_widths(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Rotary(nn.Module):
+        def __init__(self, theta: float, d_k: int) -> None:
+            super().__init__()
+            if d_k > 1:
+                raise ValueError("d_k is too wide")
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    (diagnostic,) = [d for d in report.diagnostics if d.rule == "uninstantiable"]
+    # `d_k` got a width from the annotations and is what the guard rejected,
+    # so the message has to show it next to the synthesised `theta`.
+    assert "theta=1.0" in diagnostic.message
+    assert re.search(r"d_k=\d+", diagnostic.message)
+    # Only `theta` can take a default that the first trace would use.
+    assert "`theta`" in diagnostic.hint
+    assert "`d_k`" not in diagnostic.hint
+
+
 def test_a_guarded_constructor_after_a_dead_one_is_used(project):
     paths, config = project(
         HEADER

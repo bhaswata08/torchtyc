@@ -109,6 +109,14 @@ class TraceSkipped(Exception):
         self.position = position
 
 
+class InitRaised(TraceSkipped):
+    """The user's `__init__` ran on guessed arguments and raised.
+
+    Unlike other setup failures this one reached the user's code, so a retry
+    that ends here has found something the first attempt did not.
+    """
+
+
 @dataclass
 class Construction:
     """The class a trace built, kept so the same class can be built again.
@@ -366,6 +374,11 @@ def instantiate(
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
     synthesised_args: dict[str, Any] = {}
+    # Every argument torchtyc made up, in signature order: the synthesised
+    # ones above plus the widths dimension names were bound to. Only the
+    # synthesised ones can be fixed by a default, but a guard such as
+    # `d_k % 2` rejects the width, so the message has to show both.
+    guessed: dict[str, Any] = {}
     positional_open = True
     if init is _INIT_NOT_GIVEN:
         init = live_init(owner, cls, module)
@@ -388,6 +401,10 @@ def instantiate(
                 hint=exc.hint,
                 position=exc.position or init_pos,
             ) from exc
+        if param.name in synthesised_args or (
+            param.name in dim_names and binder.sizes.get(param.name) == value
+        ):
+            guessed[param.name] = value
         if param.positional_only:
             args.append(value)
         else:
@@ -411,7 +428,7 @@ def instantiate(
                 ) from exc
             except BaseException as exc:
                 if synthesised_args:
-                    guessed_str = ", ".join(f"{k}={v!r}" for k, v in synthesised_args.items())
+                    guessed_str = ", ".join(f"{k}={v!r}" for k, v in guessed.items())
                     exc_line = f"{type(exc).__name__}: {exc}"
                     names_str = ", ".join(f"`{k}`" for k in synthesised_args)
                     hint = (
@@ -419,7 +436,7 @@ def instantiate(
                         if len(synthesised_args) == 1
                         else f"give {names_str} a default, or # torchtyc: ignore[uninstantiable]"
                     )
-                    raise TraceSkipped(
+                    raise InitRaised(
                         "uninstantiable",
                         f"`{owner.qualname or owner.name}.__init__` raised with the arguments torchtyc guessed: {guessed_str}\n  {exc_line}",
                         hint=hint,
@@ -761,7 +778,15 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
         )
         again = Construction()
         try:
-            result = _trace(module, target, wider, again)
+            try:
+                result = _trace(module, target, wider, again)
+            except InitRaised as raised:
+                # The constructor ran and raised on widths that divide, which
+                # is a finding like any other, not setup that never started.
+                cause = raised.__cause__
+                if isinstance(cause, Exception):
+                    raise cause from None
+                raise
             close_instance(built.instance)
             result.retried = True
             result.first_error = first
