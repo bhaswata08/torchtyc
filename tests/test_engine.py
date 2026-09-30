@@ -1768,12 +1768,72 @@ def test_a_constructor_bug_behind_a_parity_guard_is_reported(project):
     # trouble and hand the report back to the guard.
     assert not report.ok
     assert "uninstantiable" not in rules(report)
-    assert not any("divisible by 2" in d.message for d in report.diagnostics)
     (diagnostic,) = [d for d in report.diagnostics if d.severity is Severity.ERROR]
     assert diagnostic.rule == "trace-error"
     assert "broadcast" in diagnostic.message
+    assert "divisible by 2" not in diagnostic.message
     # 0-based: the `self.angle = i / base` line.
     assert diagnostic.line == 14
+    # The broadcast only shows at the rescaled widths, so the report says
+    # which widths those were and what stopped the usual ones.
+    (retried,) = [d for d in report.diagnostics if d.rule == "trace-retried"]
+    assert "failed on rescaled widths" in retried.message
+    assert re.search(r"d_k=\d+", retried.message)
+    assert "divisible by 2" in retried.message
+
+
+def test_a_guessed_argument_refused_on_every_width_stays_uninstantiable(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Rotary(nn.Module):
+        def __init__(self, theta: float, d_k: int) -> None:
+            super().__init__()
+            if d_k % 2 != 0:
+                raise ValueError("d_k should be even")
+            if theta <= 1.0:
+                raise ValueError("theta must exceed 1")
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The retry gets past the parity guard only to have the constructor refuse
+    # the synthesised `theta`. That is torchtyc's guess turned down, not a bug,
+    # so it stays the warning that `ignore[uninstantiable]` matches.
+    assert rules(report) == ["uninstantiable"]
+    (diagnostic,) = report.diagnostics
+    assert diagnostic.severity is Severity.WARNING
+    assert "d_k should be even" in diagnostic.message
+
+
+def test_attributes_see_the_constructor_bug_behind_a_parity_guard(project):
+    paths, config = project(
+        HEADER
+        + """
+    class RoPE(nn.Module):
+        def __init__(self, theta: float, d_k: int, max_seq_len: int) -> None:
+            super().__init__()
+            if d_k % 2 != 0:
+                raise ValueError("RoPE dimension d_k should be divisible by 2")
+            i: Float[Tensor, " max_seq_len"] = torch.arange(0, max_seq_len)
+            k: Float[Tensor, " d_k//2"] = torch.arange(0, d_k // 2)
+            base: Float[Tensor, " d_k//2"] = theta ** ((2 * k - 2) / d_k)
+            self.angle: Float[Tensor, "max_seq_len d_k//2"] = i / base
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The attribute check builds the class the same way `forward` does, so it
+    # retries too and does not report the guard beside the bug behind it.
+    assert "uninstantiable" not in rules(report)
+    errors = [d for d in report.diagnostics if d.severity is Severity.ERROR]
+    assert {d.rule for d in errors} == {"trace-error"}
+    assert any(d.message.startswith("constructing `RoPE`") for d in errors)
+    assert all("broadcast" in d.message and d.line == 14 for d in errors)
 
 
 def test_guessed_constructor_arguments_name_the_dimension_widths(project):

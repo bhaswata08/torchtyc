@@ -358,6 +358,13 @@ the traced method. Multi-head attention passes on the second attempt and reports
 `trace-retried` at info level. A model that splits by a width written nowhere
 either of those can see, or by one above 256, still needs `# torchtyc: ignore[trace-error]`.
 
+The same retry covers a constructor that rejects odd widths, such as
+`if d_k % 2: raise ValueError(...)`, and it runs for attribute checks as well as
+for `forward`. If the retry gets past the guard and hits an error, that error is
+the `trace-error`, and a `trace-retried` note gives the widths it needs. If the
+constructor instead refuses an argument torchtyc made up, with its own `raise`
+or `assert`, or fails the same way again, the result stays `uninstantiable`.
+
 Runtime checking with `jaxtyping` and `beartype` remains worth having. torchtyc
 tells you the shapes are consistent for the sizes it chose; beartype tells you
 they were right for the batch you actually ran.

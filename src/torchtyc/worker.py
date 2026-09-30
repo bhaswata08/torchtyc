@@ -51,7 +51,7 @@ if TYPE_CHECKING:
         check_return,
         describe,
         explain_derived_sizes,
-        instantiate,
+        instantiate_retrying,
         live_init,
         resolve_qualname,
         trace,
@@ -65,7 +65,7 @@ else:
     check_return = None
     describe = None
     explain_derived_sizes = None
-    instantiate = None
+    instantiate_retrying = None
     live_init = None
     resolve_qualname = None
     trace = None
@@ -78,7 +78,7 @@ def _ensure_initialized() -> None:
         check_return, \
         describe, \
         explain_derived_sizes, \
-        instantiate, \
+        instantiate_retrying, \
         live_init, \
         resolve_qualname, \
         trace, \
@@ -97,7 +97,7 @@ def _ensure_initialized() -> None:
     check_return = _tracing.check_return
     describe = _tracing.describe
     explain_derived_sizes = _tracing.explain_derived_sizes
-    instantiate = _tracing.instantiate
+    instantiate_retrying = _tracing.instantiate_retrying
     live_init = _tracing.live_init
     resolve_qualname = _tracing.resolve_qualname
     trace = _tracing.trace
@@ -680,27 +680,31 @@ def check_target(
             exc.error, path, target.position, exc.binder, _body_spans(siblings or [], target)
         )
         message = exc.binder.rename_primes(_format_exc(exc.error, statement))
-        return TargetOutcome(
-            [
-                Diagnostic(
-                    path=path,
-                    line=position.line,
-                    column=position.column,
-                    end_line=position.end_line,
-                    end_column=position.end_column,
-                    rule="trace-error",
-                    severity=Severity.ERROR,
-                    message=message,
-                    function=target.qualname,
-                    hint=hint,
-                    note=_note(message, hint, statement),
-                    traceback=text,
+        found = [
+            Diagnostic(
+                path=path,
+                line=position.line,
+                column=position.column,
+                end_line=position.end_line,
+                end_column=position.end_column,
+                rule="trace-error",
+                severity=Severity.ERROR,
+                message=message,
+                function=target.qualname,
+                hint=hint,
+                note=_note(message, hint, statement),
+                traceback=text,
+            )
+        ]
+        if exc.first_error is not None:
+            # The error only shows at the rescaled widths, so without them a
+            # reader tracing at the usual ones stops at the first error instead.
+            found.append(
+                _retried_diagnostic(
+                    target, path, exc.first_error, exc.binder, dict(exc.binder.sizes), failed=True
                 )
-            ],
-            None,
-            checked=True,
-            skipped=False,
-        )
+            )
+        return TargetOutcome(found, None, checked=True, skipped=False)
     except TraceSkipped as exc:
         pos = exc.position or target.position
         return TargetOutcome(
@@ -724,27 +728,14 @@ def check_target(
         )
 
     if result.retried and result.first_error is not None:
-        first = result.first_error
-        statement = None
-        try:
-            _, _, _, statement = _anchor(first, path, target.position, result.binder)
-        except Exception:  # noqa: BLE001, S110
-            pass
-        first_reason = result.binder.rename_primes(_format_exc(first, statement))
-        first_reason = first_reason.splitlines()[0]
-        widths_str = ", ".join(f"{k}={v}" for k, v in result.rescaled_widths.items())
         out.append(
-            Diagnostic(
-                path=path,
-                line=target.position.line,
-                column=target.position.column,
-                end_line=target.position.end_line,
-                end_column=target.position.end_column,
-                rule="trace-retried",
-                severity=Severity.INFO,
-                message=f"`{target.qualname}` traced on rescaled widths\n  {widths_str} ({first_reason})",
-                function=target.qualname,
-                hint="the annotation was not checked at the widths torchtyc normally uses",
+            _retried_diagnostic(
+                target,
+                path,
+                result.first_error,
+                result.binder,
+                result.rescaled_widths,
+                failed=False,
             )
         )
 
@@ -783,6 +774,79 @@ def check_target(
     return TargetOutcome(out, result, checked=True, skipped=False)
 
 
+def _retried_diagnostic(
+    target: Target,
+    path: str,
+    first: BaseException,
+    binder: DimBinder,
+    widths: dict[str, int],
+    *,
+    failed: bool,
+) -> Diagnostic:
+    """The `trace-retried` note: the widths a retry ran at and why it was needed."""
+    statement = None
+    try:
+        _, _, _, statement = _anchor(first, path, target.position, binder)
+    except Exception:  # noqa: BLE001, S110
+        pass
+    first_reason = binder.rename_primes(_format_exc(first, statement)).splitlines()[0]
+    widths_str = ", ".join(f"{k}={v}" for k, v in widths.items())
+    if failed:
+        message = f"`{target.qualname}` failed on rescaled widths"
+        hint = "the error above shows only at these widths; the usual ones stop at the first error"
+    else:
+        message = f"`{target.qualname}` traced on rescaled widths"
+        hint = "the annotation was not checked at the widths torchtyc normally uses"
+    return Diagnostic(
+        path=path,
+        line=target.position.line,
+        column=target.position.column,
+        end_line=target.position.end_line,
+        end_column=target.position.end_column,
+        rule="trace-retried",
+        severity=Severity.INFO,
+        message=f"{message}\n  {widths_str} ({first_reason})",
+        function=target.qualname,
+        hint=hint,
+    )
+
+
+def _constructor_error(
+    exc: BaseException, path: str, info: ClassInfo, binder: DimBinder
+) -> list[Diagnostic]:
+    """The one diagnostic for a class whose constructor raised."""
+    diag = _blocked_diagnostic(
+        exc,
+        path,
+        info.position,
+        binder,
+        rule="trace-error",
+        function=info.qualname,
+    )
+    if diag is not None:
+        return [diag]
+    position, text, hint, statement = _anchor(exc, path, info.position, binder)
+    message = binder.rename_primes(
+        _format_exc(exc, statement, prefix=f"constructing `{info.qualname}`: ")
+    )
+    return [
+        Diagnostic(
+            path=path,
+            line=position.line,
+            column=position.column,
+            end_line=position.end_line,
+            end_column=position.end_column,
+            rule="trace-error",
+            severity=Severity.ERROR,
+            message=message,
+            function=info.qualname,
+            hint=hint,
+            note=_note(message, hint, statement),
+            traceback=text,
+        )
+    ]
+
+
 def check_attributes(
     module: Any,
     info: ClassInfo,
@@ -809,9 +873,12 @@ def check_attributes(
             # a guarded `__init__` that this import skipped reports nothing.
             chosen = live_init(info, cls, module)
             attributes = chosen.attributes if chosen is not None else []
-            instance = instantiate(info, cls, binder, info.dim_names, module, init=chosen)
+            instance, binder = instantiate_retrying(info, cls, module, binder, chosen)
     except NotLive:
         return []
+    except TraceFailed as exc:
+        # A retry on divisible widths got past a guard to a real error.
+        return _constructor_error(exc.error, path, info, exc.binder)
     except TraceSkipped as exc:
         pos = exc.position or info.position
         return [
@@ -829,36 +896,7 @@ def check_attributes(
             )
         ]
     except Exception as exc:  # noqa: BLE001
-        diag = _blocked_diagnostic(
-            exc,
-            path,
-            info.position,
-            binder,
-            rule="trace-error",
-            function=info.qualname,
-        )
-        if diag is not None:
-            return [diag]
-        position, text, hint, statement = _anchor(exc, path, info.position, binder)
-        message = binder.rename_primes(
-            _format_exc(exc, statement, prefix=f"constructing `{info.qualname}`: ")
-        )
-        return [
-            Diagnostic(
-                path=path,
-                line=position.line,
-                column=position.column,
-                end_line=position.end_line,
-                end_column=position.end_column,
-                rule="trace-error",
-                severity=Severity.ERROR,
-                message=message,
-                function=info.qualname,
-                hint=hint,
-                note=_note(message, hint, statement),
-                traceback=text,
-            )
-        ]
+        return _constructor_error(exc, path, info, binder)
 
     out: list[Diagnostic] = []
     for attribute in attributes:

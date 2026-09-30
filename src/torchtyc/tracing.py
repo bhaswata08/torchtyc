@@ -19,6 +19,7 @@ import itertools
 import linecache
 import math
 import threading
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -320,10 +321,18 @@ class TraceFailed(Exception):
     The caller needs the binder to put the user's own axis names back.
     """
 
-    def __init__(self, error: BaseException, binder: DimBinder):
+    def __init__(
+        self,
+        error: BaseException,
+        binder: DimBinder,
+        first_error: BaseException | None = None,
+    ):
         super().__init__(str(error))
         self.error = error
         self.binder = binder
+        # Set when the error came from a retry on rescaled widths. The widths
+        # are then `binder.sizes`, and this is what the first attempt hit.
+        self.first_error = first_error
 
 
 def live_init(owner: ClassInfo, cls: type, module: Any) -> InitDef | None:
@@ -411,7 +420,7 @@ def instantiate(
             kwargs[param.name] = value
 
     if built is not None:
-        built.guessed_args = dict(synthesised_args)
+        built.guessed_args = dict(guessed)
 
     before_threads = set(threading.enumerate())
     instance = None
@@ -781,12 +790,13 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
             try:
                 result = _trace(module, target, wider, again)
             except InitRaised as raised:
-                # The constructor ran and raised on widths that divide, which
-                # is a finding like any other, not setup that never started.
+                # The constructor ran and raised on widths that divide. That is
+                # a finding only when it got further than the first attempt
+                # and did not stop at a check on an argument torchtyc made up.
                 cause = raised.__cause__
-                if isinstance(cause, Exception):
-                    raise cause from None
-                raise
+                if not isinstance(cause, Exception) or not _new_failure(cause, first):
+                    raise
+                raise cause from None
             close_instance(built.instance)
             result.retried = True
             result.first_error = first
@@ -809,7 +819,79 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
         # Every retry skipped setup too, so the module really cannot be
         # built: the downgrade stands as if no retry had run.
         raise first_skipped
-    raise TraceFailed(failure, binder) from failure
+    raise TraceFailed(failure, binder, first_error=None if failure is first else first) from failure
+
+
+def instantiate_retrying(
+    owner: ClassInfo,
+    cls: type,
+    module: Any,
+    binder: DimBinder,
+    init: InitDef | None,
+) -> tuple[Any, DimBinder]:
+    """`instantiate`, retried on divisible widths the way `trace` retries.
+
+    A class checked only for its attributes has to build the way its `forward`
+    does, or one constructor reports a parity guard for its attributes and the
+    bug behind the guard for its `forward`. Returns the instance and the binder
+    it was built with. A retry that reaches something new raises `TraceFailed`
+    carrying the retry's binder.
+    """
+    try:
+        return instantiate(owner, cls, binder, owner.dim_names, module, init=init), binder
+    except InitRaised as skipped:
+        first = skipped.__cause__
+        if not isinstance(first, Exception):
+            raise
+        written = _written_integers(getattr(cls, "__init__", None))
+        for scale in _scales(written)[:_MAX_RETRIES]:
+            wider = DimBinder(
+                variadic_rank=binder.variadic_rank,
+                scale=scale,
+                defaults_first=True,
+                literals=binder.literals,
+            )
+            try:
+                return instantiate(owner, cls, wider, owner.dim_names, module, init=init), wider
+            except InitRaised as raised:
+                cause = raised.__cause__
+                if isinstance(cause, Exception) and _new_failure(cause, first):
+                    raise TraceFailed(cause, wider, first_error=first) from cause
+            except TraceSkipped:
+                continue
+        raise
+
+
+def _new_failure(error: BaseException, first: BaseException) -> bool:
+    """Whether a retry's constructor error says more than the first attempt's.
+
+    It does not when it is the first error again, raised from the same place,
+    or when the constructor's own `raise` or `assert` refused an argument: a
+    `theta` synthesised as 1.0 fails `theta > 1` at every width, and that is
+    torchtyc's guess being turned down, not a bug in the model.
+    """
+    frames = _user_frames(error)
+    # The outermost frame is the constructor. torch raises its own errors from
+    # a `raise` too, so only one written in the constructor's file counts.
+    if (
+        frames
+        and frames[-1].filename == frames[0].filename
+        and (frames[-1].line or "").startswith(("raise", "assert"))
+    ):
+        return False
+    return not (type(error) is type(first) and _sites(frames) == _sites(_user_frames(first)))
+
+
+def _user_frames(error: BaseException) -> list[traceback.FrameSummary]:
+    # torchtyc's own frames differ between the first attempt and a retry only
+    # in which line called `_trace`, so they are left out.
+    return [
+        frame for frame in traceback.extract_tb(error.__traceback__) if frame.filename != __file__
+    ]
+
+
+def _sites(frames: list[traceback.FrameSummary]) -> list[tuple[str, int | None]]:
+    return [(frame.filename, frame.lineno) for frame in frames]
 
 
 # A written integer is taken as a divisor only inside this range. Below it there
@@ -849,7 +931,11 @@ def _divisible_scales(module: Any, target: Target) -> list[int]:
             written |= _written_integers(getattr(cls, target.name, None))
     except Exception:  # noqa: BLE001
         return []
+    return _scales(written)
 
+
+def _scales(written: set[int]) -> list[int]:
+    """The retry factors for a set of written integers. See `_divisible_scales`."""
     lowest, product = 1, 1
     # Smallest first, so that a number too large to fit is the one left out.
     for value in sorted(written):
