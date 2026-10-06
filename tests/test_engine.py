@@ -1836,6 +1836,120 @@ def test_attributes_see_the_constructor_bug_behind_a_parity_guard(project):
     assert all("broadcast" in d.message and d.line == 14 for d in errors)
 
 
+def test_a_constructor_bug_rewrapped_by_its_own_raise_is_reported(project):
+    paths, config = project(
+        HEADER
+        + """
+    class RoPE(nn.Module):
+        def __init__(self, theta: float, d_k: int, max_seq_len: int) -> None:
+            super().__init__()
+            if d_k % 2 != 0:
+                raise ValueError("RoPE dimension d_k should be divisible by 2")
+            try:
+                i = torch.arange(0, max_seq_len)
+                k = torch.arange(0, d_k // 2)
+                self.angle = i / theta ** ((2 * k - 2) / d_k)
+            except Exception as e:
+                raise ValueError(f"invalid RoPE config: {e}") from e
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # The constructor's own `raise` is what surfaces, but it re-raises the
+    # broadcast it caught. That is the bug, not a refused guess.
+    assert not report.ok
+    assert "uninstantiable" not in rules(report)
+    errors = [d for d in report.diagnostics if d.severity is Severity.ERROR]
+    assert errors
+    assert all(d.rule == "trace-error" and "broadcast" in d.message for d in errors)
+
+
+def test_a_guessed_argument_refused_by_a_helper_in_another_file_stays_uninstantiable(
+    project,
+):
+    paths, config = project(
+        HEADER
+        + """
+    from checks import require
+
+    class Rotary(nn.Module):
+        def __init__(self, theta: float, d_k: int) -> None:
+            super().__init__()
+            if d_k % 2 != 0:
+                raise ValueError("d_k should be even")
+            require(theta > 1.0, "theta must exceed 1")
+
+        def forward(self, x: Float[Tensor, "... seq d_k"]) -> Float[Tensor, "... seq d_k"]:
+            return x
+    """
+    )
+    (Path(paths[0]).parent / "checks.py").write_text(
+        textwrap.dedent(
+            """
+            def require(ok, message):
+                if not ok:
+                    raise ValueError(message)
+            """
+        )
+    )
+    report = check_paths(paths, config)
+    # The refusal of the synthesised `theta` comes from the project's own
+    # helper, so it is still the guess being turned down, not a bug.
+    assert rules(report) == ["uninstantiable"]
+    assert report.diagnostics[0].severity is Severity.WARNING
+
+
+def test_attributes_retry_on_a_divisor_written_only_in_forward(project):
+    paths, config = project(
+        HEADER
+        + """
+    HALVES = 2
+
+    class Halves(nn.Module):
+        def __init__(self, d_k: int) -> None:
+            super().__init__()
+            if d_k % HALVES != 0:
+                raise ValueError("d_k should be even")
+            self.w: Float[Tensor, " d_k"] = torch.zeros(d_k)
+
+        def forward(self, x: Float[Tensor, "... d_k"]) -> Float[Tensor, "... d_k"]:
+            return x.view(*x.shape[:-1], 2, -1).flatten(-2)
+    """
+    )
+    report = check_paths(paths, config)
+    # `__init__` writes no divisor, but `forward` does, and the attribute
+    # check retries on the same widths `forward` does.
+    assert report.ok
+    assert not any(d.severity is Severity.ERROR for d in report.diagnostics)
+
+
+def test_attributes_of_an_int_only_constructor_retry_past_a_parity_guard(project):
+    paths, config = project(
+        HEADER
+        + """
+    class Rotary(nn.Module):
+        def __init__(self, d_k: int) -> None:
+            super().__init__()
+            if d_k % 2 != 0:
+                raise ValueError("d_k should be even")
+            self.half: Float[Tensor, " d_k//2"] = torch.zeros(d_k // 2)
+
+        def forward(self, x: Float[Tensor, "... d_k"]) -> Float[Tensor, "... d_k"]:
+            return x
+    """
+    )
+    report = check_paths(paths, config)
+    # No argument is synthesised, so the guard raises plainly. The attribute
+    # check still retries the way `forward` does and finds nothing wrong.
+    assert report.ok
+    assert not any(d.severity is Severity.ERROR for d in report.diagnostics)
+    assert not any(
+        "d_k should be even" in d.message and d.rule == "trace-error" for d in report.diagnostics
+    )
+
+
 def test_guessed_constructor_arguments_name_the_dimension_widths(project):
     paths, config = project(
         HEADER

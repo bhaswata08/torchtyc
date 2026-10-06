@@ -20,9 +20,7 @@ import json
 import linecache
 import os
 import re
-import site
 import sys
-import sysconfig
 import threading
 import traceback
 from collections.abc import Iterable
@@ -33,6 +31,7 @@ from .binding import DimBinder
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import Attribute, ClassInfo, Position, Target, scan_source
 from .effects import active_guard, attempt_cooperative_stop, unwrap_blocked
+from .sitepaths import is_system_path
 
 # torch and everything that touches it load on first use, not at import. The
 # parent starts the per-file timeout clock when this process announces
@@ -104,37 +103,7 @@ def _ensure_initialized() -> None:
     _written_integers = _tracing._written_integers
 
 
-def _collect_system_dirs() -> tuple[Path, ...]:
-    dirs: set[Path] = set()
-    for key in ("stdlib", "platstdlib"):
-        val = sysconfig.get_path(key)
-        if val:
-            dirs.add(Path(val).resolve())
-    if hasattr(site, "getsitepackages"):
-        with contextlib.suppress(Exception):
-            for p in site.getsitepackages():
-                dirs.add(Path(p).resolve())
-    if getattr(site, "ENABLE_USER_SITE", False) and hasattr(site, "getusersitepackages"):
-        with contextlib.suppress(Exception):
-            user_site = site.getusersitepackages()
-            if isinstance(user_site, str):
-                dirs.add(Path(user_site).resolve())
-    for p in sys.path:
-        if "site-packages" in p or "dist-packages" in p:
-            dirs.add(Path(p).resolve())
-    return tuple(dirs)
-
-
-_SYSTEM_DIRS: tuple[Path, ...] = _collect_system_dirs()
 _BASELINE_MODULES: frozenset[str] = frozenset(sys.modules)
-
-
-def _is_system_path(path: Path) -> bool:
-    try:
-        resolved = path.resolve()
-        return any(resolved.is_relative_to(d) for d in _SYSTEM_DIRS)
-    except (ValueError, OSError):
-        return False
 
 
 def _should_keep_module(name: str) -> bool:
@@ -154,7 +123,7 @@ def _should_keep_module(name: str) -> bool:
 
     file = getattr(mod, "__file__", None)
     if file is not None:
-        return _is_system_path(Path(file))
+        return is_system_path(Path(file))
 
     paths = getattr(mod, "__path__", None)
     if paths is not None:
@@ -163,7 +132,7 @@ def _should_keep_module(name: str) -> bool:
         # parent is gone. A parent that is gone was dropped, so the child goes too.
         try:
             resolved_paths = [Path(p).resolve() for p in paths]
-            return bool(resolved_paths) and all(_is_system_path(p) for p in resolved_paths)
+            return bool(resolved_paths) and all(is_system_path(p) for p in resolved_paths)
         except (ValueError, OSError, KeyError):
             return False
 

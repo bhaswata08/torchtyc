@@ -30,6 +30,7 @@ from .annotations import DTYPE_NAMES, ArraySpec, OpaqueSpec, Spec, TupleSpec
 from .binding import BindingError, DimBinder, check_shape, distant_prime, shape_for
 from .discovery import ClassInfo, InitDef, Param, Position, Target
 from .effects import unwrap_blocked
+from .sitepaths import is_system_path
 
 # jaxtyping dtype name -> (dtype used to build an argument, dtypes accepted on
 # the way out). Building picks one representative; checking accepts the family.
@@ -843,23 +844,40 @@ def instantiate_retrying(
         first = skipped.__cause__
         if not isinstance(first, Exception):
             raise
-        written = _written_integers(getattr(cls, "__init__", None))
-        for scale in _scales(written)[:_MAX_RETRIES]:
-            wider = DimBinder(
-                variadic_rank=binder.variadic_rank,
-                scale=scale,
-                defaults_first=True,
-                literals=binder.literals,
-            )
-            try:
-                return instantiate(owner, cls, wider, owner.dim_names, module, init=init), wider
-            except InitRaised as raised:
-                cause = raised.__cause__
-                if isinstance(cause, Exception) and _new_failure(cause, first):
-                    raise TraceFailed(cause, wider, first_error=first) from cause
-            except TraceSkipped:
-                continue
+        refused: Exception = skipped
+    except (TraceSkipped, NotLive, BindingError):
         raise
+    except Exception as exc:
+        # With no synthesised argument the constructor's error comes out as
+        # itself, not as `InitRaised`. `trace` retries that too, so this has
+        # to, or an int-only constructor's parity guard is an error here and
+        # a clean pass for its `forward`.
+        if unwrap_blocked(exc) is not None:
+            raise
+        first = refused = exc
+    # `trace` reads divisors off `__init__` and the method it calls. An
+    # attribute check calls no method, so it reads every method the class body
+    # writes, or a divisor written only in `forward` retries there and not here.
+    written = _written_integers(getattr(cls, "__init__", None)) | _written_integers(cls)
+    for scale in _scales(written)[:_MAX_RETRIES]:
+        wider = DimBinder(
+            variadic_rank=binder.variadic_rank,
+            scale=scale,
+            defaults_first=True,
+            literals=binder.literals,
+        )
+        try:
+            return instantiate(owner, cls, wider, owner.dim_names, module, init=init), wider
+        except InitRaised as raised:
+            cause = raised.__cause__
+            if isinstance(cause, Exception) and _new_failure(cause, first):
+                raise TraceFailed(cause, wider, first_error=first) from cause
+        except (TraceSkipped, NotLive, BindingError):
+            continue
+        except Exception as later:
+            if unwrap_blocked(later) is not None or _new_failure(later, first):
+                raise TraceFailed(later, wider, first_error=first) from later
+    raise refused
 
 
 def _new_failure(error: BaseException, first: BaseException) -> bool:
@@ -872,14 +890,27 @@ def _new_failure(error: BaseException, first: BaseException) -> bool:
     """
     frames = _user_frames(error)
     # The outermost frame is the constructor. torch raises its own errors from
-    # a `raise` too, so only one written in the constructor's file counts.
+    # a `raise` too, so only one written in the project counts: the
+    # constructor's file, or a helper of its own such as a `require()` in a
+    # sibling module, but nothing in Python or an installed package.
     if (
         frames
-        and frames[-1].filename == frames[0].filename
+        and (frames[-1].filename == frames[0].filename or not _is_library_file(frames[-1].filename))
         and (frames[-1].line or "").startswith(("raise", "assert"))
     ):
+        # A `raise` inside an `except` passes on the error it caught, which
+        # may be the bug itself, so that error is what gets judged.
+        inner = error.__cause__ or error.__context__
+        if inner is not None and inner is not error:
+            return _new_failure(inner, first)
         return False
     return not (type(error) is type(first) and _sites(frames) == _sites(_user_frames(first)))
+
+
+def _is_library_file(filename: str) -> bool:
+    # `<frozen ...>` and `<string>` have no file to place, and are never the
+    # project's own source.
+    return filename.startswith("<") or is_system_path(Path(filename))
 
 
 def _user_frames(error: BaseException) -> list[traceback.FrameSummary]:

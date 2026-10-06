@@ -362,8 +362,11 @@ The same retry covers a constructor that rejects odd widths, such as
 `if d_k % 2: raise ValueError(...)`, and it runs for attribute checks as well as
 for `forward`. If the retry gets past the guard and hits an error, that error is
 the `trace-error`, and a `trace-retried` note gives the widths it needs. If the
-constructor instead refuses an argument torchtyc made up, with its own `raise`
-or `assert`, or fails the same way again, the result stays `uninstantiable`.
+constructor instead refuses an argument torchtyc made up, with a `raise` or
+`assert` of its own or in a helper from the project, or fails the same way again,
+the result stays `uninstantiable`. A `raise` inside an `except` is judged by the
+error it caught, so a real bug that the constructor wraps and raises again is
+still a `trace-error`.
 
 Runtime checking with `jaxtyping` and `beartype` remains worth having. torchtyc
 tells you the shapes are consistent for the sizes it chose; beartype tells you
