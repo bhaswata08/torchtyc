@@ -1925,6 +1925,74 @@ def test_attributes_retry_on_a_divisor_written_only_in_forward(project):
     assert not any(d.severity is Severity.ERROR for d in report.diagnostics)
 
 
+ROTARY = """
+    from einops import rearrange
+    from jaxtyping import jaxtyped
+
+
+    class RoPE(nn.Module):
+        @jaxtyped(typechecker=None)
+        def __init__(self, theta: float, d_k: int, max_seq_len: int) -> None:
+            super().__init__()
+            self.register_buffer("emb", self.precompute(d_k, max_seq_len), persistent=False)
+
+        @staticmethod
+        @jaxtyped(typechecker=None)
+        def precompute(d_k: int, max_seq_len: int) -> Float[Tensor, " max_seq_len d_k"]:
+            if d_k % 2 != 0:
+                raise ValueError("RoPE dimension d_k should be divisible by 2")
+            return torch.zeros(max_seq_len, d_k)
+
+        @staticmethod
+        @jaxtyped(typechecker=None)
+        def rotate(x: Float[Tensor, " ... seq d_k"]) -> Float[Tensor, " ... seq d_k"]:
+            pairs = rearrange(x, " ... seq (d_k pair) -> ... seq d_k pair", pair=2)
+            return rearrange(pairs, " ... seq d_k pair -> ... seq (d_k pair)")
+
+        @jaxtyped(typechecker=None)
+        def forward(self, x: Float[Tensor, " ... seq d_k"]) -> Float[Tensor, " ... seq d_k"]:
+            return self.rotate(x)
+"""
+
+
+def test_a_parity_guard_behind_a_jaxtyping_wrapper_retries(project):
+    paths, config = project(HEADER + ROTARY)
+    report = check_paths(paths, config)
+    # jaxtyping's import hook wraps every function, so the code torchtyc finds
+    # first is jaxtyping's, which writes no divisor. The `2` is in what it
+    # wraps, and in a helper the constructor calls rather than in `__init__`.
+    assert not any(d.severity is not Severity.INFO for d in report.diagnostics), report.diagnostics
+    assert {d.function for d in report.diagnostics if d.rule == "trace-retried"} >= {
+        "RoPE.precompute",
+        "RoPE.rotate",
+        "RoPE.forward",
+    }
+
+
+def test_a_parity_guard_in_another_module_retries_its_caller(tmp_path):
+    (tmp_path / "rotary.py").write_text(textwrap.dedent(HEADER + ROTARY))
+    caller = tmp_path / "adapters.py"
+    caller.write_text(
+        textwrap.dedent(
+            HEADER
+            + """
+    from rotary import RoPE
+
+    def run_rope(
+        d_k: int, theta: float, max_seq_len: int, x: Float[Tensor, " ... seq d_k"]
+    ) -> Float[Tensor, " ... seq d_k"]:
+        return RoPE(theta=theta, d_k=d_k, max_seq_len=max_seq_len)(x)
+    """
+        )
+    )
+    config = Config(root=tmp_path, python=sys.executable)
+    report = check_paths([str(caller)], config)
+    # `run_rope` writes no divisor. The function that raised does, so the
+    # retry reads it there.
+    assert not any(d.severity is not Severity.INFO for d in report.diagnostics), report.diagnostics
+    assert [d.function for d in report.diagnostics if d.rule == "trace-retried"] == ["run_rope"]
+
+
 def test_attributes_of_an_int_only_constructor_retry_past_a_parity_guard(project):
     paths, config = project(
         HEADER

@@ -779,7 +779,7 @@ def trace(module: Any, target: Target, variadic_rank: int) -> TraceResult:
         first = exc
         first_skipped = None
     failure: BaseException = first
-    for scale in _divisible_scales(module, target)[:_MAX_RETRIES]:
+    for scale in _divisible_scales(module, target, first)[:_MAX_RETRIES]:
         wider = DimBinder(
             variadic_rank=variadic_rank,
             scale=scale,
@@ -859,6 +859,7 @@ def instantiate_retrying(
     # attribute check calls no method, so it reads every method the class body
     # writes, or a divisor written only in `forward` retries there and not here.
     written = _written_integers(getattr(cls, "__init__", None)) | _written_integers(cls)
+    written |= _raising_integers(first)
     for scale in _scales(written)[:_MAX_RETRIES]:
         wider = DimBinder(
             variadic_rank=binder.variadic_rank,
@@ -934,7 +935,7 @@ _MAX_WRITTEN_DIVISOR = 256
 _MAX_SCALE = 1024
 
 
-def _divisible_scales(module: Any, target: Target) -> list[int]:
+def _divisible_scales(module: Any, target: Target, failure: BaseException) -> list[int]:
     """Factors to retry a failed trace on, read off the integers the code writes.
 
     A dimension is normally a prime, and a prime does not divide, so attention
@@ -949,10 +950,14 @@ def _divisible_scales(module: Any, target: Target) -> list[int]:
     first one left, which is what grouped-query attention does when it divides
     a head count that was itself divided out of a width.
 
+    The functions `failure` was raised through count too: a parity guard in a
+    helper the constructor calls, or in a class another module defines, writes
+    its divisor there and not in the target.
+
     Empty means the code writes no number that could be a divisor, so any
     retry would trace exactly what the first attempt did.
     """
-    written: set[int] = set()
+    written = _raising_integers(failure)
     try:
         if target.owner is None:
             written |= _written_integers(resolve_qualname(module, target.qualname))
@@ -963,6 +968,27 @@ def _divisible_scales(module: Any, target: Target) -> list[int]:
     except Exception:  # noqa: BLE001
         return []
     return _scales(written)
+
+
+def _raising_integers(error: BaseException) -> set[int]:
+    """The divisors written in the project's own functions that `error` passed through.
+
+    The causes and contexts count too, since `InitRaised` and `TraceSkipped`
+    carry the user's traceback on the error they wrap.
+    """
+    written: set[int] = set()
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        tb = current.__traceback__
+        while tb is not None:
+            code = tb.tb_frame.f_code
+            if code.co_filename != __file__ and not _is_library_file(code.co_filename):
+                written |= _written_integers(code)
+            tb = tb.tb_next
+        current = current.__cause__ or current.__context__
+    return written
 
 
 def _scales(written: set[int]) -> list[int]:
@@ -1021,6 +1047,35 @@ def _written_integers(fn: Any, *, max_value: int | None = _MAX_WRITTEN_DIVISOR) 
         return {value for value in found if value >= 0}
 
     found = set()
+    if isinstance(fn, property):
+        for accessor in (fn.fget, fn.fset, fn.fdel):
+            found.update(_written_integers(accessor, max_value=None))
+        fn = None
+    # A decorator such as jaxtyping's import hook hands back a wrapper whose
+    # code is the decorator's own. What the user wrote is at the end of
+    # `__wrapped__`, and a wrapper may keep the defaults on either side.
+    for layer in _unwrapped_layers(fn):
+        found.update(_written_integers_of_layer(layer))
+    if max_value is not None:
+        return {value for value in found if 2 <= value <= max_value}
+    return {value for value in found if value >= 0}
+
+
+def _unwrapped_layers(fn: Any) -> list[Any]:
+    layers: list[Any] = []
+    seen: set[int] = set()
+    while fn is not None and id(fn) not in seen:
+        seen.add(id(fn))
+        layers.append(fn)
+        if isinstance(fn, (staticmethod, classmethod)):
+            fn = fn.__func__
+        else:
+            fn = getattr(fn, "__wrapped__", None)
+    return layers
+
+
+def _written_integers_of_layer(fn: Any) -> set[int]:
+    found: set[int] = set()
     found.update(value for value in getattr(fn, "__defaults__", None) or () if type(value) is int)
     kwonly = getattr(fn, "__kwdefaults__", None) or {}
     found.update(value for value in kwonly.values() if type(value) is int)
@@ -1047,9 +1102,7 @@ def _written_integers(fn: Any, *, max_value: int | None = _MAX_WRITTEN_DIVISOR) 
                 stack.extend(const for const in current.co_consts if isinstance(const, type(code)))
         except Exception:  # noqa: BLE001, S110
             pass
-    if max_value is not None:
-        return {value for value in found if 2 <= value <= max_value}
-    return {value for value in found if value >= 0}
+    return found
 
 
 def explain_derived_sizes(binder: DimBinder, built: Construction) -> None:
