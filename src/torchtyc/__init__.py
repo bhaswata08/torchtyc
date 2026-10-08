@@ -4,7 +4,7 @@ from .config import Config, load
 from .diagnostics import RULES, Diagnostic, Rule, Severity
 from .engine import Report, check_paths, collect_files
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 __all__ = [
     "RULES",
