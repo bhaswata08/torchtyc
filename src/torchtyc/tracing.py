@@ -187,13 +187,20 @@ _DEVICE_TYPES = ("torch.device", "device")
 _DTYPE_TYPES = ("torch.dtype", "dtype")
 
 
-def _from_plain_type(plain: str | None, name: str, binder: DimBinder) -> Any:
+def _from_plain_type(
+    plain: str | None,
+    name: str,
+    binder: DimBinder,
+    dim_names: set[str] | None = None,
+) -> Any:
     """A stand-in value for a parameter annotated with an ordinary type.
 
     `_MISSING` when the type is not one torchtyc models, which the caller turns
     into a default or a skip.
     """
     if plain == "int":
+        if name in ("dim", "axis") and name not in (dim_names or ()):
+            return -1
         # Record it under its own name even though no annotation mentions it.
         # `Linear(in_features, out_features)` with a forward that only names
         # `in_features` still lets a message say "this dimension is
@@ -265,7 +272,7 @@ def build_value(
                 built.append(build_tensor(item, binder))
                 continue
             raw = str(item)
-            value = _from_plain_type(raw, param.name, binder)
+            value = _from_plain_type(raw, param.name, binder, dim_names)
             if value is _MISSING:
                 raise _unresolved(param.name, raw)
             if synthesised is not None and raw in ("str", "bool", "float"):
@@ -302,7 +309,7 @@ def build_value(
     if param.has_default:
         raise _UseDefault()
 
-    value = _from_plain_type(plain, param.name, binder)
+    value = _from_plain_type(plain, param.name, binder, dim_names)
     if value is _MISSING:
         raise _unresolved(param.name, plain)
     if synthesised is not None and plain in ("str", "bool", "float"):

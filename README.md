@@ -213,6 +213,7 @@ def forward(self, x: Float[Tensor, "... in_features"]) -> ...
 ```
 
 `in_features` is a dimension name, so it receives that dimension's prime.
+An `int` named `dim` or `axis` is passed as -1 unless an annotation names it as a dimension.
 Parameters with defaults are left alone. A parameter that is neither a
 dimension, a known type, nor defaulted produces an `unresolved-arg` warning and
 the function is skipped rather than guessed at.

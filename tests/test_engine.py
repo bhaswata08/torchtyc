@@ -3247,3 +3247,70 @@ def test_rules_lists_worker_error(capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "worker-error" in out
+
+
+def test_softmax_dim_int_parameter_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    def run_softmax_ellipsis(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
+        top = torch.amax(in_features, dim=dim, keepdim=True)
+        return (in_features - top) / torch.sum(in_features, dim=dim, keepdim=True)
+
+    def run_softmax_fixed(in_features: Float[Tensor, "b n"], dim: int) -> Float[Tensor, "b n"]:
+        top = torch.amax(in_features, dim=dim, keepdim=True)
+        return (in_features - top) / torch.sum(in_features, dim=dim, keepdim=True)
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_dim_as_annotated_dimension_is_bound_as_size(project):
+    paths, config = project(
+        HEADER
+        + """
+    def make_zeros(x: Float[Tensor, "batch"], dim: int) -> Float[Tensor, "batch dim"]:
+        return torch.zeros(x.shape[0], dim)
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_softmax_axis_int_parameter_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    def run_softmax_ellipsis(in_features: Float[Tensor, " ..."], axis: int) -> Float[Tensor, " ..."]:
+        top = torch.amax(in_features, dim=axis, keepdim=True)
+        return (in_features - top) / torch.sum(in_features, dim=axis, keepdim=True)
+
+    def run_softmax_fixed(in_features: Float[Tensor, "b n"], axis: int) -> Float[Tensor, "b n"]:
+        top = torch.amax(in_features, dim=axis, keepdim=True)
+        return (in_features - top) / torch.sum(in_features, dim=axis, keepdim=True)
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
+
+
+def test_module_init_dim_int_parameter_is_clean(project):
+    paths, config = project(
+        HEADER
+        + """
+    class SoftmaxModule(nn.Module):
+        def __init__(self, dim: int):
+            super().__init__()
+            self.dim = dim
+
+        def forward(self, x: Float[Tensor, "b n"]) -> Float[Tensor, "b n"]:
+            return x / torch.sum(x, dim=self.dim, keepdim=True)
+    """
+    )
+    report = check_paths(paths, config)
+    assert report.diagnostics == []
+    assert report.ok
