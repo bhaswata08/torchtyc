@@ -14,6 +14,7 @@ machine, but the ratios do not.
 | Lint (AST only) | 0.27 ms per module | every keystroke |
 | Trace (subprocess) | ~1.3 s | on open, on save, after 0.7 s idle |
 | Marginal trace per function | ~1 ms | within a trace |
+| Run (36-layer LLaMA, 4096 tokens) | ~2.7 s | on demand (`torchtyc run`) |
 
 ## Lint scales with the file, and stays cheap
 
@@ -66,6 +67,20 @@ Meta also allocates nothing, but that saving does not show up here, because the
 operands are built outside the timed region on both sides. It shows up instead
 as memory the checker never needs: the width-8192 real operands are 256 MB,
 against zero on meta.
+
+## Running unannotated models on meta
+
+From `run_36_layer_4096_tokens`:
+
+| Model | Layers | Sequence length | Cost |
+| --- | --- | --- | --- |
+| LLaMA | 36 | 4096 | 2.66 s |
+
+A full forward pass of a 36-layer LLaMA model (hidden size 2560, intermediate
+size 10240, 32 attention heads, vocab size 250624) over 4096 tokens runs in
+**2.66 s** on meta tensors. Because no weights load and no kernel arithmetic runs,
+a multi-billion-parameter architecture can be shape-checked end to end on CPU in
+seconds.
 
 ## Measuring a real project
 

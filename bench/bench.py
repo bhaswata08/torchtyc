@@ -198,6 +198,31 @@ def bench_width_sweep(widths: tuple[int, ...], batch: int, repeats: int) -> dict
     return {width: bench_real_vs_meta(width, batch, repeats) for width in widths}
 
 
+RUN_SCRIPT = """
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+def main():
+    config = LlamaConfig(hidden_size=2560, intermediate_size=10240, num_hidden_layers=36,
+                         num_attention_heads=32, num_key_value_heads=8, vocab_size=250624,
+                         max_position_embeddings=8192)
+    model = LlamaForCausalLM(config)
+    ids = torch.zeros(1, 4096, dtype=torch.long)
+    model(input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False)
+"""
+
+
+def bench_run(python: str, scratch: Path, repeats: int) -> dict:
+    script = scratch / "run_bench.py"
+    script.write_text(RUN_SCRIPT)
+    from torchtyc.config import Config, RunEntry
+    from torchtyc.engine import check_paths
+
+    config = Config(root=scratch, python=python)
+    entry = RunEntry(str(script), "main")
+    return timed(lambda: check_paths([str(script)], config, run=[entry], trace=False), repeats)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", default=sys.executable)
@@ -233,6 +258,7 @@ def measure(args: argparse.Namespace, scratch: Path) -> dict:
     results["scaling_by_module_count"] = scaling
 
     results["worker_startup"] = bench_worker_startup(args.python, args.repeats)
+    results["run_36_layer_4096_tokens"] = bench_run(args.python, scratch, args.repeats)
     results["forward_pass_by_width"] = bench_width_sweep((512, 2048, 8192), 256, args.repeats * 4)
 
     for target in args.target:

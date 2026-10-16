@@ -26,11 +26,20 @@ fmt:
 self-check:
     #!/usr/bin/env bash
     set -uo pipefail
-    uv run torchtyc check tests/fixtures --format github
-    status=$?
+    status=0
+    out=$(uv run torchtyc check tests/fixtures --format github) || status=$?
+    printf '%s\n' "$out"
     if [ "$status" -gt 1 ]; then
         echo "torchtyc exited $status, which is torchtyc failing rather than a finding" >&2
         exit "$status"
+    fi
+    if ! printf '%s\n' "$out" | grep -q "^::error "; then
+        echo "the fixtures produced no github annotation" >&2
+        exit 1
+    fi
+    if ! printf '%s\n' "$out" | grep -q "^::error file=tests/fixtures/run_bugs.py,line=11,.*title=torchtyc\[run-error\]"; then
+        echo "torchtyc run found nothing in tests/fixtures/run_bugs.py" >&2
+        exit 1
     fi
 
 # Everything CI runs, in the order CI runs it.

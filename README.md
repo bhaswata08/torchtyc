@@ -182,6 +182,7 @@ On a pull request, see [CI](#ci) below.
 
 ```
 torchtyc check <paths>...        Shape-check files or directories
+torchtyc run <file.py::entry>    Run an entry point on meta tensors
 torchtyc trace <file.py::func>   Show the shapes flowing through one function
 torchtyc watch <paths>...        Re-check on change
 torchtyc lsp                     Language server on stdio
@@ -246,6 +247,54 @@ attr.py:9:17: error[attribute-mismatch]
   hint: this dimension is `d_in`, so the annotation likely names the wrong axis
 ```
 
+## Running unannotated code
+
+Most PyTorch code carries no shape annotations. `torchtyc run` checks it
+anyway, by running the script's real entry point with every tensor on the
+meta device:
+
+```
+torchtyc run tools/eval.py::main            # call main()
+torchtyc run tools/eval.py                  # run the `if __name__ == "__main__":` block
+torchtyc run tools/eval.py::main -- --n 6   # arguments for argparse
+```
+
+No weights load and no kernels run. `from_pretrained` builds the model from
+its config on meta, safetensors files are read from their header alone, and
+`.to("cuda")` stays on meta, so a multi-billion-parameter model runs a
+forward pass in a second on a machine without a GPU. A shape bug raises at
+your line:
+
+```
+tools/eval.py:36:5: error[run-error]
+  `rearrange` raised EinopsError: Wrong shape: expected 2 dims. Received 3-dim tensor.
+    Got:      logits (1, 113 (seq_len?), 250624 (vocab_size?))
+    36 | rearrange(logits, "1 seq_len -> seq_len ")
+  via: main (line 47) → run (line 36)
+  hint: the pattern names 2 axes but the tensor has 3
+run tools/eval.py::main: stopped at tools/eval.py:36 (run-error)
+```
+
+A name in parentheses is a guess: torchtyc prints one only when exactly one
+config key or einops axis has that size, and always prints the number.
+
+A run stops, with `run-stopped` at info level, when the script needs a
+tensor's value (`.item()`, `if loss < best`, `.tolist()`), a file that is
+missing, a download, or a write. That is never reported as an error, and the
+status line says how far the run got.
+
+List entry points in `pyproject.toml` and `torchtyc check` runs the ones
+under the paths it checks:
+
+```toml
+[tool.torchtyc]
+run = ["tools/eval.py::main", { entry = "tools/train.py", args = ["--steps", "1"] }]
+path-map = { "/workspace" = "." }   # hard-coded container paths
+run-timeout = 300                   # seconds per entry
+```
+
+The CI job tests `torchtyc run` against pinned transformers releases: 4.45.2, 4.57.6 and 5.20.0.
+
 ## Suppressing
 
 ```python
@@ -269,6 +318,9 @@ einops = true
 timeout = 60.0
 extra-paths = ["stubs"]       # prepended to the worker's PYTHONPATH
 allow-effects = false         # let imported code write files, open sockets, and spawn processes
+run = ["tools/eval.py::main"] # entry points `check` runs on meta
+path-map = { "/workspace" = "." }   # rewrite container paths for loaders
+run-timeout = 300.0           # seconds per run entry
 ```
 
 ## Editors
@@ -319,17 +371,20 @@ matched no python file.
 | `trace-error` | error | the function raised while being traced |
 | `import-error` | error | the module could not be imported |
 | `worker-error` | error | the file could not be traced |
+| `run-error` | error | the entry point raised while running on meta tensors |
 | `device-mismatch` | warning | a traced value left the meta device |
 | `einops-unknown-axis` | warning | an einops axis matches no input axis or keyword |
 | `uninstantiable` | warning | a module's `__init__` could not be called automatically |
 | `unresolved-arg` | warning | a parameter has no annotation and no default |
 | `unsupported-annotation` | warning | an annotation could not be parsed |
+| `run-unsupported` | warning | the run reached something the meta runtime cannot stand in for |
 | `local-definition` | info | a target inside a function body cannot be reached after import |
 | `anonymous-return` | info | arguments are annotated but the return is not |
 | `missing-annotation` | info | a public function has no jaxtyping annotation |
 | `trace-retried` | info | a function traced only after widths were rescaled |
 | `unused-dim` | info | a dimension name is used once, so it constrains nothing |
 | `suppression-unused` | info | an ignore comment matched no diagnostic |
+| `run-stopped` | info | the run could not continue for a reason that is not a bug |
 
 ## Limits
 
@@ -387,6 +442,18 @@ install_import_hook(
     typechecker="beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))",
 )
 ```
+
+`torchtyc run` is one concrete execution, like the trace pass. Scripts built
+on `generate()` usually stop at the `generate` call, because sampling reads
+values. A value read made inside C++ (`torch.allclose`) is recognised by its
+message, so a bare `except` around it can hide the stop. `path-map` rewrites
+paths that loaders and `open` read; it does not rewrite `os.path.exists`,
+`os.listdir` or `Path.glob`, so a script that lists a mapped directory needs
+the real directory or a symlink. PEFT, DeepSpeed, FSDP and `datasets` are not
+supported, and end the run with `run-stopped` or `run-unsupported`.
+Transformers 4.x on meta needs the meta-aware `torch.autocast` the runtime
+installs (it is automatic), and `uv run --with` is how the CI job swaps
+versions.
 
 ## Security
 

@@ -47,3 +47,26 @@ jobs:
             echo "the fixtures produced no github annotation" >&2
             exit 1
           fi
+          if ! grep -q "^::error file=tests/fixtures/run_bugs.py,line=11,.*title=torchtyc\[run-error\]" annotations.txt; then
+            echo "torchtyc run found nothing in tests/fixtures/run_bugs.py" >&2
+            exit 1
+          fi
+
+  transformers:
+    # The meta runtime patches transformers internals that move between
+    # releases. Pin the oldest supported 4.x, the last 4.x and the current 5.x.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transformers: ["4.45.2", "4.57.6", "5.20.0"]
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --all-extras --dev
+      - run: uv run --with "transformers==${{ matrix.transformers }}" pytest -q tests/test_metaruntime.py tests/test_run.py

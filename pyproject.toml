@@ -36,7 +36,7 @@ dev = [
     "pygls>=1.3",
     "watchfiles>=0.24",
     "ruff>=0.6",
-    "transformers>=4.45",
+    "transformers>=4.45,<5.21",
     "safetensors>=0.4",
     "tokenizers>=0.20",
 ]
@@ -45,6 +45,9 @@ dev = [
 line-length = 100
 # These files exist to be wrong. That is the point of them.
 exclude = ["tests/fixtures"]
+
+[tool.torchtyc]
+run = ["tests/fixtures/run_bugs.py::main"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
