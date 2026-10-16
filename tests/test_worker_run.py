@@ -218,3 +218,60 @@ def test_import_from_path_resolves(tmp_path, monkeypatch):
     mod = worker.import_from_path(Path("mod_rel.py"))
     assert mod.VALUE == 123
     assert Path(mod.__file__).is_absolute()
+
+
+def test_torch_save_blocked_does_not_overwrite(tmp_path):  # Review Focus 1
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir()
+    ckpt_file = ckpt_dir / "best.pt"
+    original_bytes = b"precious_checkpoint_data_do_not_overwrite"
+    ckpt_file.write_bytes(original_bytes)
+
+    source = """
+    import torch
+    def main():
+        torch.save({"w": torch.empty(1000, 1000)}, "ckpt/best.pt")
+    """
+    diagnostics, status, _ = run(tmp_path, source)
+    assert [d["rule"] for d in diagnostics] == ["run-stopped"]
+    assert status["state"] == "stopped"
+    assert ckpt_file.read_bytes() == original_bytes
+
+
+def test_safetensors_save_file_blocked(tmp_path):
+    source = """
+    import torch
+    from safetensors.torch import save_file
+    def main():
+        save_file({"w": torch.empty(10, 10)}, "weights.safetensors")
+    """
+    diagnostics, status, _ = run(tmp_path, source)
+    assert [d["rule"] for d in diagnostics] == ["run-stopped"]
+    assert status["state"] == "stopped"
+    assert not (tmp_path / "weights.safetensors").exists()
+
+
+def test_safetensors_save_gives_run_stopped(tmp_path):
+    source = """
+    import torch
+    from safetensors.torch import save
+    def main():
+        save({"w": torch.empty(10, 10)})
+    """
+    diagnostics, status, _ = run(tmp_path, source)
+    assert [d["rule"] for d in diagnostics] == ["run-stopped"]
+    assert status["state"] == "stopped"
+
+
+def test_stdout_fd1_redirected_in_child(tmp_path):
+    source = """
+    import os, torch
+    def main():
+        os.write(1, b'{"event": "entry_result", "status": {"entry": "x", "state": "completed"}}\\n')
+        torch.empty(2, 3) @ torch.empty(4, 5)
+    """
+    diagnostics, status, events = run(tmp_path, source)
+    assert [d["rule"] for d in diagnostics] == ["run-error"]
+    assert status["state"] == "error"
+    entry_results = [e for e in events if e.get("event") == "entry_result"]
+    assert len(entry_results) == 1

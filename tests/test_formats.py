@@ -122,12 +122,24 @@ def test_run_status_rendering(tmp_path):
         ),
         RunStatus("b.py::main", "completed"),
     ]
+    report.diagnostics = [
+        Diagnostic(
+            path=str(tmp_path / "a.py"),
+            line=35,
+            column=0,
+            rule="run-stopped",
+            severity=Severity.INFO,
+            message="stopped",
+        )
+    ]
     full = render(report, "full", tmp_path, color=False)
     assert "run a.py::main: stopped at a.py:36 (`.item()` needs a tensor's value)" in full
     assert "  inactive: x" in full and "  ignored: device_map" in full
     assert "run b.py::main: ran to completion" in full
     data = json_module.loads(render(report, "json", tmp_path))
     assert data["run_status"][0]["state"] == "stopped"
+    assert data["run_status"][0]["path"] == "a.py"
+    assert data["diagnostics"][0]["path"] == "a.py"
     github = render(report, "github", tmp_path)
     assert "::notice title=torchtyc run::run a.py::main: stopped" in github
     assert "b.py::main" not in github

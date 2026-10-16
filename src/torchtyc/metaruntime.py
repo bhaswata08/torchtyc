@@ -33,7 +33,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map
 
-from .effects import unwrap_blocked
+from .effects import BlockedEffect, _is_allowed_write, guard_active, unwrap_blocked
 
 META = torch.device("meta")
 
@@ -183,8 +183,14 @@ class RunState:
             return path
         text = os.fsdecode(path)
         for old, new in self.path_map:
-            if text == old or text.startswith(old.rstrip("/") + "/"):
-                mapped = new + text[len(old) :]
+            prefix = old.rstrip("/")
+            if text == old or (prefix and text == prefix):
+                mapped = new
+                return type(path)(mapped) if isinstance(path, PurePath) else mapped
+            if text.startswith(prefix + "/"):
+                remainder = text[len(prefix) :]
+                new_base = new.rstrip("/")
+                mapped = (new_base + remainder) if new_base else remainder
                 return type(path)(mapped) if isinstance(path, PurePath) else mapped
         return path
 
@@ -311,9 +317,9 @@ class _MetaDispatchMode(TorchDispatchMode):
         if _reads_values(func, name, args, kwargs):
             raise MetaValueRead(_short(name))
         if (
-            _is_meta(args[0])
+            len(args) > 1
+            and _is_meta(args[0])
             and name.startswith("aten::index_put")
-            and len(args) > 1
             and _has_mask(args[1])
         ):
             # Assigning through a mask keeps the target's shape, which is all
@@ -523,7 +529,14 @@ _ST_DTYPES: dict[str, torch.dtype] = {
     "U8": torch.uint8,
     "BOOL": torch.bool,
 }
-for _code, _attr in (("F8_E4M3", "float8_e4m3fn"), ("F8_E5M2", "float8_e5m2")):
+for _code, _attr in (
+    ("F8_E4M3", "float8_e4m3fn"),
+    ("F8_E5M2", "float8_e5m2"),
+    ("U16", "uint16"),
+    ("U32", "uint32"),
+    ("U64", "uint64"),
+    ("C64", "complex64"),
+):
     if hasattr(torch, _attr):
         _ST_DTYPES[_code] = getattr(torch, _attr)
 
@@ -541,7 +554,10 @@ def _read_header(path: Any) -> tuple[dict[str, dict], dict[str, str]]:
 
 
 def _meta_tensor(info: dict) -> torch.Tensor:
-    return torch.empty(info["shape"], dtype=_ST_DTYPES[info["dtype"]], device=META)
+    dtype_code = info["dtype"]
+    if dtype_code not in _ST_DTYPES:
+        raise Unsupported(f"safetensors dtype {dtype_code} has no torch equivalent")
+    return torch.empty(info["shape"], dtype=_ST_DTYPES[dtype_code], device=META)
 
 
 class _MetaSlice:
@@ -601,6 +617,24 @@ def _meta_load(data: bytes) -> dict[str, torch.Tensor]:
     return {name: _meta_tensor(info) for name, info in header.items()}
 
 
+def _meta_save_file(
+    tensors: Any, filename: Any = None, metadata: Any = None, **kwargs: Any
+) -> None:
+    target = filename if filename is not None else kwargs.get("filename")
+    if isinstance(target, (str, bytes, os.PathLike)):
+        state = _state()
+        target = state.remap(target)
+        if guard_active() and not _is_allowed_write(target):
+            target_str = (
+                os.fsdecode(target) if isinstance(target, (bytes, os.PathLike)) else str(target)
+            )
+            raise BlockedEffect(f"cannot write to '{target_str}' during run", target=target_str)
+
+
+def _meta_save(tensors: Any, metadata: Any = None, **kwargs: Any) -> bytes:
+    raise MetaValueRead("serializing tensors")
+
+
 def _patch_safetensors(patches: _Patches, module: ModuleType) -> None:
     if "safe_open" in vars(module):
         patches.set(module, "safe_open", _MetaSafeOpen)
@@ -609,6 +643,10 @@ def _patch_safetensors(patches: _Patches, module: ModuleType) -> None:
 def _patch_safetensors_torch(patches: _Patches, module: ModuleType) -> None:
     patches.set(module, "load_file", _meta_load_file)
     patches.set(module, "load", _meta_load)
+    if hasattr(module, "save_file"):
+        patches.set(module, "save_file", _meta_save_file)
+    if hasattr(module, "save"):
+        patches.set(module, "save", _meta_save)
     if "safe_open" in vars(module):
         patches.set(module, "safe_open", _MetaSafeOpen)
 
@@ -624,6 +662,31 @@ def _patch_torch_load(patches: _Patches, state: RunState) -> None:
             return real(f, META, *args, **kwargs)
 
     patches.set(torch, "load", load)
+
+
+def _patch_torch_save(patches: _Patches, state: RunState) -> None:
+    real = torch.save
+
+    def save(obj: Any, f: Any = None, *args: Any, **kwargs: Any) -> Any:
+        target = f if f is not None else kwargs.get("f")
+        if isinstance(target, (str, bytes, os.PathLike)):
+            remapped = state.remap(target)
+            if guard_active() and not _is_allowed_write(remapped):
+                target_str = (
+                    os.fsdecode(remapped)
+                    if isinstance(remapped, (bytes, os.PathLike))
+                    else str(remapped)
+                )
+                raise BlockedEffect(f"cannot write to '{target_str}' during run", target=target_str)
+            if f is not None:
+                return real(obj, remapped, *args, **kwargs)
+            kwargs["f"] = remapped
+            return real(obj, *args, **kwargs)
+        if f is not None:
+            return real(obj, f, *args, **kwargs)
+        return real(obj, *args, **kwargs)
+
+    patches.set(torch, "save", save)
 
 
 def _patch_open(patches: _Patches, state: RunState) -> None:
@@ -746,6 +809,7 @@ def _meta_from_pretrained(*, auto: bool) -> Any:
         torch_dtype = kwargs.pop("torch_dtype", None)
         dtype = dtype if dtype is not None else torch_dtype
         attn = kwargs.pop("attn_implementation", None)
+        output_loading_info = kwargs.pop("output_loading_info", False)
         for key in _IGNORED_KWARGS:
             if key in kwargs:
                 kwargs.pop(key)
@@ -777,6 +841,13 @@ def _meta_from_pretrained(*, auto: bool) -> Any:
                     model = cls._from_config(config, **build)
         state.remember_config(config)
         model.eval()
+        if output_loading_info:
+            return model, {
+                "missing_keys": [],
+                "unexpected_keys": [],
+                "mismatched_keys": [],
+                "error_msgs": [],
+            }
         return model
 
     return classmethod(from_pretrained)
@@ -894,6 +965,7 @@ def install(path_map: Sequence[Sequence[str]] = (), *, hf_flags: bool = True) ->
         _patch_compile(patches, state)
         _patch_autocast(patches)
         _patch_torch_load(patches, state)
+        _patch_torch_save(patches, state)
         _patch_open(patches, state)
         _register_library_patches(hook, patches, state, hf_flags)
         hook.install()

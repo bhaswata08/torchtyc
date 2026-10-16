@@ -1404,6 +1404,7 @@ def _run_entry_in_child(entry: dict[str, Any], job: dict[str, Any], channel: Any
             stream.flush()
     pid = os.fork()
     if pid == 0:
+        os.dup2(2, 1)
         os.close(r_fd)
         lock = threading.Lock()
 

@@ -382,28 +382,29 @@ def _finish(proc: subprocess.Popen[str]) -> None:
     cooperative worker exits cleanly, kill after a short grace so a stuck one
     still dies, then wait so the child is reaped either way.
     """
+    pgid = proc.pid if (os.name == "posix" and proc.pid is not None) else None
     try:
         terminate_worker(proc)
         try:
             proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
-            return
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
             pass
-        except OSError:
-            return
-        _kill_worker(proc)
+        if os.name == "posix" and pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        else:
+            try:
+                proc.kill()
+            except OSError:
+                pass
         try:
             proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
         except (subprocess.TimeoutExpired, OSError):
             pass
-    finally:
-        for name in ("stdin", "stdout", "stderr"):
-            pipe = getattr(proc, name, None)
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+    except OSError:
+        pass
 
 
 def _communicate(
@@ -458,8 +459,10 @@ def _communicate(
         finally:
             output_queue.put(("stderr_eof", None))
 
-    threading.Thread(target=_read_stdout, daemon=True).start()
-    threading.Thread(target=_read_stderr, daemon=True).start()
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -469,68 +472,79 @@ def _communicate(
 
     deadline = None if timeout is None else time.monotonic() + timeout
 
-    while not (stdout_eof and stderr_eof):
-        if cancel is not None and cancel.is_set():
-            _finish(proc)
-            raise WorkerCancelled()
+    try:
+        while not (stdout_eof and stderr_eof):
+            if cancel is not None and cancel.is_set():
+                _finish(proc)
+                raise WorkerCancelled()
 
-        remaining = None if deadline is None else deadline - time.monotonic()
-        if remaining is not None and remaining <= 0:
-            timed_out = True
-            _finish(proc)
-            break
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                timed_out = True
+                _finish(proc)
+                break
 
-        quantum = (
-            _WORKER_POLL_SECONDS
-            if remaining is None
-            else min(_WORKER_POLL_SECONDS, max(0.001, remaining))
-        )
-        try:
-            kind, data = output_queue.get(timeout=quantum)
-        except queue.Empty:
-            continue
+            quantum = (
+                _WORKER_POLL_SECONDS
+                if remaining is None
+                else min(_WORKER_POLL_SECONDS, max(0.001, remaining))
+            )
+            try:
+                kind, data = output_queue.get(timeout=quantum)
+            except queue.Empty:
+                continue
 
-        if kind == "stdout":
-            if data is not None:
-                stdout_lines.append(data)
-                if timeout is not None:
-                    try:
-                        parsed = json.loads(data.strip())
-                        event = parsed.get("event")
-                        if event == "ready":
-                            deadline = time.monotonic() + max(
-                                timeout, _WORKER_STARTUP_GRACE_SECONDS
-                            )
-                        elif event in reset_events:
-                            deadline = time.monotonic() + timeout
-                    except json.JSONDecodeError:
-                        pass
-        elif kind == "stderr":
-            if data is not None:
-                stderr_lines.append(data)
-        elif kind == "stdout_eof":
-            stdout_eof = True
-        elif kind == "stderr_eof":
-            stderr_eof = True
+            if kind == "stdout":
+                if data is not None:
+                    stdout_lines.append(data)
+                    if timeout is not None:
+                        try:
+                            parsed = json.loads(data.strip())
+                            event = parsed.get("event")
+                            if event == "ready":
+                                deadline = time.monotonic() + max(
+                                    timeout, _WORKER_STARTUP_GRACE_SECONDS
+                                )
+                            elif event in reset_events:
+                                deadline = time.monotonic() + timeout
+                        except json.JSONDecodeError:
+                            pass
+            elif kind == "stderr":
+                if data is not None:
+                    stderr_lines.append(data)
+            elif kind == "stdout_eof":
+                stdout_eof = True
+            elif kind == "stderr_eof":
+                stderr_eof = True
 
-    while not output_queue.empty():
-        try:
-            kind, data = output_queue.get_nowait()
-            if kind == "stdout" and data is not None:
-                stdout_lines.append(data)
-            elif kind == "stderr" and data is not None:
-                stderr_lines.append(data)
-        except queue.Empty:
-            break
+        while not output_queue.empty():
+            try:
+                kind, data = output_queue.get_nowait()
+                if kind == "stdout" and data is not None:
+                    stdout_lines.append(data)
+                elif kind == "stderr" and data is not None:
+                    stderr_lines.append(data)
+            except queue.Empty:
+                break
 
-    if not timed_out:
-        try:
-            proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        if not timed_out:
+            try:
+                proc.wait(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
 
-    stderr_text = "".join(stderr_lines) if stderr_lines else None
-    return stdout_lines, stderr_text, timed_out
+        stderr_text = "".join(stderr_lines) if stderr_lines else None
+        return stdout_lines, stderr_text, timed_out
+    finally:
+        t_out.join(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+        t_err.join(timeout=_WORKER_TERMINATE_GRACE_SECONDS)
+        for name in ("stdin", "stdout", "stderr"):
+            pipe = getattr(proc, name, None)
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
 
 class WorkerRunResult(tuple):
@@ -733,90 +747,120 @@ def _run_worker_entries(
     on_proc: Callable[[subprocess.Popen[str]], None] | None = None,
 ) -> tuple[list[Diagnostic], list[RunStatus], str | None]:
     by_spec = {entry.spec: entry for entry in entries}
-    job = {
-        "mode": "run",
-        "entries": [
-            {
-                "path": str(Path(e.path).resolve()),
-                "func": e.func,
-                "args": list(e.args),
-                "spec": e.spec,
-            }
-            for e in entries
-        ],
-        "path_map": [list(pair) for pair in config.path_map],
-        "allow_effects": config.allow_effects,
-        "root": str(Path(config.root).resolve()),
-        "protect_roots": [str(Path(config.root).resolve())],
-        "stream": True,
-    }
-    try:
-        proc = _spawn_worker(config)
-    except OSError as exc:
-        return [], [], f"could not start {config.interpreter}: {exc}"
-    if on_proc is not None:
-        on_proc(proc)
-    # A run's limit is wall-clock per entry: only a new entry resets it, never
-    # a heartbeat, so a hung script still times out.
-    lines, stderr, timed_out = _communicate(
-        proc, json.dumps(job), config.run_timeout, cancel, reset_events=("entry_start",)
-    )
-    if not timed_out and proc.poll() is None:
-        _finish(proc)
+    all_diagnostics: list[Diagnostic] = []
+    all_statuses: list[RunStatus] = []
+    overall_error: str | None = None
 
-    diagnostics: list[Diagnostic] = []
-    statuses: list[RunStatus] = []
-    beats: dict[str, tuple[str | None, int | None]] = {}
-    current: str | None = None
-    error: str | None = None
-    for line in lines:
+    remaining_entries = list(entries)
+    while remaining_entries:
+        if cancel is not None and cancel.is_set():
+            break
+
+        job = {
+            "mode": "run",
+            "entries": [
+                {
+                    "path": str(Path(e.path).resolve()),
+                    "func": e.func,
+                    "args": list(e.args),
+                    "spec": e.spec,
+                }
+                for e in remaining_entries
+            ],
+            "path_map": [list(pair) for pair in config.path_map],
+            "allow_effects": config.allow_effects,
+            "root": str(Path(config.root).resolve()),
+            "protect_roots": [str(Path(config.root).resolve())],
+            "stream": True,
+        }
         try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        event = msg.get("event")
-        if event == "entry_start":
-            current = msg.get("entry")
-        elif event == "diagnostic":
-            diagnostics.append(Diagnostic.from_json(msg["diagnostic"]))
-        elif event == "heartbeat":
-            beats[msg.get("entry")] = (msg.get("path"), msg.get("line"))
-        elif event == "entry_result":
-            statuses.append(RunStatus.from_json(msg["status"]))
-        elif "error" in msg:
-            error = msg["error"]
+            proc = _spawn_worker(config)
+        except OSError as exc:
+            err = f"could not start {config.interpreter}: {exc}"
+            return all_diagnostics, all_statuses, overall_error or err
 
-    finished = {status.entry for status in statuses}
-    if timed_out:
-        if current is not None and current not in finished:
-            path, beat_line = beats.get(current, (None, None))
-            where = f" at line {beat_line + 1}" if beat_line is not None else ""
-            message = f"the run timed out after {config.run_timeout:g}s{where}"
-            entry_path = by_spec[current].path if current in by_spec else (path or "")
-            diagnostics.append(
-                Diagnostic(
-                    path=path or entry_path,
-                    line=beat_line or 0,
-                    column=0,
-                    rule="run-stopped",
-                    severity=RULES["run-stopped"].severity,
-                    message=message,
+        if on_proc is not None:
+            on_proc(proc)
+
+        # A run's limit is wall-clock per entry: only a new entry resets it, never
+        # a heartbeat, so a hung script still times out.
+        lines, stderr, timed_out = _communicate(
+            proc, json.dumps(job), config.run_timeout, cancel, reset_events=("entry_start",)
+        )
+        if not timed_out and proc.poll() is None:
+            _finish(proc)
+
+        batch_diagnostics: list[Diagnostic] = []
+        batch_statuses: list[RunStatus] = []
+        beats: dict[str, tuple[str | None, int | None]] = {}
+        current: str | None = None
+        error: str | None = None
+
+        for line in lines:
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = msg.get("event")
+            if event == "entry_start":
+                current = msg.get("entry")
+            elif event == "diagnostic":
+                batch_diagnostics.append(Diagnostic.from_json(msg["diagnostic"]))
+            elif event == "heartbeat":
+                beats[msg.get("entry")] = (msg.get("path"), msg.get("line"))
+            elif event == "entry_result":
+                batch_statuses.append(RunStatus.from_json(msg["status"]))
+            elif "error" in msg:
+                error = msg["error"]
+
+        finished = {status.entry for status in batch_statuses}
+        if timed_out:
+            if current is not None and current not in finished:
+                path, beat_line = beats.get(current, (None, None))
+                where = f" at line {beat_line + 1}" if beat_line is not None else ""
+                message = f"the run timed out after {config.run_timeout:g}s{where}"
+                entry_path = by_spec[current].path if current in by_spec else (path or "")
+                batch_diagnostics.append(
+                    Diagnostic(
+                        path=path or entry_path,
+                        line=beat_line or 0,
+                        column=0,
+                        rule="run-stopped",
+                        severity=RULES["run-stopped"].severity,
+                        message=message,
+                    )
                 )
-            )
-            statuses.append(RunStatus(current, "timeout", path or entry_path, beat_line, message))
-        elif current is None:
-            error = f"the run timed out after {config.run_timeout:g}s before any entry started"
-    elif not lines and error is None:
-        detail = (stderr or "").strip().splitlines()
-        error = f"the worker produced no output ({detail[-1] if detail else proc.returncode})"
+                batch_statuses.append(
+                    RunStatus(current, "timeout", path or entry_path, beat_line, message)
+                )
+            elif current is None:
+                error = f"the run timed out after {config.run_timeout:g}s before any entry started"
+        elif not lines and error is None:
+            detail = (stderr or "").strip().splitlines()
+            error = f"the worker produced no output ({detail[-1] if detail else proc.returncode})"
 
-    if not timed_out and proc.returncode not in (0, None) and error is None:
-        error = f"the worker failed with exit code {proc.returncode}"
+        if not timed_out and proc.returncode not in (0, None) and error is None:
+            error = f"the worker failed with exit code {proc.returncode}"
 
-    seen_statuses = {status.entry for status in statuses}
+        all_diagnostics.extend(batch_diagnostics)
+        all_statuses.extend(batch_statuses)
+        if error is not None and overall_error is None:
+            overall_error = error
+
+        if timed_out and current is not None:
+            idx = next((i for i, e in enumerate(remaining_entries) if e.spec == current), -1)
+            if idx != -1:
+                remaining_entries = remaining_entries[idx + 1 :]
+                continue
+            else:
+                break
+        else:
+            break
+
+    seen_statuses = {status.entry for status in all_statuses}
     for entry in entries:
         if entry.spec not in seen_statuses:
-            statuses.append(
+            all_statuses.append(
                 RunStatus(
                     entry.spec,
                     "crashed",
@@ -825,7 +869,7 @@ def _run_worker_entries(
             )
             seen_statuses.add(entry.spec)
 
-    return diagnostics, statuses, error
+    return all_diagnostics, all_statuses, overall_error
 
 
 def apply_suppressions(

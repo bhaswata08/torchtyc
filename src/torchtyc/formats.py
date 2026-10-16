@@ -75,7 +75,7 @@ def render(report: Report, style: str, root: Path, color: bool | None = None) ->
     if color is None:
         color = use_color()
     if style == "json":
-        return _json(report)
+        return _json(report, root)
     if style == "github":
         return _github(report, root)
     if style == "concise":
@@ -162,16 +162,28 @@ def _summary(report: Report, color: bool) -> str:
     return f"Found {', '.join(parts)} in {fn_part} across {report.checked_files} file(s)"
 
 
-def _json(report: Report) -> str:
+def _json(report: Report, root: Path | None = None) -> str:
+    diags = []
+    for d in report.diagnostics:
+        item = d.to_json()
+        if root is not None:
+            item["path"] = _relative(d.path, root)
+        diags.append(item)
+    statuses = []
+    for s in report.run_status:
+        data = asdict(s)
+        if root is not None and data.get("path") is not None:
+            data["path"] = _relative(data["path"], root)
+        statuses.append(data)
     return json.dumps(
         {
-            "diagnostics": [d.to_json() for d in report.diagnostics],
+            "diagnostics": diags,
             "hovers": report.hovers,
             "checked_files": report.checked_files,
             "checked_functions": report.checked_functions,
             "skipped_functions": report.skipped_functions,
             "worker_error": report.worker_error,
-            "run_status": [asdict(s) for s in report.run_status],
+            "run_status": statuses,
             "ok": report.ok,
             "retried": report.retried,
         },

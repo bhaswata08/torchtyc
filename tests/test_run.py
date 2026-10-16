@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,42 @@ def test_timeout_keeps_earlier_findings(project):
     assert "timed out after 2s" in stopped.message
     assert stopped.line in (3, 4)  # inside the loop, from the last heartbeat
     assert [s.state for s in report.run_status] == ["error", "timeout"]
+
+
+def test_timeout_restarts_worker_for_later_entries(project):
+    slow, config = project(
+        "import time\n\ndef main():\n    while True:\n        time.sleep(0.05)\n",
+        name="slow.py",
+        run_timeout=2.0,
+    )
+    bug, _ = project(BUG, name="bug.py")
+    entries = [RunEntry(str(slow), "main"), RunEntry(str(bug), "main")]
+    report = check_paths([str(slow), str(bug)], config, run=entries, trace=False)
+    rules = {(Path(d.path).name, d.rule) for d in report.diagnostics}
+    assert rules == {("slow.py", "run-stopped"), ("bug.py", "run-error")}
+    (stopped,) = [d for d in report.diagnostics if d.rule == "run-stopped"]
+    assert "timed out after 2s" in stopped.message
+    assert [s.state for s in report.run_status] == ["timeout", "error"]
+    assert report.errors == 1
+
+
+def test_sigterm_handling_child_times_out_cleanly(project):
+    source = """
+    import signal
+    import time
+
+    def main():
+        signal.signal(signal.SIGTERM, lambda *a: None)
+        while True:
+            time.sleep(0.05)
+    """
+    path, config = project(source, name="sigterm_trap.py", run_timeout=2.0)
+    start = time.monotonic()
+    report = check_paths([str(path)], config, run=[RunEntry(str(path), "main")], trace=False)
+    elapsed = time.monotonic() - start
+    assert elapsed < 15.0
+    assert [s.state for s in report.run_status] == ["timeout"]
+    assert any(d.rule == "run-stopped" and "timed out" in d.message for d in report.diagnostics)
 
 
 def test_suppression_in_helper_file(project, tmp_path):

@@ -5,6 +5,8 @@ from __future__ import annotations
 import builtins
 import importlib
 import io
+import json
+import struct
 import sys
 from pathlib import Path
 
@@ -27,6 +29,7 @@ from torchtyc.metaruntime import MetaValueRead, Unsupported, classify
 def _patch_targets():
     return (
         torch.load,
+        torch.save,
         torch.compile,
         torch.autocast,
         torch.cuda.is_available,
@@ -535,3 +538,83 @@ def test_einops_calls_are_recorded():
 
         rearrange(torch.empty(113), "seq_len -> 1 seq_len")
     assert state.einops_axes == {"seq_len": {113}}
+
+
+def test_torch_save_without_guard(tmp_path):
+    ckpt = tmp_path / "model.pt"
+    with metaruntime.install():
+        torch.save({"w": torch.empty(4, 5)}, ckpt)
+    assert ckpt.exists()
+    assert ckpt.stat().st_size > 0
+
+
+def _write_custom_safetensors(path: Path, dtype: str, shape: list[int]) -> Path:
+    header = {"x": {"dtype": dtype, "shape": shape, "data_offsets": [0, 0]}}
+    blob = json.dumps(header).encode("utf-8")
+    blob += b" " * (-len(blob) % 8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<Q", len(blob)) + blob)
+    return path
+
+
+def test_safetensors_custom_dtypes(tmp_path):
+    p_u32 = _write_custom_safetensors(tmp_path / "u32.safetensors", "U32", [4])
+    p_xyz = _write_custom_safetensors(tmp_path / "xyz.safetensors", "XYZ", [4])
+    with metaruntime.install():
+        from safetensors.torch import load_file
+
+        tensors = load_file(str(p_u32))
+        assert tensors["x"].shape == (4,)
+        if hasattr(torch, "uint32"):
+            assert tensors["x"].dtype == torch.uint32
+
+        with pytest.raises(Unsupported) as exc_info:
+            load_file(str(p_xyz))
+        assert "safetensors dtype XYZ has no torch equivalent" in str(exc_info.value)
+        outcome = classify(exc_info.value)
+        assert outcome.rule == "run-unsupported"
+        assert outcome.state == "unsupported"
+
+
+def test_remap_root_key():
+    state = metaruntime.RunState(path_map=(("/", "/mnt/storage"),))
+    assert state.remap("/data/a") == "/mnt/storage/data/a"
+    state2 = metaruntime.RunState(path_map=(("/", "."),))
+    assert state2.remap("/data/a") == "./data/a"
+    state3 = metaruntime.RunState(path_map=(("/workspace", "."),))
+    assert state3.remap("/workspace/data/a") == "./data/a"
+
+
+def test_meta_dispatch_mode_empty_args():
+    mode = metaruntime._MetaDispatchMode()
+
+    class FakeSchema:
+        name = "aten::empty"
+
+    class FakeFunc:
+        _schema = FakeSchema()
+
+        def __call__(self, *args, **kwargs):
+            return "ok"
+
+    res = mode.__torch_dispatch__(FakeFunc(), (), args=(), kwargs={})
+    assert res == "ok"
+
+
+@requires_transformers
+def test_from_pretrained_output_loading_info(tmp_path):
+    path = write_tiny_llama(tmp_path / "model")
+    with metaruntime.install():
+        from transformers import AutoModelForCausalLM
+
+        model, loading_info = AutoModelForCausalLM.from_pretrained(
+            str(path), output_loading_info=True
+        )
+    assert model is not None
+    assert isinstance(loading_info, dict)
+    assert loading_info == {
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "mismatched_keys": [],
+        "error_msgs": [],
+    }

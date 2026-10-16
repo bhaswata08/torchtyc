@@ -283,6 +283,23 @@ tensor's value (`.item()`, `if loss < best`, `.tolist()`), a file that is
 missing, a download, or a write. That is never reported as an error, and the
 status line says how far the run got.
 
+`torchtyc run` accepts the same `--format` options (`full`, `concise`, `json`, `github`)
+and common flags (`--python`, `--allow-effects`, `--severity`) as `check`.
+For `run`, `--timeout` sets the per-entry run limit (overriding `run-timeout`),
+while for `check` it sets the trace-pass timeout.
+
+The status line and JSON `run_status` describe the outcome of each entry:
+- `ran to completion`: the entry finished without raising an unhandled exception;
+- `stopped`: the run could not continue for an expected reason (such as a value read, missing input, blocked write or network, or non-zero `SystemExit`);
+- `timed out`: the entry exceeded its per-entry `run-timeout`;
+- `crashed`: the worker process terminated unexpectedly before the entry finished;
+- `not run`: skipped before execution (such as a function requiring arguments with no default).
+
+Exit codes match `check`:
+- 1 when there is an unhandled `run-error` (or another error-level diagnostic);
+- 2 when torchtyc itself failed (an invalid entry target, missing file, or worker process that died);
+- 0 otherwise.
+
 List entry points in `pyproject.toml` and `torchtyc check` runs the ones
 under the paths it checks:
 
@@ -453,7 +470,8 @@ the real directory or a symlink. PEFT, DeepSpeed, FSDP and `datasets` are not
 supported, and end the run with `run-stopped` or `run-unsupported`.
 Transformers 4.x on meta needs the meta-aware `torch.autocast` the runtime
 installs (it is automatic), and `uv run --with` is how the CI job swaps
-versions.
+versions. Device checks in user code (`assert x.is_cuda`, comparing `x.device`
+to `"cuda"`) see the meta device and fail.
 
 ## Security
 

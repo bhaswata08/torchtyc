@@ -822,6 +822,11 @@ def _guarded_os_exec(file: Any, *args: Any, **kwargs: Any) -> None:
 _depth = 0
 
 
+def guard_active() -> bool:
+    """Whether the effect guard is currently active."""
+    return _depth > 0
+
+
 def _install_guard() -> None:
     builtins.open = _guarded_open
     io.open = _guarded_open
