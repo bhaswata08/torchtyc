@@ -111,9 +111,13 @@ def entry_problem(entry: RunEntry) -> Diagnostic | None:
     path = Path(entry.path)
     if not path.is_file():
         raise EntryError(f"{entry.path}: no such file")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise EntryError(f"{entry.path}: cannot be read: {exc}") from exc
     if entry.func is None:
         return None
-    scan = scan_source(path.read_text(encoding="utf-8"), entry.path)
+    scan = scan_source(text, entry.path)
     if scan.syntax_error is not None:
         return None  # the run reports it, at its line, as the import fails
     top_level = [t for t in scan.targets if t.owner is None and "." not in t.qualname]
@@ -783,25 +787,44 @@ def _run_worker_entries(
             error = msg["error"]
 
     finished = {status.entry for status in statuses}
-    if timed_out and current is not None and current not in finished:
-        path, beat_line = beats.get(current, (None, None))
-        where = f" at line {beat_line + 1}" if beat_line is not None else ""
-        message = f"the run timed out after {config.run_timeout:g}s{where}"
-        entry_path = by_spec[current].path if current in by_spec else (path or "")
-        diagnostics.append(
-            Diagnostic(
-                path=path or entry_path,
-                line=beat_line or 0,
-                column=0,
-                rule="run-stopped",
-                severity=RULES["run-stopped"].severity,
-                message=message,
+    if timed_out:
+        if current is not None and current not in finished:
+            path, beat_line = beats.get(current, (None, None))
+            where = f" at line {beat_line + 1}" if beat_line is not None else ""
+            message = f"the run timed out after {config.run_timeout:g}s{where}"
+            entry_path = by_spec[current].path if current in by_spec else (path or "")
+            diagnostics.append(
+                Diagnostic(
+                    path=path or entry_path,
+                    line=beat_line or 0,
+                    column=0,
+                    rule="run-stopped",
+                    severity=RULES["run-stopped"].severity,
+                    message=message,
+                )
             )
-        )
-        statuses.append(RunStatus(current, "timeout", path or entry_path, beat_line, message))
+            statuses.append(RunStatus(current, "timeout", path or entry_path, beat_line, message))
+        elif current is None:
+            error = f"the run timed out after {config.run_timeout:g}s before any entry started"
     elif not lines and error is None:
         detail = (stderr or "").strip().splitlines()
         error = f"the worker produced no output ({detail[-1] if detail else proc.returncode})"
+
+    if not timed_out and proc.returncode not in (0, None) and error is None:
+        error = f"the worker failed with exit code {proc.returncode}"
+
+    seen_statuses = {status.entry for status in statuses}
+    for entry in entries:
+        if entry.spec not in seen_statuses:
+            statuses.append(
+                RunStatus(
+                    entry.spec,
+                    "crashed",
+                    reason="the worker stopped before this entry finished",
+                )
+            )
+            seen_statuses.add(entry.spec)
+
     return diagnostics, statuses, error
 
 
@@ -848,7 +871,7 @@ def check_paths(
             # An empty buffer is still the buffer: `or` would fall back to the
             # file on disk and report code the user has just deleted.
             text = sources[path] if path in sources else Path(path).read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             report.diagnostics.append(
                 Diagnostic(
                     path=path,

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from torchtyc.config import Config, RunEntry
-from torchtyc.engine import EntryError, check_paths
+from torchtyc.engine import EntryError, check_paths, entry_problem
 
 
 @pytest.fixture
@@ -219,3 +219,49 @@ def test_cli_check_runs_config_entries(project, capsys, tmp_path):
     # clean check stays clean (exit 0, no run-error).
     (tmp_path / "elsewhere.py").write_text("x = 1\n")
     assert cli_main(["check", str(tmp_path / "elsewhere.py")]) == 0
+
+
+def test_entry_file_with_invalid_utf8_raises_entry_error(tmp_path, project):
+    path = tmp_path / "bad_bytes.py"
+    path.write_bytes(b"\xff\xfe def main(): pass")
+    entry = RunEntry(str(path), "main")
+    with pytest.raises(EntryError, match="cannot be read"):
+        entry_problem(entry)
+    _, config = project("def main(): pass")
+    with pytest.raises(EntryError, match="cannot be read"):
+        run(path, config)
+
+
+def test_worker_killed_mid_run_marks_uncompleted_entries_crashed(project):
+    first, config = project("def main():\n    pass\n", name="first.py")
+    second, _ = project(
+        "import os, signal\ndef main():\n    os.kill(os.getppid(), signal.SIGKILL)\n",
+        name="second.py",
+    )
+    entries = [RunEntry(str(first), "main"), RunEntry(str(second), "main")]
+    report = check_paths([str(first), str(second)], config, run=entries, trace=False)
+    assert report.worker_error is not None
+    assert "exit code" in report.worker_error
+    assert len(report.run_status) == 2
+    assert report.run_status[0].state == "completed"
+    assert report.run_status[1].state == "crashed"
+    assert report.run_status[1].reason == "the worker stopped before this entry finished"
+    assert not report.ok
+
+
+def test_timeout_before_any_entry_started(project, monkeypatch):
+    first, config = project("def main():\n    pass\n")
+    entries = [RunEntry(str(first), "main")]
+    monkeypatch.setattr(
+        "torchtyc.engine._communicate",
+        lambda *args, **kwargs: ([], None, True),
+    )
+    report = check_paths([str(first)], config, run=entries, trace=False)
+    assert (
+        report.worker_error
+        == f"the run timed out after {config.run_timeout:g}s before any entry started"
+    )
+    assert len(report.run_status) == 1
+    assert report.run_status[0].state == "crashed"
+    assert report.run_status[0].reason == "the worker stopped before this entry finished"
+    assert not report.ok

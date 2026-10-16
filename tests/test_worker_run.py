@@ -203,7 +203,7 @@ def test_keyerror_entry_result(tmp_path):
 
 
 def test_no_heartbeat_after_entry_result(tmp_path):
-    source = "import time\ndef main():\n    time.sleep(1.5)\n"
+    source = "import time\ndef main():\n    time.sleep(2.5)\n"
     _, status, events = run(tmp_path, source)
     assert status["state"] == "completed"
     entry_result_idx = next(i for i, e in enumerate(events) if e.get("event") == "entry_result")
