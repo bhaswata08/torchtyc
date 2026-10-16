@@ -11,6 +11,24 @@ from pathlib import Path
 from .diagnostics import Severity
 
 
+@dataclass(frozen=True)
+class RunEntry:
+    """One entry point for `torchtyc run`: a file, an optional function, its argv."""
+
+    path: str
+    func: str | None = None
+    args: tuple[str, ...] = ()
+
+    @property
+    def spec(self) -> str:
+        return f"{self.path}::{self.func}" if self.func else self.path
+
+    @classmethod
+    def parse(cls, text: str, args: Sequence[str] = ()) -> RunEntry:
+        path, _, func = text.partition("::")
+        return cls(path=path, func=func or None, args=tuple(args))
+
+
 @dataclass
 class Config:
     root: Path
@@ -26,6 +44,11 @@ class Config:
     timeout: float = 60.0
     extra_paths: tuple[str, ...] = field(default_factory=tuple)
     allow_effects: bool = False
+    # `torchtyc run`: entries `check` also runs, prefix rewrites for
+    # hard-coded paths, and the wall-clock limit for one entry.
+    run: tuple[RunEntry, ...] = ()
+    path_map: tuple[tuple[str, str], ...] = ()
+    run_timeout: float = 300.0
 
     @property
     def interpreter(self) -> str:
@@ -56,6 +79,7 @@ class Overrides:
     severity: Severity | None = None
     timeout: float | None = None
     allow_effects: bool | None = None
+    run_timeout: float | None = None
 
     def apply(self, config: Config) -> Config:
         if self.python is not None:
@@ -70,6 +94,8 @@ class Overrides:
             config.timeout = self.timeout
         if self.allow_effects is not None:
             config.allow_effects = self.allow_effects
+        if self.run_timeout is not None:
+            config.run_timeout = self.run_timeout
         return config
 
 
@@ -115,6 +141,40 @@ def _positive(value: float) -> float:
     return value
 
 
+def _run_entries(value: object, root: Path) -> tuple[RunEntry, ...]:
+    if not isinstance(value, list):
+        raise TypeError("run must be a list")
+    entries: list[RunEntry] = []
+    for item in value:
+        if isinstance(item, str):
+            text, args = item, ()
+        elif isinstance(item, dict) and isinstance(item.get("entry"), str):
+            text, args = item["entry"], tuple(_strings(item.get("args", [])))
+        else:
+            raise TypeError("each run entry is a string or a table with `entry`")
+        entry = RunEntry.parse(text, args)
+        path = Path(entry.path)
+        entries.append(
+            RunEntry(str(path if path.is_absolute() else root / path), entry.func, entry.args)
+        )
+    return tuple(entries)
+
+
+def _path_map(value: object, root: Path) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, dict):
+        raise TypeError("path-map must be a table")
+    pairs = []
+    for old, new in value.items():
+        target = Path(str(new)).expanduser()
+        pairs.append(
+            (
+                str(old).rstrip("/") or "/",
+                str((target if target.is_absolute() else root / target).resolve()),
+            )
+        )
+    return tuple(sorted(pairs, key=lambda pair: -len(pair[0])))
+
+
 def load(start: Path | str | Sequence[Path | str] = ".") -> Config:
     root = find_root(start)
     config = Config(root=root)
@@ -153,5 +213,8 @@ def load(start: Path | str | Sequence[Path | str] = ".") -> Config:
     read("timeout", "timeout", lambda v: _positive(float(v)))
     read("extra-paths", "extra_paths", lambda v: tuple(_strings(v)))
     read("allow-effects", "allow_effects", bool)
+    read("run", "run", lambda v: _run_entries(v, root))
+    read("path-map", "path_map", lambda v: _path_map(v, root))
+    read("run-timeout", "run_timeout", lambda v: _positive(float(v)))
 
     return config

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from torchtyc.diagnostics import Diagnostic, Severity
+from torchtyc.diagnostics import RULES, Diagnostic, Severity
 from torchtyc.engine import Report
 from torchtyc.formats import render
 
@@ -93,3 +93,11 @@ def test_summary_renders_skipped_functions():
     data = json.loads(render(report_clean, "json", Path("/project")))
     assert data["checked_functions"] == 0
     assert data["skipped_functions"] == 2
+
+
+def test_diagnostic_via_round_trips():
+    d = Diagnostic(
+        path="a.py", line=1, column=0, rule="run-error", message="m", via="main (line 2)"
+    )
+    assert Diagnostic.from_json(d.to_json()).via == "main (line 2)"
+    assert {"run-error", "run-stopped", "run-unsupported"} <= set(RULES)

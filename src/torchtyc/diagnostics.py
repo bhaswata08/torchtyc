@@ -96,6 +96,20 @@ TRACE_RETRIED = _rule(
     "trace-retried", Severity.INFO, "a function traced only after widths were rescaled"
 )
 
+# `torchtyc run`: a script's real entry point, executed on meta tensors.
+RUN_ERROR = _rule(
+    "run-error", Severity.ERROR, "the entry point raised while running on meta tensors"
+)
+RUN_STOPPED = _rule(
+    "run-stopped", Severity.INFO, "the run could not continue for a reason that is not a bug"
+)
+RUN_UNSUPPORTED = _rule(
+    "run-unsupported",
+    Severity.WARNING,
+    "the run reached something the meta runtime cannot stand in for",
+)
+
+
 # Hygiene rules, off the critical path but cheap once a trace exists.
 MISSING_ANNOTATION = _rule(
     "missing-annotation", Severity.INFO, "a public function has no jaxtyping annotation"
@@ -147,6 +161,9 @@ class Diagnostic:
     # annotation should have carried. Only set when torchtyc can name every
     # axis involved, so a suggestion is never a guess.
     suggestion: str | None = None
+    # The chain of project frames that led to a run failure, outermost first:
+    # `main (line 47) → run (line 36)`.
+    via: str | None = None
     traceback: str | None = None
 
     def to_json(self) -> dict[str, Any]:

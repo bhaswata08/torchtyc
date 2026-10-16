@@ -1,6 +1,7 @@
 """A malformed pyproject.toml must never take the language server down."""
 
 import textwrap
+from pathlib import Path
 
 from torchtyc import config as config_module
 from torchtyc.diagnostics import Severity
@@ -94,3 +95,62 @@ def test_find_root_multiple_paths_common_ancestor(tmp_path):
 
     root = config_module.find_root([p_a, p_b])
     assert root == tmp_path
+
+
+def test_run_keys_are_read(tmp_path):
+    root = write(
+        tmp_path,
+        """
+        [tool.torchtyc]
+        run = ["tools/a.py::main", { entry = "tools/b.py", args = ["--n", "2"] }]
+        path-map = { "/workspace" = ".", "/workspace/golden" = "data/golden" }
+        run-timeout = 12
+        """,
+    )
+    config = config_module.load(root)
+    assert [e.spec for e in config.run] == [
+        str(root / "tools/a.py") + "::main",
+        str(root / "tools/b.py"),
+    ]
+    assert config.run[1].args == ("--n", "2")
+    # Longest prefix first, so the more specific mapping wins.
+    assert config.path_map == (
+        ("/workspace/golden", str((root / "data/golden").resolve())),
+        ("/workspace", str(root.resolve())),
+    )
+    assert config.run_timeout == 12.0
+
+
+def test_bad_run_keys_keep_defaults(tmp_path):
+    root = write(
+        tmp_path,
+        """
+        [tool.torchtyc]
+        run = "not-a-list"
+        path-map = ["nope"]
+        run-timeout = -1
+        """,
+    )
+    config = config_module.load(root)
+    assert config.run == ()
+    assert config.path_map == ()
+    assert config.run_timeout == 300.0
+
+
+def test_run_entry_parse():
+    entry = config_module.RunEntry.parse("x.py::main", ["--a"])
+    assert (entry.path, entry.func, entry.args, entry.spec) == (
+        "x.py",
+        "main",
+        ("--a",),
+        "x.py::main",
+    )
+    bare = config_module.RunEntry.parse("x.py")
+    assert (bare.func, bare.spec) == (None, "x.py")
+
+
+def test_run_timeout_override():
+    config = config_module.Config(root=Path("."))
+    config_module.Overrides(run_timeout=3.0).apply(config)
+    assert config.run_timeout == 3.0
+    assert config.timeout == 60.0
