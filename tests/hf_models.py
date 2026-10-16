@@ -136,6 +136,7 @@ def write_inputs(path: Path, lengths: dict[str, int]) -> Path:
         offset += size
     blob = json.dumps(header).encode()
     blob += b" " * (-len(blob) % 8)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(struct.pack("<Q", len(blob)) + blob + bytes(offset))
     return path
 

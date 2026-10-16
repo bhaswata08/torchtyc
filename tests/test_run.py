@@ -7,6 +7,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from hf_models import TINY_VOCAB, requires_transformers, write_inputs, write_remote_checkpoint
 
 from torchtyc.config import Config, RunEntry
 from torchtyc.engine import EntryError, check_paths, entry_problem
@@ -265,3 +266,142 @@ def test_timeout_before_any_entry_started(project, monkeypatch):
     assert report.run_status[0].state == "crashed"
     assert report.run_status[0].reason == "the worker stopped before this entry finished"
     assert not report.ok
+
+
+MOTIVATING = """
+from pathlib import Path
+
+import torch
+from einops import rearrange
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM
+
+OUT = Path("/workspace/golden")
+CKPTS = ["/workspace/ckpt/a", "/workspace/ckpt/b"]
+
+
+def load_model(path, dtype, attn_implementation):
+    model = AutoModelForCausalLM.from_pretrained(
+        path,
+        dtype=dtype,
+        attn_implementation=attn_implementation,
+        trust_remote_code=True,
+        device_map="cuda:0",
+    )
+    model.eval()
+    return model
+
+
+def load_inputs():
+    return load_file(str(OUT / "inputs.safetensors"))
+
+
+@torch.no_grad()
+def run(model, input_ids):
+    batch_input = rearrange(input_ids, "seq_len -> 1 seq_len").to("cuda:0")
+    logits = model(input_ids=batch_input, use_cache=False)
+    rearrange(logits, "1 seq_len -> seq_len ")
+    return logits
+
+
+def main():
+    inputs = load_inputs()
+    for ckpt in CKPTS:
+        model = load_model(ckpt, dtype=torch.float32, attn_implementation="eager")
+        for name, input_ids in inputs.items():
+            run(model, input_ids)
+"""
+
+BUG_TWO = MOTIVATING.replace(
+    "logits = model(input_ids=batch_input, use_cache=False)",
+    "logits = model(input_ids=batch_input, use_cache=False).logits",
+)
+FIXED = BUG_TWO.replace(
+    'rearrange(logits, "1 seq_len -> seq_len ")',
+    'rearrange(logits, "1 seq_len vocab -> seq_len vocab")',
+)
+
+
+@pytest.fixture
+def workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "HF_MODULES_CACHE", str(tmp_path.parent / f"{tmp_path.name}-modules")
+    )  # cold cache
+    write_inputs(tmp_path / "golden" / "inputs.safetensors", {"chat": 113, "hindi": 226})
+    write_remote_checkpoint(tmp_path / "ckpt" / "a")
+    write_remote_checkpoint(tmp_path / "ckpt" / "b")
+    return tmp_path
+
+
+def _line(source: str, needle: str) -> int:
+    return next(i for i, text in enumerate(source.splitlines()) if needle in text)
+
+
+@requires_transformers
+@pytest.mark.parametrize(
+    ("source", "message", "hint"),
+    [
+        (
+            MOTIVATING,
+            "Tensor type unknown to einops",
+            "`logits` is a CausalLMOutputWithPast, not a tensor; did you mean `logits.logits`?",
+        ),
+        (BUG_TWO, "expected 2 dims", "the pattern names 2 axes but the tensor has 3"),
+    ],
+)
+def test_motivating_bugs(project, workspace, source, message, hint):
+    path, config = project(source, path_map=(("/workspace", str(workspace)),))
+    report = run(path, config)
+    (d,) = report.diagnostics
+    assert d.rule == "run-error"
+    assert d.line == _line(source, 'rearrange(logits, "1 seq_len -> seq_len ")')
+    assert d.column == 4
+    assert message in d.message
+    assert d.hint == hint
+    assert "device_map" in report.run_status[0].ignored
+
+
+@requires_transformers
+def test_motivating_fixed_runs_to_completion(project, workspace):
+    path, config = project(FIXED, path_map=(("/workspace", str(workspace)),))
+    report = run(path, config)
+    assert report.diagnostics == []
+    assert report.run_status[0].state == "completed"
+
+
+@requires_transformers
+def test_motivating_labels(project, workspace):
+    path, config = project(BUG_TWO, path_map=(("/workspace", str(workspace)),))
+    (d,) = run(path, config).diagnostics
+    assert d.got == f"logits (1, 113 (seq_len?), {TINY_VOCAB} (vocab_size?))"
+
+
+@requires_transformers
+def test_hub_id_without_cache_is_stopped(project):
+    source = """
+    from transformers import AutoModelForCausalLM
+
+    def main():
+        AutoModelForCausalLM.from_pretrained("some-org/not-cached-anywhere")
+    """
+    path, config = project(source)
+    report = run(path, config)
+    assert [d.rule for d in report.diagnostics] == ["run-stopped"]
+    assert report.diagnostics[0].line == 4
+
+
+@requires_transformers
+def test_module_level_from_pretrained(project, workspace):
+    source = """
+    from transformers import AutoModelForCausalLM
+    import torch
+
+    MODEL = AutoModelForCausalLM.from_pretrained("/workspace/ckpt/a", trust_remote_code=True)
+
+    def main():
+        MODEL(input_ids=torch.zeros(1, 5, dtype=torch.long)).logits.view(3)
+    """
+    path, config = project(source, path_map=(("/workspace", str(workspace)),))
+    report = run(path, config)
+    assert [d.rule for d in report.diagnostics] == ["run-error"]
+    assert report.diagnostics[0].line == 7
