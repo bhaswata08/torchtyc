@@ -1,4 +1,4 @@
-"""The command line: check, trace, watch, lsp, rules, version."""
+"""The command line: check, trace, run, watch, lsp, rules, version."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from pathlib import Path
 
 from . import __version__
 from . import config as config_module
+from .config import RunEntry
 from .diagnostics import RULES, Severity
-from .engine import check_paths, collect_files
+from .engine import EntryError, check_paths, collect_files
 from .formats import render, use_color
 
 
@@ -30,12 +31,15 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 def _overrides_from(args: argparse.Namespace) -> config_module.Overrides:
     severity = getattr(args, "severity", None)
+    timeout = getattr(args, "timeout", None) or None
+    is_run = getattr(args, "command", None) == "run"
     return config_module.Overrides(
         python=getattr(args, "python", None) or None,
         variadic_rank=getattr(args, "variadic_rank", None) or None,
         ignore=frozenset(getattr(args, "ignore", None) or ()),
         severity=Severity.parse(severity) if severity else None,
-        timeout=getattr(args, "timeout", None) or None,
+        timeout=None if is_run else timeout,
+        run_timeout=timeout if is_run else None,
     )
 
 
@@ -59,6 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("target", help="file.py::function or file.py::Class.method")
     _add_common(trace)
 
+    run = sub.add_parser(
+        "run",
+        help="run an entry point on meta tensors and report shape bugs, no annotations needed",
+    )
+    run.add_argument("target", help="file.py::function, or file.py to run its __main__ block")
+    run.add_argument("--format", default="full", choices=["full", "concise", "json", "github"])
+    _add_common(run)
+
     watch = sub.add_parser("watch", help="re-check when files change")
     watch.add_argument("paths", nargs="+")
     watch.add_argument("--format", default="full", choices=["full", "concise"])
@@ -80,7 +92,25 @@ def cmd_check(args: argparse.Namespace) -> int:
         print("no python files found", file=sys.stderr)
         return 2
 
-    report = check_paths(files, config)
+    try:
+        report = check_paths(files, config, run=config.run)
+    except EntryError as exc:
+        print(f"torchtyc check: {exc}", file=sys.stderr)
+        return 2
+    print(render(report, args.format, config.root))
+    if report.worker_error:
+        return 2
+    return 1 if report.errors else 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    entry = RunEntry.parse(args.target, getattr(args, "passthrough", []))
+    config = _config_from(args, entry.path)
+    try:
+        report = check_paths([entry.path], config, run=[entry], trace=False)
+    except EntryError as exc:
+        print(f"torchtyc run: {exc}", file=sys.stderr)
+        return 2
     print(render(report, args.format, config.root))
     if report.worker_error:
         return 2
@@ -170,10 +200,17 @@ def cmd_rules(_: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    passthrough: list[str] = []
+    if "--" in argv:
+        split = argv.index("--")
+        argv, passthrough = argv[:split], argv[split + 1 :]
     args = build_parser().parse_args(argv)
+    args.passthrough = passthrough
     handlers = {
         "check": cmd_check,
         "trace": cmd_trace,
+        "run": cmd_run,
         "watch": cmd_watch,
         "lsp": cmd_lsp,
         "rules": cmd_rules,

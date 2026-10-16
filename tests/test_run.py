@@ -162,3 +162,60 @@ def test_got_line_names_axes(project):
     (d,) = report.diagnostics
     assert d.got == "logits (1, 113 (seq_len?), 1000)"
     assert d.hint == "the pattern names 2 axes but the tensor has 3"
+
+
+from torchtyc.cli import main as cli_main
+
+
+def test_cli_run_exit_codes_and_output(project, capsys, monkeypatch, tmp_path):
+    project(BUG, name="tools/script.py")
+    (tmp_path / "pyproject.toml").write_text(f'[tool.torchtyc]\npython = "{sys.executable}"\n')
+    monkeypatch.chdir(tmp_path / "tools")  # Review Focus 5: run from a subdirectory
+    code = cli_main(["run", "script.py::main", "--format", "full"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "tools/script.py:6:" in out
+    assert "error[run-error]" in out
+    assert "run tools/script.py::main: stopped at tools/script.py:6 (run-error)" in out
+    assert "via: main (line 6)" in out
+
+
+def test_cli_run_missing_function_exits_2(project, capsys, tmp_path):
+    path, _ = project(BUG)
+    (tmp_path / "pyproject.toml").write_text(f'[tool.torchtyc]\npython = "{sys.executable}"\n')
+    assert cli_main(["run", f"{path}::nope"]) == 2
+    assert "no function `nope`" in capsys.readouterr().err
+
+
+def test_cli_run_passthrough_args(project, capsys, tmp_path):
+    source = """
+    import argparse, torch
+    def main():
+        p = argparse.ArgumentParser(); p.add_argument("--n", type=int)
+        torch.empty(p.parse_args().n).view(3)
+    """
+    path, _ = project(source)
+    (tmp_path / "pyproject.toml").write_text(f'[tool.torchtyc]\npython = "{sys.executable}"\n')
+    assert cli_main(["run", f"{path}::main", "--", "--n", "3"]) == 0
+    assert cli_main(["run", f"{path}::main", "--", "--n", "4"]) == 1
+
+
+def test_cli_run_timeout_flag(project, capsys, tmp_path):
+    path, _ = project("import time\ndef main():\n    while True:\n        time.sleep(0.05)\n")
+    (tmp_path / "pyproject.toml").write_text(f'[tool.torchtyc]\npython = "{sys.executable}"\n')
+    assert cli_main(["run", f"{path}::main", "--timeout", "2", "--format", "concise"]) == 0
+    assert "timed out after 2s" in capsys.readouterr().out
+
+
+def test_cli_check_runs_config_entries(project, capsys, tmp_path):
+    project(BUG, name="tools/script.py")
+    (tmp_path / "pyproject.toml").write_text(
+        f'[tool.torchtyc]\npython = "{sys.executable}"\nrun = ["tools/script.py::main"]\n'
+    )
+    assert cli_main(["check", str(tmp_path / "tools"), "--format", "github"]) == 1
+    out = capsys.readouterr().out
+    assert "title=torchtyc[run-error]" in out
+    # A file outside the entry's directory: the config entry is not run, so a
+    # clean check stays clean (exit 0, no run-error).
+    (tmp_path / "elsewhere.py").write_text("x = 1\n")
+    assert cli_main(["check", str(tmp_path / "elsewhere.py")]) == 0

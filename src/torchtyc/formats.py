@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from .diagnostics import Diagnostic, Severity
@@ -36,6 +37,40 @@ def _relative(path: str, root: Path) -> str:
         return path
 
 
+_RUN_STATES = {
+    "completed": "ran to completion",
+    "stopped": "stopped",
+    "unsupported": "stopped",
+    "error": "stopped",
+    "timeout": "timed out",
+    "crashed": "crashed",
+    "skipped": "not run",
+}
+
+
+def _relative_spec(spec: str, root: Path) -> str:
+    path, sep, func = spec.partition("::")
+    return _relative(path, root) + (sep + func if sep else "")
+
+
+def _status_lines(report: Report, root: Path) -> list[str]:
+    lines: list[str] = []
+    for status in report.run_status:
+        text = f"run {_relative_spec(status.entry, root)}: {_RUN_STATES.get(status.state, status.state)}"
+        if status.path is not None and status.line is not None:
+            text += f" at {_relative(status.path, root)}:{status.line + 1}"
+        if status.state == "error":
+            text += " (run-error)"
+        elif status.state != "completed" and status.reason:
+            text += f" ({status.reason})"
+        lines.append(text)
+        if status.inactive:
+            lines.append("  inactive: " + ", ".join(status.inactive))
+        if status.ignored:
+            lines.append("  ignored: " + ", ".join(status.ignored))
+    return lines
+
+
 def render(report: Report, style: str, root: Path, color: bool | None = None) -> str:
     if color is None:
         color = use_color()
@@ -58,6 +93,7 @@ def _concise(report: Report, root: Path, color: bool) -> str:
         f"{_paint(d.severity.label, _COLORS[d.severity], color)}[{d.rule}] {d.message}"
         for d in report.diagnostics
     ]
+    lines.extend(_status_lines(report, root))
     lines.append(_summary(report, color))
     return "\n".join(lines)
 
@@ -77,6 +113,8 @@ def _full(report: Report, root: Path, color: bool) -> str:
         source = _source_line(d)
         if source:
             body.append(_paint(f"    {d.line + 1} | {source}", _DIM, color))
+        if d.via:
+            body.append(_paint(f"  via: {d.via}", _DIM, color))
         if d.suggestion:
             body.append(f"  try:  {d.suggestion}")
         if d.hint:
@@ -85,6 +123,8 @@ def _full(report: Report, root: Path, color: bool) -> str:
             body.append(_paint(f"  note: {d.note}", _DIM, color))
         blocks.append("\n".join(body))
 
+    if report.run_status:
+        blocks.append("\n".join(_status_lines(report, root)))
     blocks.append(_summary(report, color))
     return "\n\n".join(blocks)
 
@@ -131,6 +171,7 @@ def _json(report: Report) -> str:
             "checked_functions": report.checked_functions,
             "skipped_functions": report.skipped_functions,
             "worker_error": report.worker_error,
+            "run_status": [asdict(s) for s in report.run_status],
             "ok": report.ok,
             "retried": report.retried,
         },
@@ -150,11 +191,17 @@ def _github(report: Report, root: Path) -> str:
             message += f"%0Ahint: {_escape_workflow(d.hint)}"
         if d.note:
             message += f"%0Anote: {_escape_workflow(d.note)}"
+        if d.via:
+            message += f"%0Avia: {_escape_workflow(d.via)}"
         lines.append(
             f"::{levels[d.severity]} file={_escape_property(_relative(d.path, root))},"
             f"line={d.line + 1},col={d.column + 1},"
             f"title={_escape_property(f'torchtyc[{d.rule}]')}::{message}"
         )
+    for status in report.run_status:
+        if status.state != "completed":
+            text = _status_lines(Report(run_status=[status]), root)[0]
+            lines.append(f"::notice title=torchtyc run::{_escape_workflow(text)}")
     if report.worker_error:
         lines.append(f"::error title=torchtyc::{_escape_workflow(report.worker_error)}")
     return "\n".join(lines)

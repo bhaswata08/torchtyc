@@ -101,3 +101,33 @@ def test_diagnostic_via_round_trips():
     )
     assert Diagnostic.from_json(d.to_json()).via == "main (line 2)"
     assert {"run-error", "run-stopped", "run-unsupported"} <= set(RULES)
+
+
+def test_run_status_rendering(tmp_path):
+    import json as json_module
+
+    from torchtyc.engine import Report, RunStatus
+    from torchtyc.formats import render
+
+    report = Report(checked_files=1)
+    report.run_status = [
+        RunStatus(
+            "a.py::main",
+            "stopped",
+            str(tmp_path / "a.py"),
+            35,
+            "`.item()` needs a tensor's value",
+            inactive=["x"],
+            ignored=["device_map"],
+        ),
+        RunStatus("b.py::main", "completed"),
+    ]
+    full = render(report, "full", tmp_path, color=False)
+    assert "run a.py::main: stopped at a.py:36 (`.item()` needs a tensor's value)" in full
+    assert "  inactive: x" in full and "  ignored: device_map" in full
+    assert "run b.py::main: ran to completion" in full
+    data = json_module.loads(render(report, "json", tmp_path))
+    assert data["run_status"][0]["state"] == "stopped"
+    github = render(report, "github", tmp_path)
+    assert "::notice title=torchtyc run::run a.py::main: stopped" in github
+    assert "b.py::main" not in github
