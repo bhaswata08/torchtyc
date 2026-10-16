@@ -12,6 +12,7 @@ A caller that only wants fast feedback can run the first and skip the second.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -19,12 +20,12 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .annotations import ArraySpec, TupleSpec
-from .config import Config
+from .config import Config, RunEntry
 from .diagnostics import RULES, Diagnostic, Severity
 from .discovery import FileScan, Suppression, Target, iter_arrays, scan_source
 from .einops_rules import check_call
@@ -43,6 +44,33 @@ _BOOTSTRAP = (
 
 
 @dataclass
+class RunStatus:
+    """How one `torchtyc run` ended."""
+
+    entry: str
+    state: str
+    path: str | None = None
+    line: int | None = None
+    reason: str | None = None
+    active: list[str] = field(default_factory=list)
+    inactive: list[str] = field(default_factory=list)
+    ignored: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, data: dict) -> RunStatus:
+        return cls(
+            entry=data.get("entry", "?"),
+            state=data.get("state", "crashed"),
+            path=data.get("path"),
+            line=data.get("line"),
+            reason=data.get("reason"),
+            active=list(data.get("active") or []),
+            inactive=list(data.get("inactive") or []),
+            ignored=list(data.get("ignored") or []),
+        )
+
+
+@dataclass
 class Report:
     diagnostics: list[Diagnostic] = field(default_factory=list)
     # path -> qualname -> traced shapes, as the worker returned them.
@@ -51,6 +79,7 @@ class Report:
     checked_functions: int = 0
     skipped_functions: int = 0
     worker_error: str | None = None
+    run_status: list[RunStatus] = field(default_factory=list)
 
     def shapes_in(self, path: str) -> dict[str, dict[str, str]]:
         """Every traced qualname in one file, under the path it was checked as."""
@@ -67,6 +96,48 @@ class Report:
     @property
     def retried(self) -> list[str]:
         return [d.function for d in self.diagnostics if d.rule == "trace-retried" and d.function]
+
+
+class EntryError(ValueError):
+    """A run entry that names a file or function that is not there."""
+
+
+def entry_problem(entry: RunEntry) -> Diagnostic | None:
+    """Check an entry from source, without importing anything.
+
+    A missing file or function is the user's command-line mistake (EntryError,
+    exit 2). Required parameters with no default mean torchtyc cannot call it.
+    """
+    path = Path(entry.path)
+    if not path.is_file():
+        raise EntryError(f"{entry.path}: no such file")
+    if entry.func is None:
+        return None
+    scan = scan_source(path.read_text(encoding="utf-8"), entry.path)
+    if scan.syntax_error is not None:
+        return None  # the run reports it, at its line, as the import fails
+    top_level = [t for t in scan.targets if t.owner is None and "." not in t.qualname]
+    target = next((t for t in top_level if t.qualname == entry.func), None)
+    if target is None:
+        available = ", ".join(t.qualname for t in top_level) or "none"
+        raise EntryError(
+            f"{entry.path} has no function `{entry.func}` (functions here: {available})"
+        )
+    required = [p.name for p in target.params if not p.has_default]
+    if not required:
+        return None
+    names = ", ".join(f"`{name}`" for name in required)
+    return Diagnostic(
+        path=entry.path,
+        line=target.position.line,
+        column=target.position.column,
+        end_line=target.position.end_line,
+        end_column=target.position.end_column,
+        rule="unresolved-arg",
+        severity=RULES["unresolved-arg"].severity,
+        message=f"`{entry.func}` needs {names} and has no defaults, so torchtyc cannot call it",
+        function=entry.func,
+    )
 
 
 def lint_scan(scan: FileScan, config: Config) -> list[Diagnostic]:
@@ -336,6 +407,7 @@ def _communicate(
     payload: str,
     timeout: float | None,
     cancel: threading.Event | None,
+    reset_events: tuple[str, ...] = ("file_start", "file_result"),
 ) -> tuple[list[str], str | None, bool]:
     """Collect the worker's output line by line, resetting the timeout on progress.
 
@@ -425,7 +497,7 @@ def _communicate(
                             deadline = time.monotonic() + max(
                                 timeout, _WORKER_STARTUP_GRACE_SECONDS
                             )
-                        elif event in ("file_start", "file_result"):
+                        elif event in reset_events:
                             deadline = time.monotonic() + timeout
                     except json.JSONDecodeError:
                         pass
@@ -481,6 +553,24 @@ class WorkerRunResult(tuple):
         return inst
 
 
+def _spawn_worker(config: Config) -> subprocess.Popen[str]:
+    env = dict(os.environ)
+    if config.extra_paths:
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join([p for p in [*config.extra_paths, existing] if p])
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return subprocess.Popen(
+        [config.interpreter, "-c", _BOOTSTRAP, str(_PACKAGE_ROOT)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(config.root),
+        env=env,
+        start_new_session=(os.name == "posix"),
+    )
+
+
 def run_worker(
     paths: list[str],
     config: Config,
@@ -519,26 +609,8 @@ def run_worker(
         "protect_roots": [str(Path(config.root).resolve())],
     }
 
-    env = dict(os.environ)
-    if config.extra_paths:
-        existing = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = os.pathsep.join([p for p in [*config.extra_paths, existing] if p])
-    # Importing user code must not leave .pyc files in the project tree.
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-
     try:
-        proc = subprocess.Popen(
-            [config.interpreter, "-c", _BOOTSTRAP, str(_PACKAGE_ROOT)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=str(config.root),
-            env=env,
-            # The worker imports project code, which can spawn children of its
-            # own. Its own group means stopping it stops those too.
-            start_new_session=(os.name == "posix"),
-        )
+        proc = _spawn_worker(config)
     except OSError as exc:
         return WorkerRunResult([], {}, f"could not start {config.interpreter}: {exc}")
     if on_proc is not None:
@@ -649,6 +721,90 @@ def run_worker(
     return WorkerRunResult(diagnostics, hovers, worker_error, checked_functions, skipped_functions)
 
 
+def _run_worker_entries(
+    entries: Sequence[RunEntry],
+    config: Config,
+    *,
+    cancel: threading.Event | None = None,
+    on_proc: Callable[[subprocess.Popen[str]], None] | None = None,
+) -> tuple[list[Diagnostic], list[RunStatus], str | None]:
+    by_spec = {entry.spec: entry for entry in entries}
+    job = {
+        "mode": "run",
+        "entries": [
+            {
+                "path": str(Path(e.path).resolve()),
+                "func": e.func,
+                "args": list(e.args),
+                "spec": e.spec,
+            }
+            for e in entries
+        ],
+        "path_map": [list(pair) for pair in config.path_map],
+        "allow_effects": config.allow_effects,
+        "root": str(Path(config.root).resolve()),
+        "protect_roots": [str(Path(config.root).resolve())],
+        "stream": True,
+    }
+    try:
+        proc = _spawn_worker(config)
+    except OSError as exc:
+        return [], [], f"could not start {config.interpreter}: {exc}"
+    if on_proc is not None:
+        on_proc(proc)
+    # A run's limit is wall-clock per entry: only a new entry resets it, never
+    # a heartbeat, so a hung script still times out.
+    lines, stderr, timed_out = _communicate(
+        proc, json.dumps(job), config.run_timeout, cancel, reset_events=("entry_start",)
+    )
+    if not timed_out and proc.poll() is None:
+        _finish(proc)
+
+    diagnostics: list[Diagnostic] = []
+    statuses: list[RunStatus] = []
+    beats: dict[str, tuple[str | None, int | None]] = {}
+    current: str | None = None
+    error: str | None = None
+    for line in lines:
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = msg.get("event")
+        if event == "entry_start":
+            current = msg.get("entry")
+        elif event == "diagnostic":
+            diagnostics.append(Diagnostic.from_json(msg["diagnostic"]))
+        elif event == "heartbeat":
+            beats[msg.get("entry")] = (msg.get("path"), msg.get("line"))
+        elif event == "entry_result":
+            statuses.append(RunStatus.from_json(msg["status"]))
+        elif "error" in msg:
+            error = msg["error"]
+
+    finished = {status.entry for status in statuses}
+    if timed_out and current is not None and current not in finished:
+        path, beat_line = beats.get(current, (None, None))
+        where = f" at line {beat_line + 1}" if beat_line is not None else ""
+        message = f"the run timed out after {config.run_timeout:g}s{where}"
+        entry_path = by_spec[current].path if current in by_spec else (path or "")
+        diagnostics.append(
+            Diagnostic(
+                path=path or entry_path,
+                line=beat_line or 0,
+                column=0,
+                rule="run-stopped",
+                severity=RULES["run-stopped"].severity,
+                message=message,
+            )
+        )
+        statuses.append(RunStatus(current, "timeout", path or entry_path, beat_line, message))
+    elif not lines and error is None:
+        detail = (stderr or "").strip().splitlines()
+        error = f"the worker produced no output ({detail[-1] if detail else proc.returncode})"
+    return diagnostics, statuses, error
+
+
 def apply_suppressions(
     diagnostics: list[Diagnostic], suppressions: list[Suppression]
 ) -> list[Diagnostic]:
@@ -680,6 +836,8 @@ def check_paths(
     *,
     cancel: threading.Event | None = None,
     on_proc: Callable[[subprocess.Popen[str]], None] | None = None,
+    run: Sequence[RunEntry] = (),
+    trace: bool = True,
 ) -> Report:
     report = Report()
     sources = sources or {}
@@ -707,7 +865,10 @@ def check_paths(
     traceable: list[str] = []
     for path, scan in scans.items():
         report.checked_files += 1
-        report.diagnostics.extend(lint_scan(scan, config))
+        found = lint_scan(scan, config)
+        if not trace:
+            found = [d for d in found if d.rule != "missing-annotation"]
+        report.diagnostics.extend(found)
         needs_trace = any(t.has_array_annotation for t in scan.targets) or any(
             c.all_attributes for c in scan.classes
         )
@@ -716,7 +877,7 @@ def check_paths(
         elif scan.syntax_error is not None:
             report.skipped_functions += sum(1 for t in scan.targets if t.has_array_annotation)
 
-    if traceable:
+    if trace and traceable:
         worker_res = run_worker(traceable, config, sources, hover, cancel=cancel, on_proc=on_proc)
         traced, hovers, error = worker_res
         report.diagnostics.extend(traced)
@@ -725,18 +886,72 @@ def check_paths(
         report.checked_functions += worker_res.checked_functions
         report.skipped_functions += worker_res.skipped_functions
 
+    extra_scans: dict[str, FileScan] = {}
+    if run:
+        checked = [Path(p).resolve() for p in paths]
+        selected = [
+            e
+            for e in run
+            if not checked
+            or any(
+                Path(e.path).resolve().is_relative_to(c) or Path(e.path).resolve() == c
+                for c in checked
+            )
+        ]
+        runnable: list[RunEntry] = []
+        for entry in selected:
+            problem = entry_problem(entry)
+            if problem is not None:
+                report.diagnostics.append(problem)
+                report.run_status.append(
+                    RunStatus(entry.spec, "skipped", problem.path, problem.line, problem.message)
+                )
+            else:
+                runnable.append(entry)
+        if runnable:
+            found, statuses, error = _run_worker_entries(
+                runnable, config, cancel=cancel, on_proc=on_proc
+            )
+            # Diagnostics come back absolute; key them like the caller's paths
+            # so the entry file's suppressions see them.
+            absolute = {str(Path(p).resolve()): p for p in [*paths, *(e.path for e in runnable)]}
+            for diagnostic in found:
+                diagnostic.path = absolute.get(
+                    str(Path(diagnostic.path).resolve()), diagnostic.path
+                )
+            report.diagnostics.extend(found)
+            report.run_status.extend(statuses)
+            report.worker_error = report.worker_error or error
+        traced_lines = {
+            (str(Path(d.path).resolve()), d.line)
+            for d in report.diagnostics
+            if d.rule == "trace-error"
+        }
+        report.diagnostics = [
+            d
+            for d in report.diagnostics
+            if not (d.rule == "run-error" and (str(Path(d.path).resolve()), d.line) in traced_lines)
+        ]
+        for diagnostic in report.diagnostics:
+            if diagnostic.path not in scans and diagnostic.path.endswith(".py"):
+                with contextlib.suppress(OSError, UnicodeDecodeError):
+                    text = Path(diagnostic.path).read_text(encoding="utf-8")
+                    extra_scans[diagnostic.path] = scan_source(text, diagnostic.path)
+
     per_file: dict[str, list[Diagnostic]] = {}
     for diagnostic in report.diagnostics:
         per_file.setdefault(diagnostic.path, []).append(diagnostic)
 
     final: list[Diagnostic] = []
-    for path in {*per_file, *scans}:
+    for path in {*per_file, *scans, *extra_scans}:
         items = per_file.get(path, [])
-        scan = scans.get(path)
+        scan = scans.get(path) or extra_scans.get(path)
         if scan is None:
             final.extend(items)
             continue
         final.extend(apply_suppressions(items, scan.suppressions))
+        if path not in scans:
+            continue
         for suppression in scan.suppressions:
             if not suppression.used and suppression.rules is not None:
                 final.append(

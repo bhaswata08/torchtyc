@@ -192,3 +192,29 @@ def test_model_output_hint(tmp_path):
     (d,) = diagnostics
     assert "`out` is a CausalLMOutput, not a tensor" in d["hint"]
     assert "out.logits" in d["hint"]
+
+
+def test_keyerror_entry_result(tmp_path):
+    source = 'def main():\n    raise KeyError("entry_result")\n'
+    diagnostics, status, events = run(tmp_path, source)
+    assert len(diagnostics) == 1
+    assert [e["event"] for e in events].count("entry_result") == 1
+    assert status["state"] == "error"
+
+
+def test_no_heartbeat_after_entry_result(tmp_path):
+    source = "import time\ndef main():\n    time.sleep(1.5)\n"
+    _, status, events = run(tmp_path, source)
+    assert status["state"] == "completed"
+    entry_result_idx = next(i for i, e in enumerate(events) if e.get("event") == "entry_result")
+    heartbeats = [i for i, e in enumerate(events) if e.get("event") == "heartbeat"]
+    assert heartbeats
+    assert all(i < entry_result_idx for i in heartbeats)
+
+
+def test_import_from_path_resolves(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "mod_rel.py").write_text("VALUE = 123\n")
+    mod = worker.import_from_path(Path("mod_rel.py"))
+    assert mod.VALUE == 123
+    assert Path(mod.__file__).is_absolute()

@@ -199,6 +199,7 @@ def import_from_path(path: Path, source: str | None = None) -> Any:
     relative imports still resolve and a traceback still points at the real
     path. That is what lets the editor check a buffer before it is saved.
     """
+    path = path.resolve()
     root, dotted = _module_name(path)
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
@@ -1351,6 +1352,7 @@ def run_entry(entry: dict[str, Any], job: dict[str, Any], emit: Any) -> dict[str
             )
 
     heartbeat = threading.Thread(target=beat, name="torchtyc-heartbeat", daemon=True)
+    started = False
     try:
         with (
             active_guard(enabled=False, protect=job.get("protect_roots") or [str(root)]),
@@ -1358,6 +1360,7 @@ def run_entry(entry: dict[str, Any], job: dict[str, Any], emit: Any) -> dict[str
             metaruntime.install(job.get("path_map", ())) as state,
         ):
             heartbeat.start()
+            started = True
             try:
                 sys.argv = [path, *entry.get("args", [])]
                 if entry.get("func"):
@@ -1387,6 +1390,8 @@ def run_entry(entry: dict[str, Any], job: dict[str, Any], emit: Any) -> dict[str
             )
     finally:
         stop.set()
+        if started:
+            heartbeat.join(timeout=_HEARTBEAT_SECONDS)
         sys.argv = saved_argv
         sys.path[:] = saved_path
     return status
@@ -1436,7 +1441,13 @@ def _run_entry_in_child(entry: dict[str, Any], job: dict[str, Any], channel: Any
         for line in stream:
             channel.write(line)
             channel.flush()
-            finished = finished or '"entry_result"' in line
+            if not finished:
+                try:
+                    msg = json.loads(line)
+                    if isinstance(msg, dict) and msg.get("event") == "entry_result":
+                        finished = True
+                except (json.JSONDecodeError, ValueError):
+                    pass
     _, wait_status = os.waitpid(pid, 0)
     if not finished:
         detail = (
