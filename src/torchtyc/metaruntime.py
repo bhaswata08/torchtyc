@@ -12,11 +12,12 @@ Every patch `install()` applies is recorded and taken back out on exit.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePath
-from typing import Any
+from typing import Any, Self
 
 import torch
 from torch.overrides import TorchFunctionMode
@@ -95,12 +96,18 @@ def is_meta_value_error(exc: BaseException) -> bool:
 def from_loader(exc: BaseException) -> bool:
     """Whether the exception, or one it was raised from, left a patched loader."""
     seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
         if getattr(current, "_torchtyc_loader", False):
             return True
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if current.__context__ is not None:
+            stack.append(current.__context__)
     return False
 
 
@@ -238,7 +245,12 @@ class _MetaDispatchMode(TorchDispatchMode):
         name = func._schema.name
         if _reads_values(func, name, args, kwargs):
             raise MetaValueRead(_short(name))
-        if name.startswith("aten::index_put") and len(args) > 1 and _has_mask(args[1]):
+        if (
+            _is_meta(args[0])
+            and name.startswith("aten::index_put")
+            and len(args) > 1
+            and _has_mask(args[1])
+        ):
             # Assigning through a mask keeps the target's shape, which is all
             # the run needs; which elements it touches depends on values.
             return args[0] if name.endswith("_") else args[0].clone()
@@ -251,6 +263,188 @@ class _MetaDispatchMode(TorchDispatchMode):
             if is_meta_value_error(exc):
                 raise MetaValueRead(_short(name)) from exc
             raise Unsupported(f"torch has no meta kernel for {_short(name)}") from exc
+
+
+_GIB = 1 << 30
+
+
+@dataclass(frozen=True)
+class _FakeDeviceProperties:
+    name: str = "torchtyc meta device"
+    major: int = 9
+    minor: int = 0
+    total_memory: int = 80 * _GIB
+    multi_processor_count: int = 132
+    is_integrated: bool = False
+    is_multi_gpu_board: bool = False
+    warp_size: int = 32
+
+
+_PROPS = _FakeDeviceProperties()
+
+
+class _FakeEvent:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def record(self, stream: Any = None) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        pass
+
+    def wait(self, stream: Any = None) -> None:
+        pass
+
+    def query(self) -> bool:
+        return True
+
+    def elapsed_time(self, other: Any) -> float:
+        return 0.0
+
+
+class _FakeStream:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def synchronize(self) -> None:
+        pass
+
+    def wait_stream(self, stream: Any) -> None:
+        pass
+
+    def wait_event(self, event: Any) -> None:
+        pass
+
+    def record_event(self, event: Any = None) -> Any:
+        return event or _FakeEvent()
+
+    def query(self) -> bool:
+        return True
+
+
+def _nothing(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _cuda_stubs() -> dict[str, Any]:
+    stubs: dict[str, Any] = {
+        "is_available": lambda: True,
+        "is_initialized": lambda: True,
+        "is_bf16_supported": lambda *a, **k: True,
+        "is_current_stream_capturing": lambda: False,
+        "device_count": lambda: 1,
+        "current_device": lambda: 0,
+        "get_device_name": lambda device=None: _PROPS.name,
+        "get_device_capability": lambda device=None: (_PROPS.major, _PROPS.minor),
+        "get_device_properties": lambda device=None: _PROPS,
+        "mem_get_info": lambda device=None: (_PROPS.total_memory, _PROPS.total_memory),
+        "memory_allocated": lambda device=None: 0,
+        "max_memory_allocated": lambda device=None: 0,
+        "memory_reserved": lambda device=None: 0,
+        "max_memory_reserved": lambda device=None: 0,
+        "current_stream": lambda device=None: _FakeStream(),
+        "default_stream": lambda device=None: _FakeStream(),
+        "stream": lambda stream=None: contextlib.nullcontext(stream),
+        "device": lambda device=None: contextlib.nullcontext(),
+        "get_rng_state": lambda device="cuda": torch.zeros(16, dtype=torch.uint8),
+        "Stream": _FakeStream,
+        "Event": _FakeEvent,
+    }
+    for name in (
+        "init",
+        "set_device",
+        "synchronize",
+        "empty_cache",
+        "ipc_collect",
+        "reset_peak_memory_stats",
+        "reset_max_memory_allocated",
+        "set_per_process_memory_fraction",
+        "manual_seed",
+        "manual_seed_all",
+        "seed",
+        "seed_all",
+        "set_rng_state",
+        "set_rng_state_all",
+    ):
+        stubs[name] = lambda *args, **kwargs: None
+    return stubs
+
+
+def _unstubbed_cuda(name: str) -> Any:
+    if name.startswith(("is_", "has_")):
+        # A capability probe that answers "no" sends code down its portable path.
+        def probe(*args: Any, **kwargs: Any) -> bool:
+            return False
+
+        return probe
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise Unsupported(f"`torch.cuda.{name}` needs a real CUDA device")
+
+    return refuse
+
+
+def _patch_cuda(patches: _Patches) -> None:
+    """Make CUDA look present, the same way on every machine."""
+    stubs = _cuda_stubs()
+    for name, value in list(vars(torch.cuda).items()):
+        if name.startswith("_") or name in stubs:
+            continue
+        if (inspect.isfunction(value) or inspect.isbuiltin(value)) and str(
+            getattr(value, "__module__", "")
+        ).startswith("torch.cuda"):
+            patches.set(torch.cuda, name, _unstubbed_cuda(name))
+    for name, value in stubs.items():
+        patches.set(torch.cuda, name, value)
+
+
+def _no_compile(model: Any = None, *args: Any, **kwargs: Any) -> Any:
+    if model is None:
+        return lambda fn: fn
+    return model
+
+
+def _patch_compile(patches: _Patches, state: RunState) -> None:
+    patches.set(torch, "compile", _no_compile)
+    if "compile" in vars(torch.nn.Module):
+        patches.set(torch.nn.Module, "compile", lambda self, *args, **kwargs: None)
+    state.active.append("torch.compile (runs uncompiled)")
+
+
+def _patch_autocast(patches: _Patches) -> None:
+    _real_autocast = torch.autocast
+
+    class _MetaAutocast(_real_autocast):
+        def __init__(self, device_type: str, *args: Any, **kwargs: Any) -> None:
+            self._skip = device_type == "meta"
+            if not self._skip:
+                super().__init__(device_type, *args, **kwargs)
+
+        def __enter__(self) -> Any:
+            if self._skip:
+                return None
+            return super().__enter__()
+
+        def __exit__(self, *exc: object) -> Any:
+            if self._skip:
+                return None
+            return super().__exit__(*exc)
+
+        def __call__(self, fn: Any) -> Any:
+            if self._skip:
+                return fn
+            return super().__call__(fn)
+
+    patches.set(torch, "autocast", _MetaAutocast)
+    if "autocast" in vars(torch.amp) and vars(torch.amp)["autocast"] is _real_autocast:
+        patches.set(torch.amp, "autocast", _MetaAutocast)
 
 
 @contextlib.contextmanager
@@ -270,6 +464,9 @@ def install(path_map: Sequence[Sequence[str]] = (), *, hf_flags: bool = True) ->
     STATE = state
     try:
         torch.set_default_device(META)
+        _patch_cuda(patches)
+        _patch_compile(patches, state)
+        _patch_autocast(patches)
         with _DeviceMode(), _MetaDispatchMode():
             yield state
     finally:
@@ -322,7 +519,7 @@ def classify(exc: BaseException) -> Outcome:
             f"writes and network are blocked during a run ({blocked.message})",
             "stopped",
         )
-    if isinstance(exc, FileNotFoundError) or (isinstance(exc, OSError) and from_loader(exc)):
+    if isinstance(exc, FileNotFoundError) or from_loader(exc):
         return Outcome("run-stopped", f"missing input: {exc}", "stopped")
     text = str(exc)
     if any(message in text for message in _NO_CUDA_MESSAGES):

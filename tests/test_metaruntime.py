@@ -17,6 +17,7 @@ def _patch_targets():
     return (
         torch.load,
         torch.compile,
+        torch.autocast,
         torch.cuda.is_available,
         torch.cuda.memory_summary,
         builtins.open,
@@ -172,3 +173,98 @@ def test_classify_oserror_from_loader_is_stopped():
     exc._torchtyc_loader = True
     assert classify(exc).rule == "run-stopped"
     assert classify(OSError("disk on fire")).rule == "run-error"
+
+
+def test_cuda_looks_present(runtime):
+    assert torch.cuda.is_available()
+    assert torch.cuda.device_count() == 1
+    assert torch.cuda.current_device() == 0
+    assert torch.cuda.get_device_capability() == (9, 0)
+    assert torch.cuda.is_bf16_supported()
+    assert torch.cuda.get_device_properties(0).total_memory == 80 * (1 << 30)
+    assert torch.cuda.mem_get_info()[0] == 80 * (1 << 30)
+    torch.cuda.set_device(0)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.manual_seed_all(0)
+    with torch.cuda.stream(torch.cuda.Stream()):
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+    assert torch.cuda.current_stream().query()
+    assert torch.cuda.is_current_stream_capturing() is False
+
+
+def test_unstubbed_cuda_calls_are_unsupported(runtime):
+    with pytest.raises(Unsupported):
+        torch.cuda.memory_summary()
+
+
+def test_unstubbed_cuda_probes_answer_no():
+    import inspect
+
+    probes = {
+        name
+        for name, value in vars(torch.cuda).items()
+        if name.startswith("is_")
+        and (inspect.isfunction(value) or inspect.isbuiltin(value))
+        and str(getattr(value, "__module__", "")).startswith("torch.cuda")
+    }
+    stubbed = {"is_available", "is_bf16_supported", "is_initialized", "is_current_stream_capturing"}
+    with metaruntime.install():
+        for name in probes - stubbed:
+            assert getattr(torch.cuda, name)() is False
+
+
+def test_cuda_is_restored():
+    real = torch.cuda.is_available
+    with metaruntime.install():
+        assert torch.cuda.is_available is not real
+    assert torch.cuda.is_available is real
+
+
+def test_torch_compile_runs_uncompiled(runtime):
+    def f(x):
+        return x * 2
+
+    assert torch.compile(f) is f
+    assert torch.compile(mode="max-autotune")(f) is f
+    model = torch.nn.Linear(2, 2)
+    assert torch.compile(model) is model
+    assert any("torch.compile" in item for item in runtime.active)
+
+
+def test_autocast_meta_is_noop(runtime):
+    with torch.autocast(device_type="meta", enabled=False):
+        y = torch.empty(2, 3) @ torch.empty(3, 4)
+    assert y.shape == (2, 4)
+    with torch.amp.autocast("meta"):
+        pass
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        pass
+
+
+def test_autocast_is_restored():
+    real = torch.autocast
+    with metaruntime.install():
+        assert torch.autocast is not real
+    assert torch.autocast is real
+
+
+def test_from_loader_walks_both_cause_and_context():
+    state = metaruntime.RunState()
+    with pytest.raises(RuntimeError) as info:
+        try:
+            with state.loading():
+                raise OSError("missing weights")
+        except OSError:
+            raise RuntimeError("bad config") from KeyError("x")
+    exc = info.value
+    assert metaruntime.from_loader(exc)
+    assert classify(exc).rule == "run-stopped"
+
+
+def test_masked_index_put_cpu(runtime):
+    cpu = torch.ones(4, device="cpu")
+    cpu[cpu > 0] = 0.0
+    assert cpu.is_meta
+    assert cpu.shape == (4,)
