@@ -163,7 +163,7 @@ trace pass.
 | `MetaValueRead` (dispatch mode, Python-level patches, or recognised meta value-read message) | `run-stopped`: needs a value | info |
 | `FileNotFoundError`, from any loader, after `path-map` | `run-stopped`: missing input, with the mapped path | info |
 | `BlockedEffect` while a patched loader is on the stack (loaders set a context flag) | `run-stopped`: not cached locally, needs network | info |
-| `BlockedEffect` anywhere else | the existing blocked-effect diagnostic | as today |
+| `BlockedEffect` anywhere else (a write, a network call or a process spawn in user code) | `run-stopped`: writes and network are blocked during a run, with the blocked target | info |
 | `Unsupported` (an unstubbed `torch.cuda` call) or `NotImplementedError` from a meta kernel | `run-unsupported` | warning |
 | `SystemExit(0)` / `SystemExit(≠0)` | completes / `run-stopped` | — / info |
 | Wall-clock timeout | `run-stopped`: timed out at line N; earlier diagnostics kept | info |
