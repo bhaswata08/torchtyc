@@ -145,3 +145,20 @@ def test_run_error_on_trace_error_line_is_dropped(project):
     report = check_paths([str(path)], config, run=[RunEntry(str(path), "main")])
     rules = [d.rule for d in report.diagnostics if d.line == 6]
     assert rules == ["trace-error"]
+
+
+def test_got_line_names_axes(project):
+    source = """
+    import torch
+    from einops import rearrange
+
+    def main():
+        ids = rearrange(torch.zeros(113, dtype=torch.long), "seq_len -> 1 seq_len")
+        logits = torch.empty(1, 113, 1000)
+        rearrange(logits, "1 seq_len -> seq_len")
+    """
+    path, config = project(source)
+    report = run(path, config)
+    (d,) = report.diagnostics
+    assert d.got == "logits (1, 113 (seq_len?), 1000)"
+    assert d.hint == "the pattern names 2 axes but the tensor has 3"

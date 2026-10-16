@@ -502,3 +502,36 @@ def test_mask_path_canary(tmp_path):
     off = {attn: _masked_forward(path, attn, hf_flags=False) for attn in ("eager", "sdpa")}
     assert on == {"eager": "completed", "sdpa": "completed"}
     assert "run-stopped" in off.values()
+
+
+def test_labels():
+    state = metaruntime.RunState()
+    state.model_config = {
+        "vocab_size": 250624,
+        "hidden_size": 2560,
+        "intermediate_size": 2560 * 4,
+        "num_kv": 8,
+    }
+    state.bind_einops("seq_len -> 1 seq_len", (113,))
+    assert state.label(250624) == "250624 (vocab_size?)"
+    assert state.label(113) == "113 (seq_len?)"
+    assert state.label(8) == "8"  # config labels need >= 128
+    assert state.render_shape((1, 113, 250624)) == "(1, 113 (seq_len?), 250624 (vocab_size?))"
+    state.model_config["other"] = 2560
+    assert state.label(2560) == "2560"  # two config keys: ambiguous, left bare
+    assert state.label(226) == "226"  # never factored into seq_len*2
+
+
+def test_einops_axis_with_two_sizes_is_not_a_label():
+    state = metaruntime.RunState()
+    state.bind_einops("b n -> n b", (2, 113))
+    state.bind_einops("b n -> n b", (2, 226))
+    assert state.label(113) == "113"
+
+
+def test_einops_calls_are_recorded():
+    with metaruntime.install() as state:
+        from einops import rearrange
+
+        rearrange(torch.empty(113), "seq_len -> 1 seq_len")
+    assert state.einops_axes == {"seq_len": {113}}

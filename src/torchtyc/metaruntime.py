@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import builtins
 import contextlib
+import functools
 import importlib.abc
 import importlib.util
 import inspect
@@ -150,8 +151,32 @@ class RunState:
     # einops axis -> every size it was bound to during the run.
     einops_axes: dict[str, set[int]] = field(default_factory=dict)
 
+    def bind_einops(self, pattern: str, shape: tuple[int, ...]) -> None:
+        left = pattern.split("->", 1)[0].split()
+        if len(left) != len(shape) or not all(axis.isidentifier() for axis in left):
+            return
+        for axis, size in zip(left, shape):
+            self.einops_axes.setdefault(axis, set()).add(int(size))
+
+    def label(self, size: int) -> str:
+        """A hedged name for a size, only when exactly one source gives one.
+
+        The number is always printed, so a wrong label cannot hide the value.
+        """
+        names: set[str] = set()
+        if size >= 128:
+            keys = [key for key, value in self.model_config.items() if value == size]
+            if len(keys) > 1:
+                return str(size)
+            names.update(keys)
+        axes = [axis for axis, sizes in self.einops_axes.items() if sizes == {size}]
+        if len(axes) > 1:
+            return str(size)
+        names.update(axes)
+        return f"{size} ({names.pop()}?)" if len(names) == 1 else str(size)
+
     def render_shape(self, shape: tuple[int, ...]) -> str:
-        return "(" + ", ".join(str(s) for s in shape) + ")"
+        return "(" + ", ".join(self.label(int(size)) for size in shape) + ")"
 
     def remap(self, path: Any) -> Any:
         if not self.path_map or not isinstance(path, (str, bytes, os.PathLike)):
@@ -811,11 +836,29 @@ def _patch_import_utils(patches: _Patches, state: RunState, module: ModuleType) 
         state.active.append("transformers is_torchdynamo_compiling (compile-safe paths)")
 
 
+def _patch_einops(patches: _Patches, state: RunState, module: ModuleType) -> None:
+    for name in ("rearrange", "reduce", "repeat"):
+        real = vars(module).get(name)
+        if real is None:
+            continue
+
+        @functools.wraps(real)
+        def recording(
+            tensor: Any, pattern: Any, *args: Any, _real: Any = real, **kwargs: Any
+        ) -> Any:
+            if isinstance(tensor, torch.Tensor) and isinstance(pattern, str):
+                state.bind_einops(pattern, tuple(tensor.shape))
+            return _real(tensor, pattern, *args, **kwargs)
+
+        patches.set(module, name, recording)
+
+
 def _register_library_patches(
     hook: _ImportHook, patches: _Patches, state: RunState, hf_flags: bool
 ) -> None:
     hook.on_import("safetensors", lambda m: _patch_safetensors(patches, m))
     hook.on_import("safetensors.torch", lambda m: _patch_safetensors_torch(patches, m))
+    hook.on_import("einops", lambda m: _patch_einops(patches, state, m))
     hook.on_import(
         "transformers.models.auto.auto_factory", lambda m: _patch_auto_factory(patches, m)
     )
