@@ -13,9 +13,11 @@ one JSON result on stdout. It lives in a separate process for three reasons:
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import json
 import linecache
 import os
@@ -177,6 +179,18 @@ def _clear_linecache(paths: Iterable[Path | str]) -> None:
             pass
 
 
+def _module_name(path: Path) -> tuple[Path, str]:
+    """The sys.path root and dotted name a file imports under, packages included."""
+    path = path.resolve()
+    root = path.parent
+    # `pkg/__init__.py` is the module `pkg`, not `pkg.__init__`.
+    parts = [] if path.stem == "__init__" else [path.stem]
+    while (root / "__init__.py").exists():
+        parts.append(root.name)
+        root = root.parent
+    return root, ".".join(reversed(parts))
+
+
 def import_from_path(path: Path, source: str | None = None) -> Any:
     """Import a file as part of its package, so relative imports resolve.
 
@@ -185,16 +199,7 @@ def import_from_path(path: Path, source: str | None = None) -> Any:
     relative imports still resolve and a traceback still points at the real
     path. That is what lets the editor check a buffer before it is saved.
     """
-    path = path.resolve()
-    root = path.parent
-    # `pkg/__init__.py` is the module `pkg`, not `pkg.__init__`: importing the
-    # latter runs the package body a second time under a second name.
-    parts = [] if path.stem == "__init__" else [path.stem]
-    while (root / "__init__.py").exists():
-        parts.append(root.name)
-        root = root.parent
-
-    dotted = ".".join(reversed(parts))
+    root, dotted = _module_name(path)
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
@@ -1169,7 +1174,322 @@ def _run_file_in_child(path: str, job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_TORCHTYC_DIR = Path(__file__).resolve().parent
+_HEARTBEAT_SECONDS = 1.0
+_EINOPS_RANK = re.compile(r"expected (\d+) dims\. Received (\d+)-dim tensor")
+
+
+def _is_project_file(filename: str | None, root: Path) -> bool:
+    if not filename or filename.startswith("<"):
+        return False
+    try:
+        path = Path(filename).resolve()
+    except (OSError, ValueError):
+        return False
+    if not path.is_relative_to(root) or path.is_relative_to(_TORCHTYC_DIR):
+        return False
+    return not is_system_path(path)
+
+
+def _deepest_project_line(frame: Any, root: Path) -> tuple[str, int] | None:
+    while frame is not None:
+        if _is_project_file(frame.f_code.co_filename, root):
+            return frame.f_code.co_filename, frame.f_lineno - 1
+        frame = frame.f_back
+    return None
+
+
+def _run_as_main(path: Path) -> None:
+    import runpy
+
+    top, dotted = _module_name(path)
+    if "." in dotted:
+        if str(top) not in sys.path:
+            sys.path.insert(0, str(top))
+        runpy.run_module(dotted, run_name="__main__", alter_sys=True)
+    else:
+        sys.path.insert(0, str(path.parent))
+        runpy.run_path(str(path), run_name="__main__")
+
+
+def _names_on_line(statement: str | None) -> list[str]:
+    if not statement:
+        return []
+    try:
+        tree = ast.parse(statement.strip())
+    except SyntaxError:
+        return []
+    seen: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id not in seen:
+            seen.append(node.id)
+    return seen
+
+
+def _is_model_output(value: Any) -> bool:
+    return any(cls.__name__ == "ModelOutput" for cls in type(value).__mro__)
+
+
+def _run_got(frame: Any, statement: str | None, state: Any) -> str | None:
+    parts: list[str] = []
+    for name in _names_on_line(statement):
+        value = frame.f_locals.get(name) if frame is not None else None
+        if isinstance(value, torch.Tensor):
+            parts.append(f"{name} {state.render_shape(tuple(value.shape))}")
+        elif value is not None and _is_model_output(value):
+            parts.append(f"{name} {type(value).__name__}")
+    return "; ".join(parts) or None
+
+
+def _run_hint(exc: BaseException, frame: Any, statement: str | None) -> str | None:
+    for name in _names_on_line(statement):
+        value = frame.f_locals.get(name) if frame is not None else None
+        if value is not None and _is_model_output(value):
+            hint = f"`{name}` is a {type(value).__name__}, not a tensor"
+            if getattr(value, "logits", None) is not None:
+                hint += f"; did you mean `{name}.logits`?"
+            return hint
+    match = _EINOPS_RANK.search(str(exc))
+    if match:
+        return f"the pattern names {match[1]} axes but the tensor has {match[2]}"
+    return None
+
+
+def _callee(frames: list[traceback.FrameSummary], index: int) -> str | None:
+    """The function the user's line called, skipping torchtyc's own wrappers.
+
+    The einops recorder sits between the user's `rearrange(...)` and einops,
+    and its frame must not name the call.
+    """
+    for summary in frames[index + 1 :]:
+        try:
+            if Path(summary.filename).resolve().is_relative_to(_TORCHTYC_DIR):
+                continue
+        except (OSError, ValueError):
+            pass
+        if summary.name.startswith("_") or summary.name == "<module>":
+            return None
+        return summary.name
+    return None
+
+
+def _run_diagnostic(
+    exc: BaseException, outcome: Any, entry_path: str, root: Path, state: Any
+) -> Diagnostic:
+    summaries = traceback.extract_tb(exc.__traceback__)
+    frames = _live_frames(exc)
+    mine = [i for i, s in enumerate(summaries) if _is_project_file(s.filename, root)]
+    path, line, column, end_line, end_column = entry_path, 0, 0, 0, 1
+    frame = statement = None
+    if isinstance(exc, SyntaxError) and exc.filename and _is_project_file(exc.filename, root):
+        path, line = exc.filename, max((exc.lineno or 1) - 1, 0)
+        column, end_line, end_column = max((exc.offset or 1) - 1, 0), line, max(exc.offset or 1, 1)
+    elif mine:
+        chosen = summaries[mine[-1]]
+        frame, statement = frames[mine[-1]], chosen.line
+        path, line = chosen.filename, chosen.lineno - 1
+        end_line = (chosen.end_lineno or chosen.lineno) - 1
+        if chosen.colno is not None and chosen.end_colno is not None:
+            column, end_column = chosen.colno, chosen.end_colno
+        else:
+            end_column = len(chosen.line or "") or 1
+    via = " → ".join(f"{summaries[i].name} (line {summaries[i].lineno})" for i in mine) or None
+    if outcome.rule == "run-error":
+        last = (str(exc).strip().splitlines() or [""])[-1]
+        callee = _callee(summaries, mine[-1]) if mine else None
+        head = f"`{callee}` raised" if callee else "raised"
+        message = f"{head} {type(exc).__name__}: {last}" if last else f"{head} {type(exc).__name__}"
+    else:
+        message = outcome.reason
+    return Diagnostic(
+        path=path,
+        line=line,
+        column=column,
+        end_line=end_line,
+        end_column=end_column,
+        rule=outcome.rule,
+        severity=_severity(outcome.rule),
+        message=message,
+        got=_run_got(frame, statement, state) if outcome.rule == "run-error" else None,
+        hint=_run_hint(exc, frame, statement) if outcome.rule == "run-error" else None,
+        via=via,
+        traceback="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    )
+
+
+def run_entry(entry: dict[str, Any], job: dict[str, Any], emit: Any) -> dict[str, Any]:
+    """Run one entry point on meta, emitting diagnostics as they are found."""
+    _ensure_initialized()
+    from . import metaruntime
+
+    path = entry["path"]
+    root = Path(job["root"]).resolve()
+    status: dict[str, Any] = {
+        "entry": entry["spec"],
+        "state": "completed",
+        "path": None,
+        "line": None,
+        "reason": None,
+        "active": [],
+        "inactive": [],
+        "ignored": [],
+    }
+    saved_argv, saved_path = list(sys.argv), list(sys.path)
+    main_ident = threading.get_ident()
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(_HEARTBEAT_SECONDS):
+            where = _deepest_project_line(sys._current_frames().get(main_ident), root)
+            emit(
+                {
+                    "event": "heartbeat",
+                    "entry": entry["spec"],
+                    "path": where[0] if where else None,
+                    "line": where[1] if where else None,
+                }
+            )
+
+    heartbeat = threading.Thread(target=beat, name="torchtyc-heartbeat", daemon=True)
+    try:
+        with (
+            active_guard(enabled=False, protect=job.get("protect_roots") or [str(root)]),
+            active_guard(enabled=not job.get("allow_effects", False), phase="run"),
+            metaruntime.install(job.get("path_map", ())) as state,
+        ):
+            heartbeat.start()
+            try:
+                sys.argv = [path, *entry.get("args", [])]
+                if entry.get("func"):
+                    module = import_from_path(Path(path))
+                    result = getattr(module, entry["func"])()
+                    if inspect.iscoroutine(result):
+                        asyncio.run(result)
+                else:
+                    _run_as_main(Path(path))
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:  # noqa: BLE001
+                outcome = metaruntime.classify(exc)
+                status["state"] = outcome.state
+                if outcome.rule is not None:
+                    diagnostic = _run_diagnostic(exc, outcome, path, root, state)
+                    emit({"event": "diagnostic", "diagnostic": diagnostic.to_json()})
+                    status.update(
+                        path=diagnostic.path,
+                        line=diagnostic.line,
+                        reason=outcome.reason or None,
+                    )
+            status.update(
+                active=list(state.active),
+                inactive=list(state.inactive),
+                ignored=sorted(state.ignored),
+            )
+    finally:
+        stop.set()
+        sys.argv = saved_argv
+        sys.path[:] = saved_path
+    return status
+
+
+def _run_entry_in_child(entry: dict[str, Any], job: dict[str, Any], channel: Any) -> None:
+    r_fd, w_fd = os.pipe()
+    for stream in (sys.stdout, sys.stderr, channel):
+        if stream is not None:
+            stream.flush()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        lock = threading.Lock()
+
+        def emit(message: dict[str, Any]) -> None:
+            data = memoryview((json.dumps(message) + "\n").encode("utf-8"))
+            with lock:
+                while data:
+                    data = data[os.write(w_fd, data) :]
+
+        code = 0
+        try:
+            emit({"event": "entry_result", "status": run_entry(entry, job, emit)})
+        except KeyboardInterrupt:
+            code = 130
+        except BaseException as exc:  # noqa: BLE001
+            with contextlib.suppress(Exception):
+                emit(
+                    {
+                        "event": "entry_result",
+                        "status": {
+                            "entry": entry["spec"],
+                            "state": "crashed",
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        },
+                    }
+                )
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(w_fd)
+            os._exit(code)
+
+    os.close(w_fd)
+    finished = False
+    with os.fdopen(r_fd, "r", encoding="utf-8") as stream:
+        for line in stream:
+            channel.write(line)
+            channel.flush()
+            finished = finished or '"entry_result"' in line
+    _, wait_status = os.waitpid(pid, 0)
+    if not finished:
+        detail = (
+            f"signal {os.WTERMSIG(wait_status)}"
+            if os.WIFSIGNALED(wait_status)
+            else f"exit code {os.WEXITSTATUS(wait_status)}"
+        )
+        diagnostic = Diagnostic(
+            path=entry["path"],
+            line=0,
+            column=0,
+            rule="worker-error",
+            severity=_severity("worker-error"),
+            message=f"the run's child process died ({detail})",
+        )
+        channel.write(
+            json.dumps({"event": "diagnostic", "diagnostic": diagnostic.to_json()}) + "\n"
+        )
+        channel.write(
+            json.dumps(
+                {
+                    "event": "entry_result",
+                    "status": {"entry": entry["spec"], "state": "crashed", "reason": detail},
+                }
+            )
+            + "\n"
+        )
+        channel.flush()
+
+
+def _run_entries(job: dict[str, Any], channel: Any) -> dict[str, Any]:
+    _ensure_initialized()
+    channel = channel if channel is not None else sys.stderr
+    lock = threading.Lock()
+
+    def emit(message: dict[str, Any]) -> None:
+        with lock:
+            channel.write(json.dumps(message) + "\n")
+            channel.flush()
+
+    for entry in job["entries"]:
+        emit({"event": "entry_start", "entry": entry["spec"]})
+        if hasattr(os, "fork"):
+            _run_entry_in_child(entry, job, channel)
+        else:
+            emit({"event": "entry_result", "status": run_entry(entry, job, emit)})
+    emit({"event": "done"})
+    return {"diagnostics": [], "hovers": {}, "checked_functions": 0, "skipped_functions": 0}
+
+
 def run_job(job: dict[str, Any], channel: Any = None) -> dict[str, Any]:
+    if job.get("mode") == "run":
+        return _run_entries(job, channel)
     _ensure_initialized()
     diagnostics: list[dict[str, Any]] = []
     hovers: dict[str, dict[str, dict[str, str]]] = {}

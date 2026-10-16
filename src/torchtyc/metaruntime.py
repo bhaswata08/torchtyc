@@ -150,6 +150,9 @@ class RunState:
     # einops axis -> every size it was bound to during the run.
     einops_axes: dict[str, set[int]] = field(default_factory=dict)
 
+    def render_shape(self, shape: tuple[int, ...]) -> str:
+        return "(" + ", ".join(str(s) for s in shape) + ")"
+
     def remap(self, path: Any) -> Any:
         if not self.path_map or not isinstance(path, (str, bytes, os.PathLike)):
             return path
