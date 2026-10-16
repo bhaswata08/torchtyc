@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 import torch
-from hf_models import write_inputs
+from hf_models import (
+    TINY_VOCAB,
+    requires_transformers,
+    write_inputs,
+    write_remote_checkpoint,
+    write_tiny_llama,
+    write_tokenizer,
+)
 
 from torchtyc import metaruntime
 from torchtyc.effects import BlockedEffect
@@ -373,3 +380,124 @@ def test_open_is_restored():
     with metaruntime.install([("/a", "/b")]):
         assert builtins.open is not real
     assert builtins.open is real
+
+
+@requires_transformers
+def test_from_pretrained_builds_on_meta(tmp_path):
+    path = write_tiny_llama(tmp_path / "m")
+    with metaruntime.install() as state:
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            dtype=torch.bfloat16,
+            attn_implementation="eager",
+            device_map="cuda:0",
+            low_cpu_mem_usage=True,
+        )
+        assert all(p.is_meta for p in model.parameters())
+        assert next(model.parameters()).dtype is torch.bfloat16
+        assert not model.training
+        assert {"device_map", "low_cpu_mem_usage"} <= state.ignored
+        assert state.model_config["vocab_size"] == TINY_VOCAB
+
+
+@requires_transformers
+def test_concrete_class_from_pretrained(tmp_path):
+    path = write_tiny_llama(tmp_path / "m")
+    with metaruntime.install():
+        from transformers import LlamaForCausalLM
+
+        model = LlamaForCausalLM.from_pretrained(path, torch_dtype=torch.float16)
+        assert next(model.parameters()).is_meta
+        assert next(model.parameters()).dtype is torch.float16
+
+
+@requires_transformers
+def test_auto_does_not_go_through_concrete_from_pretrained(tmp_path):
+    path = write_tiny_llama(tmp_path / "m")
+    with metaruntime.install():
+        from transformers import AutoModelForCausalLM, PreTrainedModel
+
+        calls = []
+        patched = vars(PreTrainedModel)["from_pretrained"]
+        # Set and restored by hand, inside the install block: a monkeypatch
+        # would put the patched classmethod back after install() removed it.
+        PreTrainedModel.from_pretrained = classmethod(
+            lambda cls, *a, **k: calls.append(1) or patched.__func__(cls, *a, **k)
+        )
+        try:
+            AutoModelForCausalLM.from_pretrained(path)
+        finally:
+            PreTrainedModel.from_pretrained = patched
+        assert calls == []
+
+
+@requires_transformers
+def test_remote_code_with_cold_modules_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_MODULES_CACHE", str(tmp_path / "modules"))
+    path = write_remote_checkpoint(tmp_path / "remote")
+    with metaruntime.install():
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)
+        out = model(input_ids=torch.zeros(1, 7, dtype=torch.long))
+        assert type(out).__name__ == "CausalLMOutputWithPast"
+        assert out.logits.shape == (1, 7, TINY_VOCAB)
+
+
+@requires_transformers
+def test_missing_checkpoint_is_stopped(tmp_path):
+    with metaruntime.install():
+        from transformers import AutoModelForCausalLM
+
+        with pytest.raises(BaseException) as info:
+            AutoModelForCausalLM.from_pretrained(tmp_path / "nowhere")
+    assert metaruntime.classify(info.value).rule == "run-stopped"
+
+
+@requires_transformers
+def test_tokenizer_output_reaches_a_meta_model(tmp_path):
+    model_path = write_tiny_llama(tmp_path / "m")
+    tok_path = write_tokenizer(tmp_path / "t")
+    with metaruntime.install():
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(tok_path)
+        model = AutoModelForCausalLM.from_pretrained(model_path, attn_implementation="eager")
+        batch = tokenizer(["w1 w2 w3", "w4"], return_tensors="pt", padding=True).to("cuda")
+        logits = model(**batch, use_cache=False).logits
+        assert logits.is_meta and logits.shape == (2, 3, TINY_VOCAB)
+
+
+def _masked_forward(path, attn: str, hf_flags: bool) -> str:
+    """Run a masked forward and say how it ended: "completed" or a rule."""
+    with metaruntime.install(hf_flags=hf_flags):
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(path, attn_implementation=attn)
+        ids = torch.zeros(1, 9, dtype=torch.long)
+        mask = torch.ones(1, 9, dtype=torch.long)
+        try:
+            logits = model(input_ids=ids, attention_mask=mask, use_cache=False).logits
+        except BaseException as exc:  # noqa: BLE001
+            return metaruntime.classify(exc).rule or "completed"
+        assert logits.shape == (1, 9, TINY_VOCAB)
+        return "completed"
+
+
+@requires_transformers
+def test_mask_path_canary(tmp_path):
+    """The two transformers flags must still matter.
+
+    With them on, a masked forward completes on every attention
+    implementation. With them off, at least one implementation stops on a
+    value read inside HF's mask code (which one depends on the release: 4.45
+    reads the mask only on the sdpa path). If an upgrade turns the flags into
+    no-ops, the "off" runs stop being different and this fails.
+    """
+    path = write_tiny_llama(tmp_path / "m")
+    on = {attn: _masked_forward(path, attn, hf_flags=True) for attn in ("eager", "sdpa")}
+    off = {attn: _masked_forward(path, attn, hf_flags=False) for attn in ("eager", "sdpa")}
+    assert on == {"eager": "completed", "sdpa": "completed"}
+    assert "run-stopped" in off.values()

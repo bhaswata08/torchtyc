@@ -176,6 +176,10 @@ class RunState:
                 exc._torchtyc_loader = True
             raise
 
+    def remember_config(self, config: Any) -> None:
+        values = config.to_dict() if hasattr(config, "to_dict") else {}
+        self.model_config = {k: v for k, v in values.items() if type(v) is int}
+
 
 STATE: RunState | None = None
 
@@ -190,16 +194,23 @@ class _Patches:
     """Attribute replacements, undone in reverse order."""
 
     def __init__(self) -> None:
-        self._undo: list[tuple[Any, str, bool, Any]] = []
+        self._undo: list[tuple[Any, str, bool, Any] | Callable[[], None]] = []
 
     def set(self, owner: Any, name: str, value: Any) -> None:
         own = vars(owner)
         self._undo.append((owner, name, name in own, own.get(name)))
         setattr(owner, name, value)
 
+    def on_restore(self, callback: Callable[[], None]) -> None:
+        self._undo.append(callback)
+
     def restore(self) -> None:
         while self._undo:
-            owner, name, had, old = self._undo.pop()
+            entry = self._undo.pop()
+            if callable(entry):
+                entry()
+                continue
+            owner, name, had, old = entry
             if had:
                 setattr(owner, name, old)
             else:
@@ -660,11 +671,181 @@ class _ImportHook(importlib.abc.MetaPathFinder):
         return spec
 
 
+_IGNORED_KWARGS = (
+    "device_map",
+    "quantization_config",
+    "low_cpu_mem_usage",
+    "max_memory",
+    "offload_folder",
+    "offload_state_dict",
+    "load_in_8bit",
+    "load_in_4bit",
+    "tp_plan",
+)
+_HUB_KWARGS = (
+    "revision",
+    "subfolder",
+    "cache_dir",
+    "local_files_only",
+    "token",
+    "force_download",
+    "proxies",
+    "code_revision",
+)
+
+
+def _transformers_major() -> int:
+    version = getattr(sys.modules.get("transformers"), "__version__", "5")
+    return int(version.split(".")[0])
+
+
+def _as_dtype(value: Any, config: Any) -> Any:
+    if value == "auto":
+        value = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None)
+    if isinstance(value, str):
+        value = getattr(torch, value, None)
+    return value
+
+
+def _meta_from_pretrained(*, auto: bool) -> Any:
+    def from_pretrained(
+        cls: Any, pretrained_model_name_or_path: Any, *model_args: Any, **kwargs: Any
+    ) -> Any:
+        state = _state()
+        path = state.remap(pretrained_model_name_or_path)
+        trust = kwargs.pop("trust_remote_code", None)
+        dtype = kwargs.pop("dtype", None)
+        torch_dtype = kwargs.pop("torch_dtype", None)
+        dtype = dtype if dtype is not None else torch_dtype
+        attn = kwargs.pop("attn_implementation", None)
+        for key in _IGNORED_KWARGS:
+            if key in kwargs:
+                kwargs.pop(key)
+                state.ignored.add(key)
+        config = kwargs.pop("config", None)
+        hub = {key: kwargs.pop(key) for key in _HUB_KWARGS if key in kwargs}
+        with state.loading():
+            if config is None or isinstance(config, (str, os.PathLike)):
+                from transformers import AutoConfig
+
+                config, unused = AutoConfig.from_pretrained(
+                    state.remap(config) if config is not None else path,
+                    trust_remote_code=trust,
+                    return_unused_kwargs=True,
+                    **hub,
+                    **kwargs,
+                )
+                state.ignored.update(unused)
+            build: dict[str, Any] = {}
+            if attn is not None:
+                build["attn_implementation"] = attn
+            dtype = _as_dtype(dtype, config)
+            if dtype is not None:
+                build["dtype" if _transformers_major() >= 5 else "torch_dtype"] = dtype
+            with torch.device(META):
+                if auto:
+                    model = cls.from_config(config, trust_remote_code=trust, **build)
+                else:
+                    model = cls._from_config(config, **build)
+        _wrap_model_forward(model)
+        state.remember_config(config)
+        model.eval()
+        return model
+
+    return classmethod(from_pretrained)
+
+
+def _wrap_model_forward(model: Any) -> None:
+    real_forward = getattr(model, "forward", None)
+    if not callable(real_forward):
+        return
+    try:
+        sig = inspect.signature(real_forward)
+    except (ValueError, TypeError):
+        return
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return
+    if "token_type_ids" in params:
+        return
+
+    def forward(*args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("token_type_ids", None)
+        return real_forward(*args, **kwargs)
+
+    model.forward = forward
+
+
+def _patch_auto_factory(patches: _Patches, module: ModuleType) -> None:
+    patches.set(module._BaseAutoModelClass, "from_pretrained", _meta_from_pretrained(auto=True))
+
+
+def _patch_auto_classes(patches: _Patches, module: ModuleType) -> None:
+    """4.x copies `from_pretrained` onto every Auto class; patch each copy."""
+    base = sys.modules["transformers.models.auto.auto_factory"]._BaseAutoModelClass
+    for value in list(vars(module).values()):
+        if isinstance(value, type) and issubclass(value, base) and "from_pretrained" in vars(value):
+            patches.set(value, "from_pretrained", _meta_from_pretrained(auto=True))
+
+
+def _patch_modeling_utils(patches: _Patches, module: ModuleType) -> None:
+    patches.set(module.PreTrainedModel, "from_pretrained", _meta_from_pretrained(auto=False))
+
+
+def _replace_everywhere(patches: _Patches, real: Any, replacement: Any) -> None:
+    def _cleanup() -> None:
+        for name, module in list(sys.modules.items()):
+            if module is None or not (name == "transformers" or name.startswith("transformers.")):
+                continue
+            for attr, value in list(vars(module).items()):
+                if value is replacement:
+                    setattr(module, attr, real)
+
+    patches.on_restore(_cleanup)
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "transformers" or name.startswith("transformers.")):
+            continue
+        for attr, value in list(vars(module).items()):
+            if value is real:
+                patches.set(module, attr, replacement)
+
+
+def _patch_import_utils(patches: _Patches, state: RunState, module: ModuleType) -> None:
+    version = getattr(sys.modules.get("transformers"), "__version__", "?")
+    real_tracing = vars(module).get("is_tracing")
+    if real_tracing is None:
+        state.inactive.append(f"transformers is_tracing (not in {version})")
+    else:
+
+        def is_tracing(tensor: Any = None) -> bool:
+            return _is_meta(tensor) or real_tracing(tensor)
+
+        _replace_everywhere(patches, real_tracing, is_tracing)
+        state.active.append("transformers is_tracing (true for meta tensors)")
+    real_compiling = vars(module).get("is_torchdynamo_compiling")
+    if real_compiling is None:
+        state.inactive.append(f"transformers is_torchdynamo_compiling (not in {version})")
+    else:
+        _replace_everywhere(patches, real_compiling, lambda: True)
+        state.active.append("transformers is_torchdynamo_compiling (compile-safe paths)")
+
+
 def _register_library_patches(
     hook: _ImportHook, patches: _Patches, state: RunState, hf_flags: bool
 ) -> None:
     hook.on_import("safetensors", lambda m: _patch_safetensors(patches, m))
     hook.on_import("safetensors.torch", lambda m: _patch_safetensors_torch(patches, m))
+    hook.on_import(
+        "transformers.models.auto.auto_factory", lambda m: _patch_auto_factory(patches, m)
+    )
+    hook.on_import(
+        "transformers.models.auto.modeling_auto", lambda m: _patch_auto_classes(patches, m)
+    )
+    hook.on_import("transformers.modeling_utils", lambda m: _patch_modeling_utils(patches, m))
+    if hf_flags:
+        hook.on_import(
+            "transformers.utils.import_utils", lambda m: _patch_import_utils(patches, state, m)
+        )
 
 
 @contextlib.contextmanager
