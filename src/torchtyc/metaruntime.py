@@ -11,12 +11,20 @@ Every patch `install()` applies is recorded and taken back out on exit.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
+import importlib.abc
+import importlib.util
 import inspect
+import io
+import json
 import os
-from collections.abc import Iterator, Sequence
+import struct
+import sys
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePath
+from types import ModuleType
 from typing import Any, Self
 
 import torch
@@ -461,6 +469,204 @@ def _patch_autocast(patches: _Patches) -> None:
         patches.set(torch.amp, "autocast", _MetaAutocast)
 
 
+# Captured before any patch, so header reads never go through path-map twice.
+_real_open = io.open
+
+_ST_DTYPES: dict[str, torch.dtype] = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+for _code, _attr in (("F8_E4M3", "float8_e4m3fn"), ("F8_E5M2", "float8_e5m2")):
+    if hasattr(torch, _attr):
+        _ST_DTYPES[_code] = getattr(torch, _attr)
+
+
+def _parse_header(raw: bytes) -> tuple[dict[str, dict], dict[str, str]]:
+    header = json.loads(raw)
+    metadata = header.pop("__metadata__", None) or {}
+    return header, metadata
+
+
+def _read_header(path: Any) -> tuple[dict[str, dict], dict[str, str]]:
+    with _real_open(path, "rb") as handle:
+        (length,) = struct.unpack("<Q", handle.read(8))
+        return _parse_header(handle.read(length))
+
+
+def _meta_tensor(info: dict) -> torch.Tensor:
+    return torch.empty(info["shape"], dtype=_ST_DTYPES[info["dtype"]], device=META)
+
+
+class _MetaSlice:
+    def __init__(self, info: dict) -> None:
+        self._info = info
+
+    def get_shape(self) -> list[int]:
+        return list(self._info["shape"])
+
+    def get_dtype(self) -> str:
+        return self._info["dtype"]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        return _meta_tensor(self._info)[index]
+
+
+class _MetaSafeOpen:
+    """`safetensors.safe_open`, answered from the header alone."""
+
+    def __init__(self, filename: Any, framework: str = "pt", device: Any = "cpu") -> None:
+        state = _state()
+        with state.loading():
+            self._header, self._metadata = _read_header(state.remap(filename))
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def keys(self) -> list[str]:
+        return list(self._header)
+
+    def offset_keys(self) -> list[str]:
+        return self.keys()
+
+    def metadata(self) -> dict[str, str]:
+        return dict(self._metadata)
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return _meta_tensor(self._header[name])
+
+    def get_slice(self, name: str) -> _MetaSlice:
+        return _MetaSlice(self._header[name])
+
+
+def _meta_load_file(filename: Any, device: Any = "cpu") -> dict[str, torch.Tensor]:
+    state = _state()
+    with state.loading():
+        header, _ = _read_header(state.remap(filename))
+    return {name: _meta_tensor(info) for name, info in header.items()}
+
+
+def _meta_load(data: bytes) -> dict[str, torch.Tensor]:
+    (length,) = struct.unpack("<Q", data[:8])
+    header, _ = _parse_header(data[8 : 8 + length])
+    return {name: _meta_tensor(info) for name, info in header.items()}
+
+
+def _patch_safetensors(patches: _Patches, module: ModuleType) -> None:
+    if "safe_open" in vars(module):
+        patches.set(module, "safe_open", _MetaSafeOpen)
+
+
+def _patch_safetensors_torch(patches: _Patches, module: ModuleType) -> None:
+    patches.set(module, "load_file", _meta_load_file)
+    patches.set(module, "load", _meta_load)
+    if "safe_open" in vars(module):
+        patches.set(module, "safe_open", _MetaSafeOpen)
+
+
+def _patch_torch_load(patches: _Patches, state: RunState) -> None:
+    real = torch.load
+
+    def load(f: Any, map_location: Any = None, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(f, (str, bytes, os.PathLike)):
+            f = state.remap(f)
+            kwargs.setdefault("mmap", True)
+        with state.loading():
+            return real(f, META, *args, **kwargs)
+
+    patches.set(torch, "load", load)
+
+
+def _patch_open(patches: _Patches, state: RunState) -> None:
+    if not state.path_map:
+        return
+    for owner in (builtins, io):
+        current = owner.open
+
+        def open_mapped(file: Any, *args: Any, _open: Any = current, **kwargs: Any) -> Any:
+            return _open(state.remap(file), *args, **kwargs)
+
+        patches.set(owner, "open", open_mapped)
+
+
+class _CallbackLoader(importlib.abc.Loader):
+    def __init__(self, loader: Any, callback: Callable[[ModuleType], None]) -> None:
+        self._loader = loader
+        self._callback = callback
+
+    def create_module(self, spec: Any) -> Any:
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module: ModuleType) -> None:
+        self._loader.exec_module(module)
+        self._callback(module)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._loader, name)
+
+
+class _ImportHook(importlib.abc.MetaPathFinder):
+    """Patch a library the moment it is imported, or at once if it already is.
+
+    Nothing is imported just to patch it: a script that never touches
+    transformers never pays for importing it.
+    """
+
+    def __init__(self) -> None:
+        self._callbacks: dict[str, Callable[[ModuleType], None]] = {}
+        self._done: set[str] = set()
+        self._finding: set[str] = set()
+
+    def on_import(self, name: str, callback: Callable[[ModuleType], None]) -> None:
+        self._callbacks[name] = callback
+
+    def _fire(self, name: str, module: ModuleType) -> None:
+        if name not in self._done:
+            self._done.add(name)
+            self._callbacks[name](module)
+
+    def install(self) -> None:
+        for name in list(self._callbacks):
+            module = sys.modules.get(name)
+            if module is not None:
+                self._fire(name, module)
+        sys.meta_path.insert(0, self)
+
+    def remove(self) -> None:
+        with contextlib.suppress(ValueError):
+            sys.meta_path.remove(self)
+
+    def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
+        if fullname not in self._callbacks or fullname in self._done or fullname in self._finding:
+            return None
+        self._finding.add(fullname)
+        try:
+            spec = importlib.util.find_spec(fullname)
+        finally:
+            self._finding.discard(fullname)
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _CallbackLoader(spec.loader, lambda module: self._fire(fullname, module))
+        return spec
+
+
+def _register_library_patches(
+    hook: _ImportHook, patches: _Patches, state: RunState, hf_flags: bool
+) -> None:
+    hook.on_import("safetensors", lambda m: _patch_safetensors(patches, m))
+    hook.on_import("safetensors.torch", lambda m: _patch_safetensors_torch(patches, m))
+
+
 @contextlib.contextmanager
 def install(path_map: Sequence[Sequence[str]] = (), *, hf_flags: bool = True) -> Iterator[RunState]:
     """Put the meta runtime in place for the length of the block.
@@ -474,6 +680,7 @@ def install(path_map: Sequence[Sequence[str]] = (), *, hf_flags: bool = True) ->
         raise RuntimeError("the meta runtime is already installed")
     state = RunState(path_map=tuple((str(a), str(b)) for a, b in path_map))
     patches = _Patches()
+    hook = _ImportHook()
     previous = torch.empty(()).device
     STATE = state
     try:
@@ -481,9 +688,14 @@ def install(path_map: Sequence[Sequence[str]] = (), *, hf_flags: bool = True) ->
         _patch_cuda(patches)
         _patch_compile(patches, state)
         _patch_autocast(patches)
+        _patch_torch_load(patches, state)
+        _patch_open(patches, state)
+        _register_library_patches(hook, patches, state, hf_flags)
+        hook.install()
         with _DeviceMode(), _MetaDispatchMode():
             yield state
     finally:
+        hook.remove()
         patches.restore()
         torch.set_default_device(previous)
         STATE = None

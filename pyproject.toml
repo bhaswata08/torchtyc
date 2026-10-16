@@ -48,6 +48,7 @@ exclude = ["tests/fixtures"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 
 [project.urls]
 Homepage = "https://github.com/bhaswata08/torchtyc"

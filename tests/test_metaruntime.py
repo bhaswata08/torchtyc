@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import builtins
+import importlib
 import io
+import sys
+from pathlib import Path
 
 import pytest
 import torch
+from hf_models import write_inputs
 
 from torchtyc import metaruntime
 from torchtyc.effects import BlockedEffect
@@ -282,3 +286,90 @@ def test_masked_index_put_on_real_tensor_skips_fast_path():
     assert all(a is b for a, b in zip(_patch_targets(), before))
     assert metaruntime.STATE is None
     assert torch.empty(()).device.type == "cpu"
+
+
+def test_safetensors_reads_only_the_header(tmp_path):
+    path = write_inputs(tmp_path / "inputs.safetensors", {"chat": 113, "long": 4096})
+    with metaruntime.install():
+        from safetensors.torch import load_file
+
+        tensors = load_file(str(path))
+    assert {k: tuple(v.shape) for k, v in tensors.items()} == {"chat": (113,), "long": (4096,)}
+    assert all(v.is_meta and v.dtype is torch.int64 for v in tensors.values())
+
+
+def test_safe_open_and_slices(tmp_path):
+    path = write_inputs(tmp_path / "i.safetensors", {"a": 10})
+    with metaruntime.install():
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt") as handle:
+            assert handle.keys() == ["a"]
+            assert handle.get_tensor("a").shape == (10,)
+            piece = handle.get_slice("a")
+            assert piece.get_shape() == [10]
+            assert piece.get_dtype() == "I64"
+            assert piece[2:5].shape == (3,)
+
+
+def test_path_map_applies_to_loaders_and_open(tmp_path):
+    real = tmp_path / "golden"
+    real.mkdir()
+    write_inputs(real / "inputs.safetensors", {"a": 4})
+    (real / "notes.txt").write_text("hello")
+    with metaruntime.install([("/workspace/golden", str(real))]):
+        from safetensors.torch import load_file
+
+        assert load_file("/workspace/golden/inputs.safetensors")["a"].shape == (4,)
+        with open("/workspace/golden/notes.txt") as handle:
+            assert handle.read() == "hello"
+        assert Path("/workspace/golden/notes.txt").read_text() == "hello"
+
+
+def test_missing_input_is_marked_as_loader_error(tmp_path):
+    with metaruntime.install():
+        from safetensors.torch import load_file
+
+        with pytest.raises(OSError) as info:
+            load_file(str(tmp_path / "nope.safetensors"))
+    assert metaruntime.classify(info.value).rule == "run-stopped"
+
+
+def test_torch_load_path_and_bytes(tmp_path):
+    path = tmp_path / "ckpt.pt"
+    torch.save({"w": torch.ones(3, 4)}, path)
+    blob = io.BytesIO(path.read_bytes())
+    with metaruntime.install():
+        from_path = torch.load(path)
+        from_bytes = torch.load(blob)
+    assert from_path["w"].is_meta and from_path["w"].shape == (3, 4)
+    assert from_bytes["w"].is_meta
+
+
+def test_library_imported_before_install_is_patched(tmp_path):
+    import safetensors.torch
+
+    real = safetensors.torch.load_file
+    with metaruntime.install():
+        assert safetensors.torch.load_file is not real
+    assert safetensors.torch.load_file is real
+
+
+def test_library_imported_during_install_is_patched(tmp_path):
+    # Only the Python modules: the Rust extension (safetensors._safetensors_rust)
+    # stays cached, because a PyO3 module cannot be initialised twice.
+    for name in ("safetensors.torch", "safetensors"):
+        sys.modules.pop(name, None)
+    with metaruntime.install():
+        module = importlib.import_module("safetensors.torch")
+        assert module.load_file.__module__ == "torchtyc.metaruntime"
+    assert (
+        importlib.import_module("safetensors.torch").load_file.__module__ != "torchtyc.metaruntime"
+    )
+
+
+def test_open_is_restored():
+    real = builtins.open
+    with metaruntime.install([("/a", "/b")]):
+        assert builtins.open is not real
+    assert builtins.open is real
