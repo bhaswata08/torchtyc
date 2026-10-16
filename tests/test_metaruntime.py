@@ -466,6 +466,7 @@ def test_tokenizer_output_reaches_a_meta_model(tmp_path):
         tokenizer = AutoTokenizer.from_pretrained(tok_path)
         model = AutoModelForCausalLM.from_pretrained(model_path, attn_implementation="eager")
         batch = tokenizer(["w1 w2 w3", "w4"], return_tensors="pt", padding=True).to("cuda")
+        assert batch.keys() == {"input_ids", "attention_mask"}
         logits = model(**batch, use_cache=False).logits
         assert logits.is_meta and logits.shape == (2, 3, TINY_VOCAB)
 

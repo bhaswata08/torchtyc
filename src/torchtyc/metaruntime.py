@@ -747,33 +747,11 @@ def _meta_from_pretrained(*, auto: bool) -> Any:
                     model = cls.from_config(config, trust_remote_code=trust, **build)
                 else:
                     model = cls._from_config(config, **build)
-        _wrap_model_forward(model)
         state.remember_config(config)
         model.eval()
         return model
 
     return classmethod(from_pretrained)
-
-
-def _wrap_model_forward(model: Any) -> None:
-    real_forward = getattr(model, "forward", None)
-    if not callable(real_forward):
-        return
-    try:
-        sig = inspect.signature(real_forward)
-    except (ValueError, TypeError):
-        return
-    params = sig.parameters
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return
-    if "token_type_ids" in params:
-        return
-
-    def forward(*args: Any, **kwargs: Any) -> Any:
-        kwargs.pop("token_type_ids", None)
-        return real_forward(*args, **kwargs)
-
-    model.forward = forward
 
 
 def _patch_auto_factory(patches: _Patches, module: ModuleType) -> None:

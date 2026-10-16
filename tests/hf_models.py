@@ -115,7 +115,12 @@ def write_tokenizer(dest: Path) -> Path:
     vocab = {"[UNK]": 0, "[PAD]": 1, **{f"w{i}": i + 2 for i in range(50)}}
     tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]", pad_token="[PAD]")
+    fast = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        model_input_names=["input_ids", "attention_mask"],
+    )
     dest.mkdir(parents=True, exist_ok=True)
     fast.save_pretrained(dest)
     return dest
