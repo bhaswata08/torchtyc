@@ -137,11 +137,13 @@ def _scratch_dirs() -> list[Path]:
 
     The system temp directory (via `tempfile.gettempdir()`, which already
     respects `TMPDIR`, plus an explicit read of `TMPDIR`/`TEMP`/`TMP` in case
-    the environment changed after `tempfile` cached its answer) and the user
-    cache directory (`XDG_CACHE_HOME`, falling back to `~/.cache`). Libraries
-    such as matplotlib (font cache), joblib, numba, and HuggingFace hubs write
-    here during import; blocking that pushes users to `allow-effects = true`,
-    which switches the guard off wholesale and protects less, not more.
+    the environment changed after `tempfile` cached its answer), the user
+    cache directory (`XDG_CACHE_HOME`, falling back to `~/.cache`), and
+    Hugging Face cache directories (`HF_HOME`, `HF_HUB_CACHE`,
+    `HF_MODULES_CACHE`, `TRANSFORMERS_CACHE`). Libraries such as matplotlib
+    (font cache), joblib, numba, and HuggingFace hubs write here during import;
+    blocking that pushes users to `allow-effects = true`, which switches the
+    guard off wholesale and protects less, not more.
 
     Only destinations are allowed, never callers: anything writing outside
     these directories, the inductor/triton caches, is still blocked no matter
@@ -167,6 +169,15 @@ def _scratch_dirs() -> list[Path]:
             dirs.append((Path.home() / ".cache").resolve())
     except (RuntimeError, ValueError, OSError):
         pass
+    # Hugging Face caches: `trust_remote_code` copies modeling files into the
+    # modules cache, and the hub writes lock files even on a cache hit.
+    for env_var in ("HF_HOME", "HF_HUB_CACHE", "HF_MODULES_CACHE", "TRANSFORMERS_CACHE"):
+        val = os.environ.get(env_var)
+        if val:
+            try:
+                dirs.append(Path(val).expanduser().resolve())
+            except (RuntimeError, ValueError, OSError):
+                pass
     return dirs
 
 
@@ -458,6 +469,8 @@ def _guarded_os_symlink(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_os_chmod(path: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(path):
+        return _orig_os_chmod(path, *args, **kwargs)
     raise BlockedEffect(
         f"cannot chmod '{path}' during {_current_phase()}", target=str(path), culprit=_caller_info()
     )
@@ -484,6 +497,8 @@ def _guarded_os_ftruncate(fd: int, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_os_utime(path: Any, *args: Any, **kwargs: Any) -> None:
+    if _is_allowed_write(path):
+        return _orig_os_utime(path, *args, **kwargs)
     raise BlockedEffect(
         f"cannot update timestamp for '{path}' during {_current_phase()}",
         target=str(path),
@@ -492,24 +507,32 @@ def _guarded_os_utime(path: Any, *args: Any, **kwargs: Any) -> None:
 
 
 def _guarded_shutil_copy(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+    if _is_allowed_write(dst):
+        return _orig_shutil_copy(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot copy to '{dst}' during {_current_phase()}", target=str(dst), culprit=_caller_info()
     )
 
 
 def _guarded_shutil_copy2(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+    if _is_allowed_write(dst):
+        return _orig_shutil_copy2(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot copy to '{dst}' during {_current_phase()}", target=str(dst), culprit=_caller_info()
     )
 
 
 def _guarded_shutil_copyfile(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+    if _is_allowed_write(dst):
+        return _orig_shutil_copyfile(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot copy to '{dst}' during {_current_phase()}", target=str(dst), culprit=_caller_info()
     )
 
 
 def _guarded_shutil_copytree(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+    if _is_allowed_write(dst):
+        return _orig_shutil_copytree(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot copy directory tree to '{dst}' during {_current_phase()}",
         target=str(dst),
@@ -518,6 +541,8 @@ def _guarded_shutil_copytree(src: Any, dst: Any, *args: Any, **kwargs: Any) -> A
 
 
 def _guarded_shutil_move(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+    if _is_allowed_write(dst):
+        return _orig_shutil_move(src, dst, *args, **kwargs)
     raise BlockedEffect(
         f"cannot move '{src}' to '{dst}' during {_current_phase()}",
         target=str(dst),
@@ -612,6 +637,8 @@ def _guarded_path_hardlink_to(self: Any, target: Any) -> None:
 
 
 def _guarded_path_chmod(self: Any, mode: int, *, follow_symlinks: bool = True) -> None:
+    if _is_allowed_write(self):
+        return _orig_path_chmod(self, mode, follow_symlinks=follow_symlinks)
     raise BlockedEffect(
         f"cannot chmod '{self}' during {_current_phase()}", target=str(self), culprit=_caller_info()
     )

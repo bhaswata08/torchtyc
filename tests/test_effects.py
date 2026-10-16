@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from torchtyc import effects
 from torchtyc.config import Config
 from torchtyc.effects import BlockedEffect, active_guard, unwrap_blocked
 from torchtyc.engine import check_paths
@@ -852,3 +854,57 @@ def test_new_hooks_removed_on_uninstall():
 
     for name, orig_fn in orig_sub_extra.items():
         assert getattr(subprocess, name) is orig_fn
+
+
+def test_shutil_copy_to_scratch_is_allowed(tmp_path: Path):
+    src = tmp_path / "a.py"
+    src.write_text("x = 1\n")
+    dest = tmp_path / "cache" / "a.py"
+    dest.parent.mkdir()
+    with active_guard(enabled=True):
+        shutil.copyfile(src, dest)
+        shutil.copy(src, tmp_path / "cache" / "b.py")
+        shutil.copy2(src, tmp_path / "cache" / "c.py")
+    assert dest.read_text() == "x = 1\n"
+
+
+def test_shutil_copy_into_protected_tree_is_blocked(tmp_path: Path):
+    src = tmp_path / "a.py"
+    src.write_text("x = 1\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    with active_guard(enabled=True, protect=[project]):
+        with pytest.raises(BlockedEffect):
+            shutil.copyfile(src, project / "a.py")
+        with pytest.raises(BlockedEffect):
+            shutil.copytree(tmp_path / "project", project / "nested")
+
+
+def test_hf_cache_variables_are_scratch(monkeypatch, tmp_path: Path):
+    for name in ("HF_HOME", "HF_HUB_CACHE", "HF_MODULES_CACHE", "TRANSFORMERS_CACHE"):
+        target = tmp_path / name.lower()
+        target.mkdir()
+        monkeypatch.setenv(name, str(target))
+    dirs = effects._scratch_dirs()
+    for name in ("HF_HOME", "HF_HUB_CACHE", "HF_MODULES_CACHE", "TRANSFORMERS_CACHE"):
+        assert (tmp_path / name.lower()).resolve() in dirs
+
+
+def test_chmod_and_utime_destination_checks(tmp_path: Path):
+    target_dir = tmp_path / "scratch"
+    target_dir.mkdir()
+    target = target_dir / "file.txt"
+    target.write_text("hello")
+
+    with active_guard(enabled=True):
+        os.chmod(target, 0o644)
+        target.chmod(0o644)
+        os.utime(target, None)
+
+    with active_guard(enabled=True, protect=[target_dir]):
+        with pytest.raises(BlockedEffect):
+            os.chmod(target, 0o644)
+        with pytest.raises(BlockedEffect):
+            target.chmod(0o644)
+        with pytest.raises(BlockedEffect):
+            os.utime(target, None)
