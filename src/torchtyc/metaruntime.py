@@ -111,6 +111,24 @@ def from_loader(exc: BaseException) -> bool:
     return False
 
 
+def _loader_oserror(exc: BaseException) -> bool:
+    """Whether the exception chain contains an OSError from a patched loader."""
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, OSError) and getattr(current, "_torchtyc_loader", False):
+            return True
+        if current.__cause__ is not None:
+            stack.append(current.__cause__)
+        if current.__context__ is not None:
+            stack.append(current.__context__)
+    return False
+
+
 @dataclass
 class RunState:
     """What one run has learned, read back by the worker for its report."""
@@ -329,10 +347,6 @@ class _FakeStream:
         return True
 
 
-def _nothing(*args: Any, **kwargs: Any) -> None:
-    return None
-
-
 def _cuda_stubs() -> dict[str, Any]:
     stubs: dict[str, Any] = {
         "is_available": lambda: True,
@@ -519,7 +533,7 @@ def classify(exc: BaseException) -> Outcome:
             f"writes and network are blocked during a run ({blocked.message})",
             "stopped",
         )
-    if isinstance(exc, FileNotFoundError) or from_loader(exc):
+    if isinstance(exc, FileNotFoundError) or _loader_oserror(exc):
         return Outcome("run-stopped", f"missing input: {exc}", "stopped")
     text = str(exc)
     if any(message in text for message in _NO_CUDA_MESSAGES):

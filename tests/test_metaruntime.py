@@ -175,6 +175,14 @@ def test_classify_oserror_from_loader_is_stopped():
     assert classify(OSError("disk on fire")).rule == "run-error"
 
 
+def test_classify_value_error_from_loader_is_error():
+    state = metaruntime.RunState()
+    with pytest.raises(ValueError) as info, state.loading():
+        raise ValueError("corrupt config")
+    exc = info.value
+    assert classify(exc).rule == "run-error"
+
+
 def test_cuda_looks_present(runtime):
     assert torch.cuda.is_available()
     assert torch.cuda.device_count() == 1
@@ -263,8 +271,14 @@ def test_from_loader_walks_both_cause_and_context():
     assert classify(exc).rule == "run-stopped"
 
 
-def test_masked_index_put_cpu(runtime):
-    cpu = torch.ones(4, device="cpu")
-    cpu[cpu > 0] = 0.0
-    assert cpu.is_meta
-    assert cpu.shape == (4,)
+def test_masked_index_put_on_real_tensor_skips_fast_path():
+    before = _patch_targets()
+    cpu = torch.ones(4)
+    with metaruntime.install():
+        assert not cpu.is_meta
+        cpu[cpu > 0] = 0.0
+        out = torch.index_put(cpu, (cpu > 0,), torch.zeros(4))
+        assert out.is_meta
+    assert all(a is b for a, b in zip(_patch_targets(), before))
+    assert metaruntime.STATE is None
+    assert torch.empty(()).device.type == "cpu"
