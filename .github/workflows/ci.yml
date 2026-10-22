@@ -20,7 +20,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install ${{ matrix.python }}
-      - run: uv sync --all-extras --dev
+      - run: uv sync --locked --all-extras --dev
       - run: uv run ruff check src tests bench
       - run: uv run ruff format --check src tests bench
       - run: uv run pytest -q
@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras --dev
+      - run: uv sync --locked --all-extras --dev
       # The fixtures are deliberately wrong, so exit 1 (findings) is the
       # expected result. Anything else is torchtyc itself failing.
       - run: |
@@ -68,5 +68,5 @@ jobs:
         with:
           enable-cache: true
       - run: uv python install 3.12
-      - run: uv sync --all-extras --dev
+      - run: uv sync --locked --all-extras --dev
       - run: uv run --with "transformers==${{ matrix.transformers }}" pytest -q tests/test_metaruntime.py tests/test_run.py

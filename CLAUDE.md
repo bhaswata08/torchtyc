@@ -10,8 +10,10 @@ it in step with behaviour changes.
 
 ## Commands
 
-Dependencies go through uv (`uv add`, never `uv pip install`). The `justfile` wraps
-everything; `just` lists the recipes.
+Dependencies go through uv (`uv add`, never `uv pip install`). `uv.lock` is committed
+and CI installs with `uv sync --locked`, so CI tests exactly the locked torch and
+transformers; upgrade them on purpose with `uv lock --upgrade-package <name>`. The
+`justfile` wraps everything; `just` lists the recipes.
 
 ```bash
 just sync                         # uv sync --all-extras --dev
