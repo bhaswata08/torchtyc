@@ -244,6 +244,30 @@ def test_cuda_is_restored():
     assert torch.cuda.is_available is real
 
 
+def test_cuda_replacements_keep_function_metadata():
+    """torch 2.14's dynamo reads `torch.cuda.use_mem_pool.__wrapped__` when it is
+    imported, which can happen mid-run; a replacement without it breaks every run."""
+    import inspect
+
+    originals = {
+        name: value
+        for name, value in vars(torch.cuda).items()
+        if not name.startswith("_") and (inspect.isfunction(value) or inspect.isbuiltin(value))
+    }
+    with metaruntime.install():
+        for name, original in originals.items():
+            replacement = getattr(torch.cuda, name)
+            if hasattr(original, "__wrapped__"):
+                assert hasattr(replacement, "__wrapped__"), name
+                assert replacement.__wrapped__ is original.__wrapped__, name
+            if (
+                replacement is not original
+                and name not in metaruntime._cuda_stubs()
+                and hasattr(original, "__name__")
+            ):
+                assert replacement.__name__ == original.__name__, name
+
+
 def test_torch_compile_runs_uncompiled(runtime):
     def f(x):
         return x * 2

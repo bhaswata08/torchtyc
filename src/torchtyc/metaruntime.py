@@ -444,18 +444,23 @@ def _cuda_stubs() -> dict[str, Any]:
     return stubs
 
 
-def _unstubbed_cuda(name: str) -> Any:
+def _unstubbed_cuda(name: str, original: Any) -> Any:
     if name.startswith(("is_", "has_")):
         # A capability probe that answers "no" sends code down its portable path.
         def probe(*args: Any, **kwargs: Any) -> bool:
             return False
 
-        return probe
+        replacement = probe
+    else:
 
-    def refuse(*args: Any, **kwargs: Any) -> Any:
-        raise Unsupported(f"`torch.cuda.{name}` needs a real CUDA device")
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise Unsupported(f"`torch.cuda.{name}` needs a real CUDA device")
 
-    return refuse
+        replacement = refuse
+
+    functools.update_wrapper(replacement, original)
+    replacement.__wrapped__ = getattr(original, "__wrapped__", original)
+    return replacement
 
 
 def _patch_cuda(patches: _Patches) -> None:
@@ -467,7 +472,7 @@ def _patch_cuda(patches: _Patches) -> None:
         if (inspect.isfunction(value) or inspect.isbuiltin(value)) and str(
             getattr(value, "__module__", "")
         ).startswith("torch.cuda"):
-            patches.set(torch.cuda, name, _unstubbed_cuda(name))
+            patches.set(torch.cuda, name, _unstubbed_cuda(name, value))
     for name, value in stubs.items():
         patches.set(torch.cuda, name, value)
 
