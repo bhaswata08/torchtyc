@@ -284,7 +284,7 @@ missing, a download, or a write. That is never reported as an error, and the
 status line says how far the run got.
 
 `torchtyc run` accepts the same `--format` options (`full`, `concise`, `json`, `github`)
-and common flags (`--python`, `--allow-effects`, `--severity`) as `check`.
+and common flags (`--python`, `--ignore`, `--severity`) as `check`.
 For `run`, `--timeout` sets the per-entry run limit (overriding `run-timeout`),
 while for `check` it sets the trace-pass timeout.
 

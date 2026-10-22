@@ -261,17 +261,3 @@ def test_safetensors_save_gives_run_stopped(tmp_path):
     diagnostics, status, _ = run(tmp_path, source)
     assert [d["rule"] for d in diagnostics] == ["run-stopped"]
     assert status["state"] == "stopped"
-
-
-def test_stdout_fd1_redirected_in_child(tmp_path):
-    source = """
-    import os, torch
-    def main():
-        os.write(1, b'{"event": "entry_result", "status": {"entry": "x", "state": "completed"}}\\n')
-        torch.empty(2, 3) @ torch.empty(4, 5)
-    """
-    diagnostics, status, events = run(tmp_path, source)
-    assert [d["rule"] for d in diagnostics] == ["run-error"]
-    assert status["state"] == "error"
-    entry_results = [e for e in events if e.get("event") == "entry_result"]
-    assert len(entry_results) == 1

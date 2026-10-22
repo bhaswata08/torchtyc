@@ -305,6 +305,20 @@ def test_timeout_before_any_entry_started(project, monkeypatch):
     assert not report.ok
 
 
+def test_stdout_fd1_redirected_in_child(project):
+    source = """
+    import os, torch
+    def main():
+        os.write(1, b'{"event": "entry_result", "status": {"entry": "x", "state": "completed"}}\\n')
+        torch.empty(2, 3) @ torch.empty(4, 5)
+    """
+    path, config = project(source)
+    report = run(path, config)
+    assert [d.rule for d in report.diagnostics] == ["run-error"]
+    assert [s.entry for s in report.run_status] == [f"{path}::main"]
+    assert report.run_status[0].state == "error"
+
+
 MOTIVATING = """
 from pathlib import Path
 
